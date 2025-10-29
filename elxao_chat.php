@@ -646,9 +646,9 @@ add_shortcode('elxao_chat_window', function($atts){
 });
 
 /* ================================================
-   LOOP-FRIENDLY CHAT CARD (lazy connect per card)
+   LOOP-FRIENDLY CHAT CARD (auto-connect)
    Shortcode: [elxao_chat_card]
-   Optional: height="320"  lazy="click" | "view"
+   Optional: height="320"
 ================================================== */
 
 function elxao_detect_loop_project_id(){
@@ -669,7 +669,6 @@ add_shortcode('elxao_chat_card', function($atts){
     $a = shortcode_atts([
         'project_id' => 0,
         'height'     => '320',
-        'lazy'       => 'click', // or "view"
     ], $atts, 'elxao_chat_card');
 
     $pid = (int)$a['project_id'];
@@ -682,161 +681,307 @@ add_shortcode('elxao_chat_card', function($atts){
     if ($room_id === '') { $room_id = 'project_'.$pid; elxao_update_acf('chat_room_id', $room_id, $pid); }
 
     $height = preg_replace('~[^0-9]~','', $a['height']) ?: '320';
-    $lazy   = ($a['lazy'] === 'view') ? 'view' : 'click';
 
     ob_start(); ?>
     <div class="elxao-chat-card"
          data-project="<?php echo esc_attr($pid); ?>"
          data-room="<?php echo esc_attr($room_id); ?>"
-         data-lazy="<?php echo esc_attr($lazy); ?>"
          style="border:1px solid #2b2f36;border-radius:10px;padding:10px;display:flex;flex-direction:column;gap:8px;background:#0f1115;color:#e5e7eb">
 
       <div class="elxao-chat-msgs"
            style="height:<?php echo esc_attr($height); ?>px; overflow:auto; border:1px solid #3a3f47; border-radius:8px; padding:8px; background:#0f1115;">
-        <div class="elxao-chat-empty" style="opacity:.7;">Click the input to connect & load messages…</div>
+        <div class="elxao-chat-empty" style="opacity:.7; text-align:center; padding:6px 0;">Connecting to chat…</div>
       </div>
 
       <input class="elxao-chat-input"
              type="text"
-             placeholder="Click to connect…"
+             placeholder="Connecting…"
              disabled
              style="width:100%;padding:10px;border:1px solid #3a3f47;border-radius:8px;background:#0f1115;color:#e5e7eb" />
     </div>
 
     <script>
     (function(){
-      function loadAblyOnce(cb){
-        if(window.Ably){ cb(); return; }
-        if(window.__elxaoAblyLoading){ window.__elxaoAblyLoading.push(cb); return; }
-        window.__elxaoAblyLoading = [cb];
-        var s=document.createElement('script');
-        s.src='https://cdn.ably.io/lib/ably.min-1.js';
-        s.onload=function(){ (window.__elxaoAblyLoading||[]).forEach(function(f){ try{f();}catch(e){} }); window.__elxaoAblyLoading=null; };
-        document.head.appendChild(s);
+      var INITIAL_LIMIT = 50;
+      var PAGE_LIMIT    = 30;
+      var DOM_LIMIT     = 300;
+      var TOP_THRESHOLD = 0.1; // 10%
+
+      function loadAbly(){
+        if(window.Ably){ return Promise.resolve(); }
+        if(window.__elxaoAblyPromise){ return window.__elxaoAblyPromise; }
+        window.__elxaoAblyPromise = new Promise(function(resolve, reject){
+          var s = document.createElement('script');
+          s.src = 'https://cdn.ably.io/lib/ably.min-1.js';
+          s.onload = function(){ resolve(); };
+          s.onerror = function(){ reject(new Error('Failed to load Ably SDK')); };
+          document.head.appendChild(s);
+        });
+        return window.__elxaoAblyPromise;
       }
 
-      function initCards(){
-        var cards = document.querySelectorAll('.elxao-chat-card');
-        if(!cards.length) return;
+      function fetchToken(projectId){
+        return fetch('<?php echo esc_url( site_url('/wp-json/elxao/v1/chat-token?project_id=') ); ?>'+projectId, { credentials: 'same-origin' })
+          .then(function(res){
+            if(!res.ok){ return res.json().then(function(err){ throw new Error(err && err.message ? err.message : 'Token request failed'); }); }
+            return res.json();
+          })
+          .then(function(body){
+            if(body && body.error){ throw new Error(body.message || 'Token error'); }
+            if(!body || !body.token){ throw new Error('Invalid token response'); }
+            return body;
+          });
+      }
 
-        var io = null;
-        if('IntersectionObserver' in window){
-          io = new IntersectionObserver(function(entries){
-            entries.forEach(function(en){
-              if(en.isIntersecting){
-                var card = en.target;
-                if(card.dataset.lazy === 'view'){ connectCard(card); io.unobserve(card); }
-              }
-            });
-          }, {root:null, rootMargin:'0px', threshold:0.25});
+      function createSpinner(text){
+        var d = document.createElement('div');
+        d.className = 'elxao-chat-spinner';
+        d.textContent = text || 'Loading…';
+        d.style.cssText = 'text-align:center;padding:6px 0;font-size:12px;opacity:.7;';
+        return d;
+      }
+
+      function formatTimestamp(ms){
+        var date = new Date(ms);
+        return date.toLocaleTimeString([], {hour:'2-digit', minute:'2-digit'});
+      }
+
+      function renderMessage(msg, options){
+        var wrap = document.createElement('div');
+        wrap.className = 'elxao-chat-item';
+        wrap.style.margin = '6px 0';
+        if(options && options.system){
+          wrap.className += ' elxao-chat-item--system';
+          wrap.style.opacity = '.7';
+        }
+        if(options && options.pending){
+          wrap.className += ' elxao-chat-item--pending';
+          wrap.style.opacity = '.7';
         }
 
-        cards.forEach(function(card){
-          var input = card.querySelector('.elxao-chat-input');
+        var header = document.createElement('div');
+        header.style.fontSize = '11px';
+        header.style.opacity = '.65';
+        header.style.marginBottom = '2px';
+        header.textContent = (msg.author || 'message') + ' • ' + formatTimestamp(msg.timestamp || Date.now());
 
-          if(card.dataset.lazy === 'view'){
-            input.disabled = true;
-            input.placeholder = 'Loading chat…';
-            if(io){
-              io.observe(card);
-            } else {
-              connectCard(card);
-            }
-          } else {
-            input.disabled = false;
-            input.readOnly = true;
-            input.dataset.preconnectReadonly = '1';
+        var body = document.createElement('div');
+        body.textContent = msg.text;
+        body.style.whiteSpace = 'pre-wrap';
 
-            var once=false;
-            function handler(){ if(!once){ once=true; connectCard(card); } }
-            input.addEventListener('focus', handler, {once:true});
-            input.addEventListener('click', handler, {once:true});
-          }
-        });
+        wrap.appendChild(header);
+        wrap.appendChild(body);
+        return wrap;
       }
 
-      function connectCard(card){
-        if(card.__connecting || card.__ablyChannel) return;
-        card.__connecting = true;
+      function maintainDomLimit(container){
+        var items = container.querySelectorAll('.elxao-chat-item');
+        if(items.length <= DOM_LIMIT) return;
+        var excess = items.length - DOM_LIMIT;
+        for(var i = 0; i < items.length && excess > 0; i++){
+          var el = items[i];
+          if(!el || !el.parentNode) continue;
+          el.parentNode.removeChild(el);
+          excess--;
+        }
+      }
+
+      function setupCard(card){
+        if(card.__elxaoInitialized){ return; }
+        card.__elxaoInitialized = true;
 
         var projectId = card.getAttribute('data-project');
         var roomId    = card.getAttribute('data-room');
         var msgsEl    = card.querySelector('.elxao-chat-msgs');
         var inputEl   = card.querySelector('.elxao-chat-input');
+        var empty     = card.querySelector('.elxao-chat-empty');
+        var topLoader = createSpinner('Loading messages…');
+        topLoader.style.display = 'block';
+        topLoader.className += ' elxao-chat-top-loader';
+        msgsEl.insertBefore(topLoader, msgsEl.firstChild);
 
-        function logLine(text, cls){
-          var d=document.createElement('div');
-          d.textContent=text;
-          d.style.margin='6px 0';
-          if(cls==='sys'){ d.style.opacity='.7'; }
-          msgsEl.appendChild(d);
-          msgsEl.scrollTop = msgsEl.scrollHeight;
+        var noMoreLabel = document.createElement('div');
+        noMoreLabel.className = 'elxao-chat-no-more';
+        noMoreLabel.textContent = 'No more messages';
+        noMoreLabel.style.cssText = 'text-align:center;padding:6px 0;font-size:12px;opacity:.6;display:none;';
+        msgsEl.insertBefore(noMoreLabel, topLoader.nextSibling);
+
+        var state = {
+          channel: null,
+          loadingHistory: false,
+          reachedStart: false,
+          pendingCount: 0,
+          oldestTimestamp: null
+        };
+
+        function isNearBottom(){
+          return (msgsEl.scrollTop + msgsEl.clientHeight + 40) >= msgsEl.scrollHeight;
         }
+
+        function stickToBottom(){ msgsEl.scrollTop = msgsEl.scrollHeight; }
+
+        function addMessages(items, prepend){
+          if(!items || !items.length) return;
+          var fragment = document.createDocumentFragment();
+          items.forEach(function(item){
+            var data = item.data;
+            var text;
+            if(typeof data === 'string'){ text = data; }
+            else if(data && typeof data === 'object' && data.message){ text = data.message; }
+            else { text = JSON.stringify(data); }
+
+            var author = item.clientId || item.name || 'message';
+            if(item.name === 'system' || (data && data.type === 'system')){
+              author = 'system';
+            }
+
+            var node = renderMessage({
+              text: text,
+              author: author,
+              timestamp: item.timestamp
+            }, { system: item.name === 'system' || (data && data.type === 'system') });
+
+            node.dataset.messageId = item.id || '';
+            fragment.appendChild(node);
+          });
+
+          if(prepend){
+            msgsEl.insertBefore(fragment, noMoreLabel.nextSibling);
+          } else {
+            msgsEl.appendChild(fragment);
+          }
+
+          maintainDomLimit(msgsEl);
+        }
+
+        function handleHistory(page, isInitial){
+          if(!page){ return; }
+          if(isInitial){ msgsEl.querySelectorAll('.elxao-chat-item').forEach(function(n){ n.remove(); }); }
+          var items = page.items.slice().reverse();
+          var stick = isInitial || isNearBottom();
+          addMessages(items, !isInitial);
+          if(isInitial){ stickToBottom(); }
+          else if(stick){ stickToBottom(); }
+
+          if(items.length){
+            var earliest = items[0].timestamp;
+            if(typeof earliest === 'number'){ state.oldestTimestamp = earliest; }
+          }
+
+          var expected = isInitial ? INITIAL_LIMIT : PAGE_LIMIT;
+          if(items.length < expected || !page.hasNext()){ state.reachedStart = true; noMoreLabel.style.display = 'block'; }
+          showHistoryLoader(false);
+        }
+
+        function showHistoryLoader(show){
+          topLoader.style.display = show ? 'block' : 'none';
+        }
+
+        function loadOlder(){
+          if(state.loadingHistory || state.reachedStart || !state.channel){ return; }
+          state.loadingHistory = true;
+          showHistoryLoader(true);
+          var opts = { limit: PAGE_LIMIT };
+          if(state.oldestTimestamp){ opts.end = state.oldestTimestamp - 1; }
+          state.channel.history(opts).then(function(nextPage){
+            var items = nextPage.items.slice().reverse();
+            addMessages(items, true);
+            if(items.length){
+              var earliest = items[0].timestamp;
+              if(typeof earliest === 'number'){ state.oldestTimestamp = earliest; }
+            }
+            if(items.length < PAGE_LIMIT || !nextPage.hasNext()){ state.reachedStart = true; noMoreLabel.style.display = 'block'; }
+          }).catch(function(err){ console.error(err); })
+            .finally(function(){ state.loadingHistory = false; showHistoryLoader(false); });
+        }
+
+        msgsEl.addEventListener('scroll', function(){
+          if(msgsEl.scrollHeight <= 0){ return; }
+          var threshold = msgsEl.scrollHeight * TOP_THRESHOLD;
+          if(msgsEl.scrollTop <= threshold || msgsEl.scrollTop <= 300){
+            loadOlder();
+          }
+        });
 
         inputEl.placeholder = 'Connecting…';
         inputEl.disabled = true;
 
-        fetch('<?php echo esc_url( site_url('/wp-json/elxao/v1/chat-token?project_id=') ); ?>'+projectId, { credentials: 'same-origin' })
-          .then(function(r){ return r.json(); })
-          .then(function(tokenDetails){
-            if(tokenDetails.error){ throw new Error(tokenDetails.message || 'Token error'); }
-
-            loadAblyOnce(function(){
-              var client  = new Ably.Realtime.Promise({ tokenDetails: tokenDetails, echoMessages: true });
-              var channel = client.channels.get(roomId);
-              card.__ablyClient  = client;
-              card.__ablyChannel = channel;
-
-              channel.subscribe(function(msg){
-                var body = (typeof msg.data === 'string') ? msg.data : JSON.stringify(msg.data);
-                var isSys = (msg.name === 'system') || (msg.data && msg.data.type === 'system');
-                logLine((msg.name || 'message')+': '+body, isSys?'sys':'');
-              });
-
-              channel.history({limit:20}).then(function(page){
-                msgsEl.innerHTML='';
-                page.items.reverse().forEach(function(m){
-                  var body = (typeof m.data === 'string') ? m.data : JSON.stringify(m.data);
-                  var isSys = (m.name === 'system') || (m.data && m.data.type === 'system');
-                  logLine((m.name || 'message')+': '+body+(isSys?' (system)':''));
-                });
-              }).catch(function(){ msgsEl.innerHTML=''; });
-
-              // Enable sending after connection is ready
-              inputEl.disabled = false;
-              if(inputEl.dataset.preconnectReadonly){
-                delete inputEl.dataset.preconnectReadonly;
-                inputEl.readOnly = false;
-              }
-              inputEl.placeholder = 'Type a message and press Enter';
-              inputEl.addEventListener('keydown', function(e){
-                if(e.key === 'Enter' && inputEl.value.trim()){
-                  var text = inputEl.value.trim();
-                  inputEl.value='';
-                  channel.publish('text', text).then(function(){
-                    logLine('you: ' + text, 'sys'); // local echo
-                  }).catch(function(err){
-                    logLine('send failed: ' + (err && err.message ? err.message : 'unknown'), 'sys');
+        Promise.all([loadAbly(), fetchToken(projectId)])
+          .then(function(results){
+            var tokenDetails = results[1];
+            var client = new Ably.Realtime.Promise({ tokenDetails: tokenDetails, echoMessages: false });
+            card.__ablyClient = client;
+            return new Promise(function(resolve){ client.connection.once('connected', resolve); })
+              .then(function(){ return client.channels.get(roomId); })
+              .then(function(channel){
+                state.channel = channel;
+                return channel.attach().then(function(){ return channel.history({ limit: INITIAL_LIMIT }); })
+                  .then(function(page){
+                    if(empty){ empty.remove(); }
+                    handleHistory(page, true);
+                  })
+                  .catch(function(err){
+                    console.error(err);
+                    showHistoryLoader(false);
+                    state.reachedStart = true;
+                    if(empty){ empty.textContent = 'Unable to load history'; }
                   });
-                }
-              }, { once:false });
+              })
+              .then(function(){ return state.channel; });
+          })
+          .then(function(channel){
+            if(!channel){ throw new Error('Missing channel'); }
 
-              card.__connecting = false;
+            channel.subscribe(function(msg){
+              var stick = isNearBottom();
+              addMessages([msg], false);
+              if(stick){ stickToBottom(); }
+            });
+
+            inputEl.disabled = false;
+            inputEl.placeholder = 'Type a message and press Enter';
+
+            inputEl.addEventListener('keydown', function(e){
+              if(e.key !== 'Enter'){ return; }
+              var text = inputEl.value.trim();
+              if(!text){ return; }
+              inputEl.value = '';
+
+              var localId = 'local-'+Date.now()+'-'+(++state.pendingCount);
+              var pendingNode = renderMessage({ text: text, author: 'you', timestamp: Date.now() }, { pending: true });
+              pendingNode.dataset.localId = localId;
+              msgsEl.appendChild(pendingNode);
+              stickToBottom();
+
+              channel.publish({ name: 'text', data: text }).then(function(){
+                pendingNode.classList.remove('elxao-chat-item--pending');
+                pendingNode.style.opacity = '';
+              }).catch(function(err){
+                pendingNode.classList.add('elxao-chat-item--system');
+                pendingNode.style.opacity = '.7';
+                pendingNode.querySelector('div:last-child').textContent = 'send failed: ' + (err && err.message ? err.message : 'unknown');
+              });
             });
           })
           .catch(function(err){
             console.error(err);
-            card.__connecting = false;
-            var empty = card.querySelector('.elxao-chat-empty');
-            if(empty) empty.textContent = 'Chat error: ' + (err && err.message ? err.message : 'failed to connect');
+            var message = (err && err.message) ? err.message : 'failed to connect';
+            if(empty){ empty.textContent = 'Chat error: ' + message; }
             inputEl.placeholder = 'Chat unavailable';
+            inputEl.disabled = true;
+            showHistoryLoader(false);
           });
+      }
+
+      function init(){
+        var cards = document.querySelectorAll('.elxao-chat-card');
+        cards.forEach(setupCard);
       }
 
       if(!window.__elxaoChatCardsInit){
         window.__elxaoChatCardsInit = true;
-        document.addEventListener('DOMContentLoaded', initCards);
-        if(document.readyState === 'interactive' || document.readyState === 'complete'){ initCards(); }
+        document.addEventListener('DOMContentLoaded', init);
+        if(document.readyState === 'interactive' || document.readyState === 'complete'){ init(); }
       }
     })();
     </script>
