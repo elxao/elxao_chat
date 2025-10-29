@@ -733,11 +733,20 @@ add_shortcode('elxao_chat_card', function($atts){
 
         cards.forEach(function(card){
           var input = card.querySelector('.elxao-chat-input');
-          input.disabled = (card.dataset.lazy !== 'view'); // enable only once connected
 
-          if(card.dataset.lazy === 'view' && io){
-            io.observe(card);
+          if(card.dataset.lazy === 'view'){
+            input.disabled = true;
+            input.placeholder = 'Loading chat…';
+            if(io){
+              io.observe(card);
+            } else {
+              connectCard(card);
+            }
           } else {
+            input.disabled = false;
+            input.readOnly = true;
+            input.dataset.preconnectReadonly = '1';
+
             var once=false;
             function handler(){ if(!once){ once=true; connectCard(card); } }
             input.addEventListener('focus', handler, {once:true});
@@ -795,6 +804,10 @@ add_shortcode('elxao_chat_card', function($atts){
 
               // Enable sending after connection is ready
               inputEl.disabled = false;
+              if(inputEl.dataset.preconnectReadonly){
+                delete inputEl.dataset.preconnectReadonly;
+                inputEl.readOnly = false;
+              }
               inputEl.placeholder = 'Type a message and press Enter';
               inputEl.addEventListener('keydown', function(e){
                 if(e.key === 'Enter' && inputEl.value.trim()){
