@@ -1265,8 +1265,9 @@ function scheduleReadSync(){
     if(readSyncPending) sendReadSync();
   },400);
 }
-function appendChatLine(data){
-  if(!data) return;
+function appendChatLine(source){
+  if(!source) return;
+  const data=Object.assign({},source);
   const times=extractReadTimes(data);
   if(times) updateCurrentReadTimes(times);
   const effectiveTimes={
@@ -1292,6 +1293,55 @@ function appendChatLine(data){
   if(!messageText && role!=='sys') return;
   const display=data.user_display||('User '+(data.user||''));
   const fullText=(role==='sys')?messageText:(display+': '+messageText);
+  const messageIdValue=('id' in data && data.id!==undefined && data.id!==null)?String(data.id):'';
+  const fallbackId=('message_id' in data && data.message_id!==undefined && data.message_id!==null)?String(data.message_id):'';
+  const messageId=messageIdValue||fallbackId;
+  const stampRaw=data.at||data.published_at||data.created_at||data.timestamp||'';
+  const stamp=stampRaw?String(stampRaw):'';
+  const userValue=('user' in data && data.user!==undefined && data.user!==null)?String(data.user):'';
+  const userId=userValue||(('user_id' in data && data.user_id!==undefined && data.user_id!==null)?String(data.user_id):'');
+
+  let existing=null;
+  if(list && list.children && list.children.length){
+    if(messageId){
+      const items=Array.from(list.children);
+      existing=items.find(function(line){ return line && line.dataset && line.dataset.messageId===messageId; })||null;
+    }
+    if(!existing && stamp && userId){
+      const items=Array.from(list.children);
+      existing=items.find(function(line){
+        if(!line||!line.dataset) return false;
+        return line.dataset.user===userId && line.dataset.at===stamp;
+      })||null;
+    }
+  }
+
+  const ensureTextContent=function(node,text){
+    if(!node) return;
+    while(node.firstChild){ node.removeChild(node.firstChild); }
+    node.appendChild(createTextFragment(text));
+  };
+
+  if(existing){
+    const payload=existing.__chatPayload||{};
+    const merged=Object.assign({},payload,data);
+    existing.__chatPayload=merged;
+    const indicator=existing.querySelector('.chat-read-indicator');
+    if(indicator) applyIndicatorState(indicator,determineIndicator(merged,role));
+    const textNode=existing.querySelector('.chat-text');
+    ensureTextContent(textNode,fullText);
+    existing.dataset.role=role;
+    if(stamp) existing.dataset.at=stamp;
+    else delete existing.dataset.at;
+    if(messageId) existing.dataset.messageId=messageId;
+    if(userId) existing.dataset.user=userId;
+    updateLatestFromPayload(merged);
+    if(!isRenderingHistory && role!=='sys' && (merged.user||0)!==myId){
+      scheduleReadSync();
+    }
+    return;
+  }
+
   const line=document.createElement('div');
   line.className='chat-line '+role;
   const indicator=document.createElement('span');
@@ -1300,15 +1350,14 @@ function appendChatLine(data){
   line.appendChild(indicator);
   const textNode=document.createElement('div');
   textNode.className='chat-text';
-  textNode.appendChild(createTextFragment(fullText));
+  ensureTextContent(textNode,fullText);
   line.appendChild(textNode);
   line.__chatPayload=data;
   line.dataset.role=role;
-  const stamp=data.at||data.published_at||data.created_at||'';
-  if(stamp) line.dataset.at=String(stamp);
+  if(stamp) line.dataset.at=stamp;
   else delete line.dataset.at;
-  if('id' in data && data.id!==undefined && data.id!==null) line.dataset.messageId=String(data.id);
-  if('user' in data && data.user!==undefined && data.user!==null) line.dataset.user=String(data.user);
+  if(messageId) line.dataset.messageId=messageId;
+  if(userId) line.dataset.user=userId;
   list.appendChild(line);
   list.scrollTop=list.scrollHeight;
   updateLatestFromPayload(data);
