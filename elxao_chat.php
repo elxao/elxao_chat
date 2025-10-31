@@ -814,7 +814,17 @@ if(!window.ELXAO_CHAT_NORMALIZE){
 }
 if(!window.ELXAO_CHAT_BROADCAST){
   window.ELXAO_CHAT_BROADCAST=function(projectHint,data,extras){
-    const payload=window.ELXAO_CHAT_NORMALIZE(data,projectHint);
+    let source=data;
+    if(typeof source==='string'){
+      const trimmed=source.trim();
+      if(trimmed){
+        try{ source=JSON.parse(trimmed); }
+        catch(e){ source={message:source}; }
+      } else {
+        source={};
+      }
+    }
+    const payload=window.ELXAO_CHAT_NORMALIZE(source,projectHint);
     if(!payload.project && projectHint) payload.project=Number(projectHint)||0;
     const detail=Object.assign({project:payload.project,payload:payload},(extras&&typeof extras==='object')?extras:{});
     window.ELXAO_CHAT_BUS.emit(detail);
@@ -1543,7 +1553,16 @@ if(!window.ELXAO_ABLY){
     entry.refCount++;
     if(!entry.handler){
       entry.handler=function(msg){
-        const data=(msg&&msg.data)?msg.data:{};
+        let data=(msg&&msg.data)?msg.data:{};
+        if(typeof data==='string'){
+          const trimmed=data.trim();
+          if(trimmed){
+            try{ data=JSON.parse(trimmed); }
+            catch(e){ data={message:data}; }
+          } else {
+            data={};
+          }
+        }
         const projectId=data.project||entry.projectId||project||0;
         window.ELXAO_CHAT_BUS.emit({project:projectId,payload:window.ELXAO_CHAT_NORMALIZE(data,projectId)});
         if(projectId){
