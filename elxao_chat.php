@@ -184,11 +184,56 @@ add_action('rest_api_init',function(){
         'methods'=>'GET','callback'=>'elxao_chat_rest_token',
         'permission_callback'=>fn()=>is_user_logged_in()
     ]);
+    register_rest_route('elxao/v1','/inbox-token',[
+        'methods'=>'GET','callback'=>'elxao_chat_rest_inbox_token',
+        'permission_callback'=>fn()=>is_user_logged_in()
+    ]);
     register_rest_route('elxao/v1','/chat-window',[
         'methods'=>'GET','callback'=>'elxao_chat_rest_window',
         'permission_callback'=>fn()=>is_user_logged_in()
     ]);
 });
+
+function elxao_chat_request_ably_token($uid,array $capability,$ttl_ms=3600000){
+    if ( ! defined('ELXAO_ABLY_KEY') || ! ELXAO_ABLY_KEY )
+        return new WP_Error('no_ably','No Ably key',['status'=>500]);
+
+    if(empty($capability))
+        return new WP_Error('no_capability','No capability',['status'=>400]);
+
+    $parts=explode(':',ELXAO_ABLY_KEY,2);
+    $key_id=$parts[0]??'';
+    if(!$key_id)
+        return new WP_Error('token_fail','Token error',['status'=>500]);
+
+    $endpoint='https://rest.ably.io/keys/'.$key_id.'/requestToken';
+    $body=[
+        'capability'=>wp_json_encode($capability),
+        'clientId'=>'wpuser_'.$uid,
+    ];
+    if($ttl_ms){
+        $body['ttl']=(int)$ttl_ms;
+    }
+
+    $ch=curl_init($endpoint);
+    curl_setopt_array($ch,[
+        CURLOPT_HTTPHEADER=>['Content-Type: application/json','Authorization: Basic '.base64_encode(ELXAO_ABLY_KEY)],
+        CURLOPT_POST=>true, CURLOPT_POSTFIELDS=>wp_json_encode($body),
+        CURLOPT_RETURNTRANSFER=>true, CURLOPT_TIMEOUT=>10
+    ]);
+    $resp=curl_exec($ch);
+    $code=curl_getinfo($ch,CURLINFO_HTTP_CODE);
+    curl_close($ch);
+
+    if($code<200||$code>=300)
+        return new WP_Error('token_fail','Token error',['status'=>500]);
+
+    $data=json_decode($resp,true);
+    if(!is_array($data))
+        return new WP_Error('token_fail','Token error',['status'=>500]);
+
+    return $data;
+}
 
 function elxao_chat_rest_send(WP_REST_Request $r){
     global $wpdb; $t=$wpdb->prefix.'elxao_chat_messages';
@@ -229,7 +274,7 @@ function elxao_chat_rest_send(WP_REST_Request $r){
             'at'=>$now
         ]
     ]);
-    return new WP_REST_Response(['ok'=>true],200);
+    return new WP_REST_Response(['ok'=>true,'project_id'=>$pid,'at'=>$now],200);
 }
 
 function elxao_chat_rest_history(WP_REST_Request $r){
@@ -253,28 +298,38 @@ function elxao_chat_rest_history(WP_REST_Request $r){
 }
 
 function elxao_chat_rest_token(WP_REST_Request $r){
-    if ( ! defined('ELXAO_ABLY_KEY') || ! ELXAO_ABLY_KEY )
-        return new WP_Error('no_ably','No Ably key',['status'=>500]);
-
     $pid=(int)$r['project_id']; $uid=get_current_user_id();
     if(!elxao_chat_user_can_access_project($pid,$uid))
         return new WP_Error('forbidden','Not allowed',['status'=>403]);
 
     $room=elxao_chat_room_id($pid);
-    $key_id=strtok(ELXAO_ABLY_KEY,':');
-    $endpoint='https://rest.ably.io/keys/'.$key_id.'/requestToken';
-    $cap=[$room=>['subscribe','presence']];
-    $body=['capability'=>wp_json_encode($cap),'clientId'=>'wpuser_'.$uid,'ttl'=>60*60*1000];
+    $token=elxao_chat_request_ably_token($uid,[$room=>['subscribe','presence']]);
+    if(is_wp_error($token)) return $token;
+    return new WP_REST_Response($token,200);
+}
 
-    $ch=curl_init($endpoint);
-    curl_setopt_array($ch,[
-        CURLOPT_HTTPHEADER=>['Content-Type: application/json','Authorization: Basic '.base64_encode(ELXAO_ABLY_KEY)],
-        CURLOPT_POST=>true, CURLOPT_POSTFIELDS=>wp_json_encode($body),
-        CURLOPT_RETURNTRANSFER=>true, CURLOPT_TIMEOUT=>10
-    ]);
-    $resp=curl_exec($ch); $code=curl_getinfo($ch,CURLINFO_HTTP_CODE); curl_close($ch);
-    if($code<200||$code>=300) return new WP_Error('token_fail','Token error',['status'=>500]);
-    return new WP_REST_Response(json_decode($resp,true),200);
+function elxao_chat_rest_inbox_token(WP_REST_Request $r){
+    $uid=get_current_user_id();
+    $ids=$r->get_param('project_ids');
+    if(is_null($ids)) $ids=[];
+    if(!is_array($ids)) $ids=[$ids];
+
+    $ids=array_unique(array_map('intval',$ids));
+
+    $capability=[];
+    foreach($ids as $pid){
+        if(!$pid) continue;
+        if(!elxao_chat_user_can_access_project($pid,$uid)) continue;
+        $room=elxao_chat_room_id($pid);
+        $capability[$room]=['subscribe'];
+    }
+
+    if(empty($capability))
+        return new WP_Error('no_rooms','No accessible rooms',['status'=>403]);
+
+    $token=elxao_chat_request_ably_token($uid,$capability);
+    if(is_wp_error($token)) return $token;
+    return new WP_REST_Response($token,200);
 }
 
 function elxao_chat_rest_window(WP_REST_Request $r){
@@ -379,6 +434,7 @@ const pid=root.dataset.project,room=root.dataset.room,rest=root.dataset.rest,non
 const myId=parseInt(root.dataset.myid,10)||0;
 const myRole=(root.dataset.myrole||'other');
 const hdr={'X-WP-Nonce':nonce};
+const projectId=parseInt(pid,10)||0;
 
 function addLine(text, cls){
   const d=document.createElement('div'); d.className=cls||'';
@@ -395,7 +451,7 @@ function send(content){
   return fetch(rest+'elxao/v1/messages',{
     method:'POST', credentials:'same-origin',
     headers:Object.assign({'Content-Type':'application/json'},hdr),
-    body:JSON.stringify({project_id:parseInt(pid,10),content:content})
+    body:JSON.stringify({project_id:projectId||parseInt(pid,10),content:content})
   }).then(r=>r.json());
 }
 
@@ -434,7 +490,20 @@ btn.addEventListener('click', function(){
   const meName = '<?php echo $meName;?>';
   addLine(meName+': '+v, myRole);
   ta.value=''; btn.disabled=true;
-  send(v).finally(()=>{ btn.disabled=false; ta.focus(); });
+  send(v)
+    .then(function(resp){
+      if(resp && resp.ok){
+        const detailProject=resp.project_id?parseInt(resp.project_id,10):projectId;
+        const resolvedProject=detailProject||projectId;
+        if(resolvedProject){
+          const payload={ projectId: resolvedProject };
+          if(resp.at) payload.at=resp.at;
+          window.dispatchEvent(new CustomEvent('elxao:room-bump',{detail:payload}));
+        }
+      }
+    })
+    .catch(function(err){ console.error('Failed to send chat message',err); })
+    .finally(()=>{ btn.disabled=false; ta.focus(); });
 });
 
 // Ctrl/Cmd+Enter quick send; Enter alone makes new line
@@ -469,10 +538,15 @@ function elxao_chat_render_inbox(){
       <?php if($rooms){ foreach($rooms as $idx=>$room){
         $label=sprintf('#%d · %s',$room['id'],$room['title']);
         $activity=elxao_chat_format_activity($room['latest']);
+        $room_id=elxao_chat_room_id($room['id']);
+        $timestamp_attr=$room['timestamp']? (int)$room['timestamp'] : 0;
       ?>
       <button type="button"
               class="room<?php echo $idx===0?' active':''; ?>"
-              data-project="<?php echo (int)$room['id']; ?>">
+              data-project="<?php echo (int)$room['id']; ?>"
+              data-room="<?php echo esc_attr($room_id); ?>"
+              data-latest="<?php echo esc_attr($room['latest']); ?>"
+              data-timestamp="<?php echo esc_attr($timestamp_attr); ?>">
         <span class="label"><?php echo esc_html($label); ?></span>
         <span class="meta"><?php echo esc_html($activity?:'—'); ?></span>
       </button>
@@ -517,9 +591,85 @@ if(!root) return;
 const rest=root.dataset.rest||'';
 const nonce=root.dataset.nonce||'';
 const chat=root.querySelector('.chat-pane');
-const rooms=Array.from(root.querySelectorAll('.room'));
+const roomList=root.querySelector('.room-list');
+const rooms=Array.from(roomList?roomList.querySelectorAll('.room'):[]);
 const headers={'X-WP-Nonce':nonce,'Accept':'application/json'};
+const roomMap=new Map();
+const subscribedChannels=new Set();
 let active=null;
+
+function parseTimestamp(value){
+  if(value instanceof Date) return value;
+  if(typeof value==='number' && isFinite(value)) return new Date(value);
+  const str=String(value||'').trim();
+  if(!str) return null;
+  if(/^-?\d+$/.test(str)){
+    const num=parseInt(str,10);
+    if(str.length<=10) return new Date(num*1000);
+    return new Date(num);
+  }
+  const normalized=str.replace(' ','T');
+  const date=new Date(normalized);
+  return isNaN(date.getTime())?null:date;
+}
+
+function pad(v){ return v<10?'0'+v:''+v; }
+
+function formatTimestamp(date){
+  if(!(date instanceof Date) || isNaN(date.getTime())) return '—';
+  const months=['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
+  return months[date.getMonth()]+' '+date.getDate()+', '+pad(date.getHours())+':'+pad(date.getMinutes());
+}
+
+function updateMetaText(room,date){
+  if(!room) return;
+  const meta=room.querySelector('.meta');
+  if(meta && date instanceof Date && !isNaN(date.getTime())){
+    meta.textContent=formatTimestamp(date);
+  } else if(meta && !meta.textContent){
+    meta.textContent='—';
+  }
+}
+
+function setRoomActivity(room,source){
+  const date=parseTimestamp(source);
+  if(!date) return;
+  room.dataset.timestamp=String(date.getTime());
+  room.dataset.latest=date.toISOString();
+  updateMetaText(room,date);
+}
+
+rooms.forEach(function(room){
+  const pid=room.getAttribute('data-project');
+  if(pid) roomMap.set(String(pid),room);
+  const latestAttr=room.getAttribute('data-latest');
+  const tsAttr=room.getAttribute('data-timestamp');
+  const tsNumeric=tsAttr?parseInt(tsAttr,10):0;
+  if(latestAttr){
+    setRoomActivity(room,latestAttr);
+  } else if(tsNumeric>0){
+    setRoomActivity(room,tsAttr);
+  } else {
+    room.dataset.timestamp=room.dataset.timestamp||'0';
+    room.dataset.latest=room.dataset.latest||'';
+  }
+});
+
+function bumpRoom(projectId,activity){
+  if(!projectId) return;
+  const key=String(projectId);
+  const room=roomMap.get(key);
+  if(!room) return;
+  const date=(activity instanceof Date)?activity:(parseTimestamp(activity)||new Date());
+  const newTime=date.getTime();
+  const currentTime=parseInt(room.dataset.timestamp||'0',10);
+  if(currentTime && newTime && newTime<currentTime) return;
+  setRoomActivity(room,date);
+  const parent=room.parentElement;
+  if(parent && parent.firstElementChild!==room){
+    parent.insertBefore(room,parent.firstElementChild);
+  }
+}
 
 function renderHTML(html){
   if(!chat) return;
@@ -570,9 +720,89 @@ rooms.forEach(function(room){
   room.addEventListener('click',function(){ loadRoom(room); });
 });
 
+function ensureAblyClient(token){
+  function subscribeChannels(client){
+    rooms.forEach(function(room){
+      const channelName=room.getAttribute('data-room');
+      if(!channelName) return;
+      if(subscribedChannels.has(channelName)) return;
+      subscribedChannels.add(channelName);
+      const channel=client.channels.get(channelName);
+      channel.subscribe(function(msg){
+        const data=msg&&msg.data?msg.data:{};
+        const project=data.project||room.getAttribute('data-project');
+        const at=data.at||data.published_at||Date.now();
+        bumpRoom(project,at);
+      });
+    });
+  }
+
+  function start(){
+    if(root._ablyClient){
+      subscribeChannels(root._ablyClient);
+      return;
+    }
+    if(!window.Ably || !window.Ably.Realtime || !window.Ably.Realtime.Promise) return;
+    const client=new window.Ably.Realtime.Promise({tokenDetails:token});
+    root._ablyClient=client;
+    subscribeChannels(client);
+  }
+
+  if(window.Ably && window.Ably.Realtime && window.Ably.Realtime.Promise){
+    start();
+  } else {
+    const existing=document.querySelector('script[data-elxao-ably]');
+    if(existing){
+      existing.addEventListener('load',start,{once:true});
+    } else {
+      const s=document.createElement('script');
+      s.src='https://cdn.ably.io/lib/ably.min-1.js';
+      s.async=true;
+      s.setAttribute('data-elxao-ably','1');
+      s.onload=start;
+      s.onerror=function(){ console.error('Failed to load Ably library'); };
+      document.head.appendChild(s);
+    }
+  }
+}
+
+function subscribeInbox(){
+  if(!rooms.length || !rest) return;
+  const params=[];
+  const seen=new Set();
+  rooms.forEach(function(room){
+    const pid=room.getAttribute('data-project');
+    if(!pid || seen.has(pid)) return;
+    seen.add(pid);
+    params.push('project_ids[]='+encodeURIComponent(pid));
+  });
+  if(!params.length) return;
+  fetch(rest+'elxao/v1/inbox-token?'+params.join('&'),{
+    credentials:'same-origin',
+    headers:headers
+  }).then(function(r){
+    if(!r.ok) throw new Error(''+r.status);
+    return r.json();
+  }).then(function(token){
+    if(token && !token.error){
+      ensureAblyClient(token);
+    }
+  }).catch(function(err){
+    console.warn('ELXAO inbox realtime unavailable',err);
+  });
+}
+
 if(rooms.length){
   loadRoom(rooms[0]);
+  subscribeInbox();
 }
+
+window.addEventListener('elxao:room-bump',function(ev){
+  const detail=ev&&ev.detail?ev.detail:{};
+  if(detail && detail.projectId){
+    bumpRoom(detail.projectId,detail.at||Date.now());
+  }
+});
 })();
 </script>
 <?php
