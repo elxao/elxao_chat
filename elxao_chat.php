@@ -685,6 +685,42 @@ if(!window.ELXAO_CHAT_BUS){
     window.ELXAO_CHAT_BUS=state;
   })();
 }
+if(!window.ELXAO_CHAT_RESOLVE_PROJECT_ID){
+  window.ELXAO_CHAT_RESOLVE_PROJECT_ID=function(){
+    const args=Array.prototype.slice.call(arguments);
+    const parseValue=function(value){
+      if(value===undefined||value===null) return 0;
+      if(typeof value==='number' && isFinite(value)){ const num=value<0?-value:value; return num>0?Math.floor(num):0; }
+      if(typeof value==='string'){
+        const trimmed=value.trim();
+        if(!trimmed) return 0;
+        if(/^-?\d+$/.test(trimmed)) return Math.abs(parseInt(trimmed,10));
+        const match=trimmed.match(/(-?\d+)/);
+        return match?Math.abs(parseInt(match[1],10)):0;
+      }
+      if(Array.isArray(value)){
+        for(let i=0;i<value.length;i++){ const result=parseValue(value[i]); if(result) return result; }
+        return 0;
+      }
+      if(typeof value==='object'){
+        const keys=['project','project_id','projectId','projectID','id','room','room_id','roomId'];
+        for(let i=0;i<keys.length;i++){
+          const key=keys[i];
+          if(Object.prototype.hasOwnProperty.call(value,key)){
+            const result=parseValue(value[key]);
+            if(result) return result;
+          }
+        }
+      }
+      return 0;
+    };
+    for(let i=0;i<args.length;i++){
+      const resolved=parseValue(args[i]);
+      if(resolved) return resolved;
+    }
+    return 0;
+  };
+}
 if(!window.ELXAO_CHAT_BUILD_NORMALIZER){
   window.ELXAO_CHAT_BUILD_NORMALIZER=function(){
     const roles=new Set(['client','pm','admin','other','sys']);
@@ -877,9 +913,26 @@ if(!window.ELXAO_ABLY){
     if(!entry.handler){
       entry.handler=function(msg){
         const data=(msg&&msg.data)?msg.data:{};
-        const projectId=data.project||entry.projectId||project||0;
+        const resolve=window.ELXAO_CHAT_RESOLVE_PROJECT_ID;
+        const hintedProject=resolve(
+          data && typeof data==='object' ? data.project : (data&&data.project),
+          data && typeof data==='object' ? data.project_id : undefined,
+          data && typeof data==='object' ? data.projectId : undefined,
+          data && typeof data==='object' ? data.projectID : undefined,
+          entry && entry.projectId,
+          project
+        );
+        const projectId=hintedProject || resolve(entry && entry.projectId, project);
         const extras={}; if(msg && 'id' in msg) extras.id=msg.id; if(msg && 'name' in msg) extras.name=msg.name;
-        window.ELXAO_CHAT_BROADCAST(projectId,data,extras);
+        let payload=data;
+        if(payload && typeof payload==='object' && !Array.isArray(payload)){
+          if(projectId && resolve(payload.project)!==projectId){
+            payload=Object.assign({},payload,{project:projectId});
+          } else if(projectId && !('project' in payload)){
+            payload=Object.assign({},payload,{project:projectId});
+          }
+        }
+        window.ELXAO_CHAT_BROADCAST(projectId,payload,extras);
       };
       entry.channel.subscribe(entry.handler);
     }
@@ -1515,6 +1568,42 @@ if(!window.ELXAO_CHAT_BUILD_NORMALIZER){
 if(!window.ELXAO_CHAT_NORMALIZE){
   window.ELXAO_CHAT_NORMALIZE=window.ELXAO_CHAT_BUILD_NORMALIZER();
 }
+if(!window.ELXAO_CHAT_RESOLVE_PROJECT_ID){
+  window.ELXAO_CHAT_RESOLVE_PROJECT_ID=function(){
+    const args=Array.prototype.slice.call(arguments);
+    const parseValue=function(value){
+      if(value===undefined||value===null) return 0;
+      if(typeof value==='number' && isFinite(value)){ const num=value<0?-value:value; return num>0?Math.floor(num):0; }
+      if(typeof value==='string'){
+        const trimmed=value.trim();
+        if(!trimmed) return 0;
+        if(/^-?\d+$/.test(trimmed)) return Math.abs(parseInt(trimmed,10));
+        const match=trimmed.match(/(-?\d+)/);
+        return match?Math.abs(parseInt(match[1],10)):0;
+      }
+      if(Array.isArray(value)){
+        for(let i=0;i<value.length;i++){ const result=parseValue(value[i]); if(result) return result; }
+        return 0;
+      }
+      if(typeof value==='object'){
+        const keys=['project','project_id','projectId','projectID','id','room','room_id','roomId'];
+        for(let i=0;i<keys.length;i++){
+          const key=keys[i];
+          if(Object.prototype.hasOwnProperty.call(value,key)){
+            const result=parseValue(value[key]);
+            if(result) return result;
+          }
+        }
+      }
+      return 0;
+    };
+    for(let i=0;i<args.length;i++){
+      const resolved=parseValue(args[i]);
+      if(resolved) return resolved;
+    }
+    return 0;
+  };
+}
 if(!window.ELXAO_ABLY){
   window.ELXAO_ABLY={client:null,clientPromise:null,libraryPromise:null,channels:new Map()};
   window.ELXAO_ABLY.loadLibrary=function(){
@@ -1563,10 +1652,27 @@ if(!window.ELXAO_ABLY){
             data={};
           }
         }
-        const projectId=data.project||entry.projectId||project||0;
-        window.ELXAO_CHAT_BUS.emit({project:projectId,payload:window.ELXAO_CHAT_NORMALIZE(data,projectId)});
+        const resolve=window.ELXAO_CHAT_RESOLVE_PROJECT_ID;
+        const hintedProject=resolve(
+          data && data.project,
+          data && data.project_id,
+          data && data.projectId,
+          data && data.projectID,
+          entry && entry.projectId,
+          project
+        );
+        const projectId=hintedProject || resolve(entry && entry.projectId, project);
+        let payload=data;
+        if(payload && typeof payload==='object' && !Array.isArray(payload)){
+          if(projectId && resolve(payload.project)!==projectId){
+            payload=Object.assign({},payload,{project:projectId});
+          } else if(projectId && !('project' in payload)){
+            payload=Object.assign({},payload,{project:projectId});
+          }
+        }
+        window.ELXAO_CHAT_BUS.emit({project:projectId,payload:window.ELXAO_CHAT_NORMALIZE(payload,projectId)});
         if(projectId){
-          const bumpAt=data.at||data.published_at||Date.now();
+          const bumpAt=(payload&&payload.at)||data.at||data.published_at||Date.now();
           window.dispatchEvent(new CustomEvent('elxao:room-bump',{detail:{projectId:projectId,at:bumpAt}}));
         }
       };
