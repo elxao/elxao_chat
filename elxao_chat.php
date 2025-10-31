@@ -369,6 +369,7 @@ function elxao_chat_rest_send(WP_REST_Request $r){
     $wpdb->insert($t,[
         'project_id'=>$pid,'user_id'=>$uid,'content'=>$msg,'content_type'=>'text','published_at'=>$now
     ]);
+    $message_id = (int)$wpdb->insert_id;
 
     // Update latest_message_at for inbox ordering
     if(function_exists('update_field')){
@@ -391,6 +392,7 @@ function elxao_chat_rest_send(WP_REST_Request $r){
         'name'=>'text',
         'data'=>[
             'type'=>'text',
+            'id'=>$message_id,
             'message'=>$msg,
             'project'=>$pid,
             'user'=>$uid,
@@ -405,7 +407,18 @@ function elxao_chat_rest_send(WP_REST_Request $r){
             ],
         ]
     ]);
-    return new WP_REST_Response(['ok'=>true,'project_id'=>$pid,'at'=>$now],200);
+    return new WP_REST_Response([
+        'ok'          => true,
+        'project_id'  => $pid,
+        'id'          => $message_id,
+        'at'          => $now,
+        'read_status' => $read_status,
+        'read_times'  => $reads,
+        'reads'       => [
+            'roles' => $read_status,
+            'times' => $reads,
+        ],
+    ],200);
 }
 
 function elxao_chat_rest_history(WP_REST_Request $r){
@@ -414,10 +427,37 @@ function elxao_chat_rest_history(WP_REST_Request $r){
     if(!elxao_chat_user_can_access_project($pid,$uid))
         return new WP_Error('forbidden','Not allowed',['status'=>403]);
 
-    $limit=min(200,max(1,(int)($r['limit']?:50)));
-    $rows=$wpdb->get_results($wpdb->prepare(
-        "SELECT id,project_id,user_id,content,content_type,published_at
-         FROM $t WHERE project_id=%d ORDER BY published_at ASC,id ASC LIMIT %d",$pid,$limit),ARRAY_A);
+    $limit = min(200,max(1,(int)($r['limit']?:50)));
+
+    $after_raw = $r->get_param('after');
+    $after_id  = (int)$r->get_param('after_id');
+    $after     = elxao_chat_normalize_datetime_value($after_raw);
+
+    $where_clauses = ['project_id=%d'];
+    $params = [$pid];
+
+    if ($after) {
+        if ($after_id > 0) {
+            $where_clauses[] = '(published_at > %s OR (published_at = %s AND id > %d))';
+            $params[] = $after;
+            $params[] = $after;
+            $params[] = $after_id;
+        } else {
+            $where_clauses[] = 'published_at > %s';
+            $params[] = $after;
+        }
+    } elseif ($after_id > 0) {
+        $where_clauses[] = 'id > %d';
+        $params[] = $after_id;
+    }
+
+    $where_sql = implode(' AND ',$where_clauses);
+    $params[] = $limit;
+
+    $sql = "SELECT id,project_id,user_id,content,content_type,published_at
+            FROM $t WHERE $where_sql ORDER BY published_at ASC,id ASC LIMIT %d";
+
+    $rows = $wpdb->get_results($wpdb->prepare($sql,...$params),ARRAY_A);
 
     foreach($rows as &$row){
         $u=get_userdata($row['user_id']);
@@ -665,6 +705,12 @@ let readSyncTimer=null;
 let readSyncPending=false;
 let readSyncInFlight=false;
 let isRenderingHistory=false;
+let latestAt='';
+let latestId=0;
+let fallbackActive=false;
+let fallbackTimer=null;
+let fallbackInFlight=false;
+const FALLBACK_INTERVAL=4000;
 const currentReadTimes={client:'',pm:'',admin:''};
 const DEBUG=false;
 
@@ -1000,6 +1046,25 @@ function updateCurrentReadTimes(times){
     }
   });
 }
+function updateLatestFromPayload(data){
+  if(!data || typeof data!=='object') return;
+  const stampRaw=data.at||data.published_at||data.created_at||data.timestamp||'';
+  const stamp=stampRaw?String(stampRaw):'';
+  const idValue=('id' in data)?data.id:('message_id' in data?data.message_id:null);
+  const numericId=(idValue!==undefined&&idValue!==null)?parseInt(idValue,10):0;
+  const shouldUpdate=function(currentStamp,currentId,newStamp,newId){
+    if(!currentStamp && !currentId) return true;
+    if(newStamp && !currentStamp) return true;
+    if(newStamp && currentStamp && newStamp>currentStamp) return true;
+    if(newStamp && currentStamp && newStamp===currentStamp && newId>currentId) return true;
+    if(!newStamp && newId>currentId) return true;
+    return false;
+  };
+  if(shouldUpdate(latestAt,latestId,stamp,numericId)){
+    if(stamp) latestAt=stamp;
+    if(numericId>0) latestId=numericId;
+  }
+}
 function parseReadTime(value){
   if(value===undefined || value===null || value==='') return 0;
   if(value instanceof Date) return value.getTime();
@@ -1246,6 +1311,7 @@ function appendChatLine(data){
   if('user' in data && data.user!==undefined && data.user!==null) line.dataset.user=String(data.user);
   list.appendChild(line);
   list.scrollTop=list.scrollHeight;
+  updateLatestFromPayload(data);
   if(!isRenderingHistory && role!=='sys' && (data.user||0)!==myId){
     scheduleReadSync();
   }
@@ -1264,7 +1330,14 @@ function isRecentLocal(fp){
   localEchoes.delete(fp); return (Date.now()-ts<=5000);
 }
 
-function load(){ return fetch(rest+'elxao/v1/messages?project_id='+pid,{credentials:'same-origin',headers:hdr}).then(r=>r.json()); }
+function load(params){
+  const query=['project_id='+encodeURIComponent(pid||'')];
+  if(params && params.after){ query.push('after='+encodeURIComponent(params.after)); }
+  if(params && params.after_id){ query.push('after_id='+encodeURIComponent(params.after_id)); }
+  if(params && params.limit){ query.push('limit='+encodeURIComponent(params.limit)); }
+  const url=rest+'elxao/v1/messages?'+query.join('&');
+  return fetch(url,{credentials:'same-origin',headers:hdr}).then(r=>r.json());
+}
 function token(){ return fetch(rest+'elxao/v1/chat-token?project_id='+pid,{credentials:'same-origin',headers:hdr}).then(r=>r.json()); }
 function send(content){
   return fetch(rest+'elxao/v1/messages',{ method:'POST', credentials:'same-origin',
@@ -1309,10 +1382,14 @@ function onChatEvent(ev){
 }
 
 function subscribeRealtime(tokenDetails){
+  if(!isValidRealtimeToken(tokenDetails)){
+    return Promise.reject(new Error('Invalid realtime token'));
+  }
   return window.ELXAO_ABLY.ensureClient(tokenDetails).then(function(client){
     if(realtimeCleanup){ try{ realtimeCleanup(); }catch(e){} realtimeCleanup=null; }
     const unsubscribe=window.ELXAO_ABLY.registerChannel(client,room,projectId,handleRealtimePayload);
     realtimeCleanup=unsubscribe;
+    stopFallbackPolling();
   });
 }
 
@@ -1321,6 +1398,7 @@ function cleanup(){
   if(busCleanup){ try{ busCleanup(); }catch(e){} busCleanup=null; }
   if(readSyncTimer){ clearTimeout(readSyncTimer); readSyncTimer=null; }
   readSyncPending=false;
+  stopFallbackPolling();
   window.removeEventListener('elxao:chat',onChatEvent);
   window.removeEventListener('beforeunload',cleanup);
 }
@@ -1335,32 +1413,127 @@ if(window.ELXAO_CHAT_BUS.channel && window.ELXAO_CHAT_BUS.channel.addEventListen
 }
 window.addEventListener('beforeunload',cleanup,{once:true});
 
+function mapHistoryItem(item){
+  if(!item || typeof item!=='object') return null;
+  return {
+    type:item.content_type,
+    message:item.content,
+    project:item.project_id||projectId,
+    user:item.user_id,
+    user_display:item.user_display||item.user_name,
+    role:item.role,
+    at:item.published_at,
+    id:item.id
+  };
+}
 function renderHistory(items){
   if(!items||!Array.isArray(items)) return;
   isRenderingHistory=true;
+  latestAt='';
+  latestId=0;
   try{
     if(list) list.innerHTML='';
     items.forEach(function(m){
-      const payload=Object.assign({},m,{
-        type:m.content_type,
-        message:m.content,
-        project:m.project_id||projectId,
-        user:m.user_id,
-        user_display:m.user_display||m.user_name,
-        role:m.role,
-        at:m.published_at
-      });
-      handleChatPayload(payload);
+      const payload=mapHistoryItem(m);
+      if(payload) handleChatPayload(payload);
     });
   } finally {
     isRenderingHistory=false;
   }
 }
+function processIncrementalHistory(items){
+  if(!items||!Array.isArray(items)) return;
+  items.forEach(function(m){
+    const payload=mapHistoryItem(m);
+    if(payload) handleChatPayload(payload);
+  });
+}
+function pollForUpdates(){
+  if(fallbackInFlight) return Promise.resolve();
+  if(!pid || !rest) return Promise.resolve();
+  const params={limit:100};
+  if(latestAt) params.after=latestAt;
+  if(latestId) params.after_id=latestId;
+  fallbackInFlight=true;
+  return load(params)
+    .then(function(r){
+      if(r && typeof r==='object'){
+        if(r.reads) updateCurrentReadTimes(r.reads);
+        if(r.items && Array.isArray(r.items) && r.items.length){
+          processIncrementalHistory(r.items);
+        }
+      }
+    })
+    .catch(function(){})
+    .finally(function(){ fallbackInFlight=false; });
+}
+function isValidRealtimeToken(token){
+  if(!token || typeof token!=='object') return false;
+  if(token.error || token.code) return false;
+  if(token.token || token.keyName || token.expires || token.issued) return true;
+  return false;
+}
+function scheduleFallback(delay){
+  if(!fallbackActive) return;
+  if(fallbackTimer){ clearTimeout(fallbackTimer); fallbackTimer=null; }
+  const wait=(typeof delay==='number' && delay>=0)?delay:FALLBACK_INTERVAL;
+  fallbackTimer=setTimeout(function(){
+    fallbackTimer=null;
+    pollForUpdates().finally(function(){ if(fallbackActive) scheduleFallback(FALLBACK_INTERVAL); });
+  },wait);
+}
+function startFallbackPolling(initialDelay){
+  if(fallbackActive) return;
+  fallbackActive=true;
+  scheduleFallback(initialDelay!==undefined?initialDelay:FALLBACK_INTERVAL);
+}
+function stopFallbackPolling(){
+  fallbackActive=false;
+  if(fallbackTimer){ clearTimeout(fallbackTimer); fallbackTimer=null; }
+  fallbackInFlight=false;
+}
+function applyServerAck(resp){
+  if(!resp || !list) return;
+  const ackId=('id' in resp && resp.id!==undefined && resp.id!==null)?parseInt(resp.id,10):0;
+  const ackAt=resp.at||resp.published_at||'';
+  const ackTimes=extractReadTimes(resp);
+  const ackStatus=(resp && resp.read_status && typeof resp.read_status==='object')?resp.read_status:null;
+  const lines=list.children?Array.from(list.children):[];
+  for(let i=lines.length-1;i>=0;i--){
+    const line=lines[i];
+    if(!line||!line.__chatPayload) continue;
+    const payload=line.__chatPayload;
+    if((payload.user||0)!==myId) continue;
+    if(ackId && payload.id && parseInt(payload.id,10)!==ackId) continue;
+    if(ackId){
+      payload.id=ackId;
+      line.dataset.messageId=String(ackId);
+    }
+    if(ackAt){
+      payload.at=ackAt;
+      line.dataset.at=String(ackAt);
+    }
+    if(ackTimes){
+      payload.reads=payload.reads||{};
+      payload.reads.times=Object.assign({},ackTimes);
+      updateCurrentReadTimes(ackTimes);
+    }
+    if(ackStatus){
+      payload.read_status=Object.assign({},ackStatus);
+      payload.reads=payload.reads||{};
+      payload.reads.roles=Object.assign({},ackStatus);
+    }
+    const indicator=line.querySelector('.chat-read-indicator');
+    if(indicator) applyIndicatorState(indicator,determineIndicator(payload,payload.role||line.dataset.role||'other'));
+    updateLatestFromPayload(payload);
+    break;
+  }
+}
 
 /* Subscribe first, then load history (avoid race) */
 token()
-  .then(function(tk){ if(!tk||tk.error) throw tk||new Error('token'); return subscribeRealtime(tk); })
-  .catch(function(err){ console.warn('ELXAO chat realtime unavailable',err); })
+  .then(function(tk){ if(!isValidRealtimeToken(tk)) throw (tk&&tk.message)?new Error(tk.message):new Error('token'); return subscribeRealtime(tk); })
+  .catch(function(err){ console.warn('ELXAO chat realtime unavailable',err); startFallbackPolling(1000); })
   .then(function(){ return load(); })
   .then(function(r){
     if(r && typeof r==='object'){
@@ -1368,7 +1541,7 @@ token()
       if(r.items && Array.isArray(r.items)) renderHistory(r.items);
     }
   })
-  .catch(function(err){ console.error('ELXAO chat history unavailable',err); });
+  .catch(function(err){ console.error('ELXAO chat history unavailable',err); if(!fallbackActive) startFallbackPolling(FALLBACK_INTERVAL); });
 
 btn.addEventListener('click', function(){
   const v = ta.value.replace(/\s+$/,''); if(!v.trim()) return;
@@ -1379,8 +1552,9 @@ btn.addEventListener('click', function(){
     if(resp && resp.ok){
       const resolvedProject=resp.project_id?parseInt(resp.project_id,10):projectId;
       if(resolvedProject){
-        window.ELXAO_CHAT_BROADCAST(resolvedProject,{ type:'text', message:v, project:resolvedProject, user:myId, user_display:meName, role:myRole, at:resp.at||new Date().toISOString()});
+        window.ELXAO_CHAT_BROADCAST(resolvedProject,{ type:'text', message:v, project:resolvedProject, user:myId, user_display:meName, role:myRole, at:resp.at||new Date().toISOString(), id:resp.id });
       }
+      applyServerAck(resp);
     }
   }).catch(function(err){ console.error('Failed to send chat message',err); })
     .finally(()=>{ btn.disabled=false; ta.focus(); });
