@@ -494,36 +494,17 @@ function elxao_chat_rest_history(WP_REST_Request $r){
     $role = elxao_chat_role_for_user($pid,$uid);
     $participants = elxao_chat_get_client_pm_ids($pid);
     $reads = elxao_chat_get_last_reads($pid);
-    $reads_before = $reads;
-    $updated_reads = false;
-
-    if(in_array($role,['client','pm','admin'],true)){
-        $maybe = elxao_chat_update_last_read($pid,$role,current_time('timestamp'));
-        if($maybe){
-            $reads = $maybe;
-            $updated_reads = true;
-        }
-    }
 
     foreach($rows as &$row){
-        $pre_status = elxao_chat_build_message_read_status($pid,$row['role'],$row['published_at'],$reads_before,$participants);
         $status = elxao_chat_build_message_read_status($pid,$row['role'],$row['published_at'],$reads,$participants);
         $row['read_status']=$status;
         $row['reads']=[
             'roles'=>$status,
             'times'=>$reads,
         ];
-        if(in_array($role,['client','pm','admin'],true) && isset($pre_status[$role])){
-            $row['viewer_unread'] = !$pre_status[$role];
-        } else {
-            $row['viewer_unread'] = false;
-        }
+        $row['viewer_unread'] = (in_array($role,['client','pm','admin'],true) && isset($status[$role])) ? !$status[$role] : false;
     }
     unset($row);
-
-    if($updated_reads){
-        elxao_chat_publish_read_receipt($pid,$reads,$uid);
-    }
 
     return new WP_REST_Response([
         'items'=>$rows,
@@ -755,6 +736,8 @@ let indicatorObserverDisabled=false;
 let focusHandler=null;
 let visibilityHandler=null;
 let pageShowHandler=null;
+let viewerEngaged=false;
+let blurHandler=null;
 
 /* ---------- Shared helpers (guarded singletons) ---------- */
 if(!window.ELXAO_CHAT_BUS){
@@ -1447,15 +1430,77 @@ function viewerHasAttention(){
   return true;
 }
 
+function chatIsVisiblyMounted(){
+  if(!root) return false;
+  const rect=root.getBoundingClientRect();
+  const vw=window.innerWidth||document.documentElement.clientWidth||0;
+  const vh=window.innerHeight||document.documentElement.clientHeight||0;
+  if(!rect || !Number.isFinite(rect.top) || !Number.isFinite(rect.left)) return false;
+  if(vw<=0 || vh<=0) return false;
+  if(rect.width<=0 || rect.height<=0) return false;
+  if(rect.bottom<=0 || rect.right<=0) return false;
+  if(rect.top>=vh || rect.left>=vw) return false;
+  return true;
+}
+
+function hasUnreadMessages(){
+  if(!list) return false;
+  const lines=list.querySelectorAll('.chat-line.is-unread');
+  if(!lines || !lines.length) return false;
+  for(let i=0;i<lines.length;i++){
+    const line=lines[i];
+    if(!line) continue;
+    const payload=line.__chatPayload||{};
+    const userId=('user' in payload)?(parseInt(payload.user,10)||0):(line.dataset&&line.dataset.user?parseInt(line.dataset.user,10)||0:0);
+    if(userId && userId===myId) continue;
+    const role=(payload.role||line.dataset&&line.dataset.role||'').toString().toLowerCase();
+    if(role==='sys') continue;
+    return true;
+  }
+  return false;
+}
+
+function hasVisibleUnreadMessage(){
+  if(!list) return false;
+  const visibleTop=list.scrollTop||0;
+  const visibleBottom=visibleTop+list.clientHeight;
+  if(visibleBottom<=visibleTop) return false;
+  const lines=list.querySelectorAll('.chat-line.is-unread');
+  for(let i=0;i<lines.length;i++){
+    const line=lines[i];
+    if(!line) continue;
+    const payload=line.__chatPayload||{};
+    const userId=('user' in payload)?(parseInt(payload.user,10)||0):(line.dataset&&line.dataset.user?parseInt(line.dataset.user,10)||0:0);
+    if(userId && userId===myId) continue;
+    const role=(payload.role||line.dataset&&line.dataset.role||'').toString().toLowerCase();
+    if(role==='sys') continue;
+    const top=line.offsetTop;
+    const height=line.offsetHeight||0;
+    const bottom=top+height;
+    if(bottom>visibleTop && top<visibleBottom) return true;
+  }
+  return false;
+}
+
+function viewerReadyForReadSync(){
+  if(!hasUnreadMessages()) return false;
+  if(!viewerHasAttention()) return false;
+  if(viewerEngaged) return true;
+  if(!chatIsVisiblyMounted()) return false;
+  return hasVisibleUnreadMessage();
+}
+
 function ensureReadSyncScheduled(){
   if(!readSyncPending) return;
   if(readSyncInFlight) return;
-  if(!viewerHasAttention()) return;
+  if(!hasUnreadMessages()){ readSyncPending=false; return; }
+  if(!viewerReadyForReadSync()) return;
   if(readSyncTimer) return;
   readSyncTimer=setTimeout(()=>{
     readSyncTimer=null;
     if(!readSyncPending) return;
-    if(!viewerHasAttention()){
+    if(!hasUnreadMessages()){ readSyncPending=false; return; }
+    if(!viewerReadyForReadSync()){
       ensureReadSyncScheduled();
       return;
     }
@@ -1465,7 +1510,8 @@ function ensureReadSyncScheduled(){
 
 function sendReadSync(){
   if(readSyncInFlight) return;
-  if(!viewerHasAttention()){
+  if(!hasUnreadMessages()){ readSyncPending=false; return; }
+  if(!viewerReadyForReadSync()){
     ensureReadSyncScheduled();
     return;
   }
@@ -1499,16 +1545,34 @@ function sendReadSync(){
 function scheduleReadSync(){
   if(!projectId || !rest || !myId) return;
   if(myRole==='other') return;
+  if(!hasUnreadMessages()) return;
   readSyncPending=true;
   ensureReadSyncScheduled();
 }
+
+const markViewerEngaged=function(){
+  viewerEngaged=true;
+  ensureReadSyncScheduled();
+};
+const handleListScroll=function(){
+  ensureReadSyncScheduled();
+};
+const handleWindowScroll=function(){
+  ensureReadSyncScheduled();
+};
+const handleWindowResize=function(){
+  ensureReadSyncScheduled();
+};
 
 focusHandler=function(){
   ensureReadSyncScheduled();
 };
 visibilityHandler=function(){
   if(typeof document==='undefined') return;
-  if(typeof document.hidden==='boolean' && document.hidden) return;
+  if(typeof document.hidden==='boolean' && document.hidden){
+    viewerEngaged=false;
+    return;
+  }
   ensureReadSyncScheduled();
 };
 pageShowHandler=function(){
@@ -1517,6 +1581,17 @@ pageShowHandler=function(){
 window.addEventListener('focus',focusHandler);
 window.addEventListener('pageshow',pageShowHandler);
 document.addEventListener('visibilitychange',visibilityHandler);
+blurHandler=function(){
+  viewerEngaged=false;
+};
+window.addEventListener('blur',blurHandler);
+root.addEventListener('focusin',markViewerEngaged);
+root.addEventListener('pointerdown',markViewerEngaged);
+root.addEventListener('pointerenter',markViewerEngaged);
+root.addEventListener('keydown',markViewerEngaged);
+if(list) list.addEventListener('scroll',handleListScroll,{passive:true});
+window.addEventListener('scroll',handleWindowScroll,{passive:true});
+window.addEventListener('resize',handleWindowResize);
 
 function appendChatLine(source){
   if(!source) return;
@@ -1715,6 +1790,15 @@ function cleanup(){
   if(focusHandler){ window.removeEventListener('focus',focusHandler); focusHandler=null; }
   if(pageShowHandler){ window.removeEventListener('pageshow',pageShowHandler); pageShowHandler=null; }
   if(visibilityHandler){ document.removeEventListener('visibilitychange',visibilityHandler); visibilityHandler=null; }
+  if(blurHandler){ window.removeEventListener('blur',blurHandler); blurHandler=null; }
+  root.removeEventListener('focusin',markViewerEngaged);
+  root.removeEventListener('pointerdown',markViewerEngaged);
+  root.removeEventListener('pointerenter',markViewerEngaged);
+  root.removeEventListener('keydown',markViewerEngaged);
+  if(list) list.removeEventListener('scroll',handleListScroll);
+  window.removeEventListener('scroll',handleWindowScroll);
+  window.removeEventListener('resize',handleWindowResize);
+  viewerEngaged=false;
 }
 
 const observer=new MutationObserver(function(){ if(!document.body.contains(root)){ observer.disconnect(); cleanup(); }});
