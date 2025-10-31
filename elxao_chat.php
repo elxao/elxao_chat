@@ -169,7 +169,7 @@ function elxao_chat_build_message_read_status($pid,$message_role,$published_at,?
     if ($message_role === 'admin')  $status['admin']  = true;
 
     if (empty($participants['client'])) $status['client'] = true;
-    if (empty($participants['pm']))     $status['pm']     = true;
+    if (empty($participants['pm']) && $message_role !== 'admin') $status['pm'] = true;
 
     if ($published_ts) {
         if ($client_ts && $client_ts >= $published_ts) $status['client'] = true;
@@ -1090,7 +1090,7 @@ function buildStatusFromTimes(payload,times){
   if(role==='pm') status.pm=true;
   if(role==='admin') status.admin=true;
   if(!clientId) status.client=true;
-  if(!pmId) status.pm=true;
+  if(!pmId && role!=='admin') status.pm=true;
   const messageTime= parseReadTime(payload&&payload.at) || parseReadTime(payload&&payload.published_at) || parseReadTime(payload&&payload.created_at);
   const pickTime=function(map,keys){
     if(!map || typeof map!=='object') return undefined;
