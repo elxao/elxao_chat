@@ -430,6 +430,7 @@ ob_start();?>
 #elxao-chat-<?php echo $pid;?> .chat-line:last-child{margin-bottom:0}
 #elxao-chat-<?php echo $pid;?> .chat-line .chat-text{flex:1;color:inherit;word-break:break-word;white-space:pre-wrap}
 #elxao-chat-<?php echo $pid;?> .chat-read-indicator{width:10px;height:10px;border-radius:999px;background:var(--chat-read-unread);margin-top:6px;flex:0 0 10px;box-shadow:0 0 0 1px rgba(0,0,0,0.35)}
+#elxao-chat-<?php echo $pid;?> .chat-read-indicator.chat-read-indicator--unread{background:var(--chat-read-unread)}
 #elxao-chat-<?php echo $pid;?> .chat-read-indicator.is-hidden{opacity:0;visibility:hidden}
 #elxao-chat-<?php echo $pid;?> .chat-read-indicator.chat-read-indicator--read{background:var(--chat-read-read)}
 #elxao-chat-<?php echo $pid;?> .chat-read-indicator.chat-read-indicator--client{background:var(--chat-read-client)}
@@ -723,6 +724,7 @@ function determineIndicator(data,role){
   const reads=buildReadState(data);
   const clientRead=!!reads.client;
   const pmRead=!!reads.pm;
+  const viewerRole=(myRole||'other');
   if(role==='client'){
     return {className:pmRead?'chat-read-indicator--read':'chat-read-indicator--unread',label:pmRead?'Read by PM':'Unread by PM'};
   }
@@ -730,10 +732,18 @@ function determineIndicator(data,role){
     return {className:clientRead?'chat-read-indicator--read':'chat-read-indicator--unread',label:clientRead?'Read by client':'Unread by client'};
   }
   if(role==='admin'){
-    if(clientRead && pmRead) return {className:'chat-read-indicator--read',label:'Read by client and PM'};
-    if(pmRead) return {className:'chat-read-indicator--pm',label:'Read by PM'};
-    if(clientRead) return {className:'chat-read-indicator--client',label:'Read by client'};
-    return {className:'chat-read-indicator--unread',label:'Unread by client and PM'};
+    if(viewerRole==='admin'){
+      if(clientRead && pmRead) return {className:'chat-read-indicator--read',label:'Read by client and PM'};
+      if(pmRead && !clientRead) return {className:'chat-read-indicator--pm',label:'Read by PM'};
+      if(clientRead && !pmRead) return {className:'chat-read-indicator--client',label:'Read by client'};
+      return {className:'chat-read-indicator--unread',label:'Unread by client and PM'};
+    }
+    if(viewerRole==='client'){
+      return {className:clientRead?'chat-read-indicator--read':'chat-read-indicator--unread',label:clientRead?'Read by client':'Unread by client'};
+    }
+    if(viewerRole==='pm'){
+      return {className:pmRead?'chat-read-indicator--read':'chat-read-indicator--unread',label:pmRead?'Read by PM':'Unread by PM'};
+    }
   }
   const anyRead=clientRead||pmRead;
   return {className:anyRead?'chat-read-indicator--read':'chat-read-indicator--unread',label:anyRead?'Read':'Unread'};
