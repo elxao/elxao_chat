@@ -752,9 +752,14 @@ const DEBUG=false;
 const indicatorStates=(typeof WeakMap==='function')?new WeakMap():new Map();
 let indicatorObserverInstance=null;
 let indicatorObserverDisabled=false;
+const trackedUnreadLines=new Set();
+const pendingVisibleUnread=new Set();
+let unreadObserverInstance=null;
+let unreadObserverDisabled=false;
 let focusHandler=null;
 let visibilityHandler=null;
 let pageShowHandler=null;
+let scrollHandler=null;
 
 /* ---------- Shared helpers (guarded singletons) ---------- */
 if(!window.ELXAO_CHAT_BUS){
@@ -1280,6 +1285,140 @@ function applyIndicatorState(indicator,info){
   state.signature=signature;
   state.lastInfo=info||null;
 }
+function ensureUnreadObserver(){
+  if(unreadObserverDisabled) return null;
+  if(unreadObserverInstance) return unreadObserverInstance;
+  if(typeof IntersectionObserver==='undefined'){
+    unreadObserverDisabled=true;
+    return null;
+  }
+  try{
+    unreadObserverInstance=new IntersectionObserver(handleUnreadVisibility,{root:list||null,threshold:[0,0.15,0.6]});
+  }catch(err){
+    unreadObserverDisabled=true;
+    unreadObserverInstance=null;
+    return null;
+  }
+  return unreadObserverInstance;
+}
+function handleUnreadVisibility(entries){
+  entries.forEach(entry=>{
+    const line=entry.target;
+    if(!line || !trackedUnreadLines.has(line)) return;
+    const visible=entry.isIntersecting||entry.intersectionRatio>0;
+    if(visible){
+      pendingVisibleUnread.add(line);
+      processPendingVisibleUnread();
+    } else {
+      pendingVisibleUnread.delete(line);
+    }
+  });
+}
+function observeUnreadLine(line){
+  if(!line || line.__unreadObserved) return;
+  const observer=ensureUnreadObserver();
+  if(observer){
+    try{ observer.observe(line); line.__unreadObserved=true; }
+    catch(e){ line.__unreadObserved=false; }
+  }
+}
+function unobserveUnreadLine(line){
+  if(!line) return;
+  pendingVisibleUnread.delete(line);
+  if(line.__unreadObserved && unreadObserverInstance){
+    try{ unreadObserverInstance.unobserve(line); }
+    catch(e){}
+  }
+  line.__unreadObserved=false;
+}
+function lineIsVisible(line){
+  if(!line || typeof line.getBoundingClientRect!=='function') return false;
+  if(!list || typeof list.getBoundingClientRect!=='function') return false;
+  const rect=line.getBoundingClientRect();
+  const containerRect=list.getBoundingClientRect();
+  const top=Math.max(rect.top,containerRect.top);
+  const bottom=Math.min(rect.bottom,containerRect.bottom);
+  const visibleHeight=bottom-top;
+  const lineHeight=rect.height || (rect.bottom-rect.top);
+  if(!Number.isFinite(lineHeight) || lineHeight<=0) return false;
+  const threshold=Math.min(Math.max(lineHeight*0.25,1),lineHeight);
+  return visibleHeight>=threshold;
+}
+function evaluateUnreadVisibility(line){
+  if(!line || !trackedUnreadLines.has(line)) return;
+  if(!line.__chatPayload || !messageIsUnreadForViewer(line.__chatPayload)){
+    stopUnreadTracking(line);
+    return;
+  }
+  if(lineIsVisible(line)){
+    pendingVisibleUnread.add(line);
+    processPendingVisibleUnread();
+  }
+}
+function scheduleUnreadEvaluation(line){
+  if(typeof requestAnimationFrame==='function'){
+    requestAnimationFrame(()=>evaluateUnreadVisibility(line));
+  } else {
+    setTimeout(()=>evaluateUnreadVisibility(line),50);
+  }
+}
+function trackUnreadLine(line){
+  if(!line || !line.__chatPayload) return;
+  trackedUnreadLines.add(line);
+  observeUnreadLine(line);
+  scheduleUnreadEvaluation(line);
+}
+function stopUnreadTracking(line){
+  if(!line) return;
+  trackedUnreadLines.delete(line);
+  unobserveUnreadLine(line);
+}
+function markLineAsSeen(line){
+  if(!line || !line.__chatPayload) return;
+  const payload=line.__chatPayload;
+  let changed=false;
+  if(payload.viewer_unread){
+    payload.viewer_unread=false;
+    changed=true;
+  }
+  if(line.classList && line.classList.contains('is-unread')){
+    line.classList.remove('is-unread');
+    changed=true;
+  }
+  stopUnreadTracking(line);
+  if(changed){
+    scheduleReadSync();
+  }
+}
+function collectVisibleUnread(){
+  trackedUnreadLines.forEach(line=>{
+    if(!line || !line.__chatPayload){
+      stopUnreadTracking(line);
+      return;
+    }
+    if(!messageIsUnreadForViewer(line.__chatPayload)){
+      stopUnreadTracking(line);
+      return;
+    }
+    if(lineIsVisible(line)){
+      pendingVisibleUnread.add(line);
+    }
+  });
+}
+function processPendingVisibleUnread(){
+  if(!pendingVisibleUnread.size) return;
+  if(!viewerHasAttention()) return;
+  const lines=Array.from(pendingVisibleUnread);
+  pendingVisibleUnread.clear();
+  lines.forEach(line=>{
+    if(!line || !trackedUnreadLines.has(line)) return;
+    if(!line.__chatPayload || !messageIsUnreadForViewer(line.__chatPayload)){
+      stopUnreadTracking(line);
+      return;
+    }
+    markLineAsSeen(line);
+  });
+}
 function buildReadState(data){
   const reads=(data&&data.reads&&typeof data.reads==='object')?data.reads:{};
   const roleMap=(reads.roles&&typeof reads.roles==='object')?reads.roles:{};
@@ -1364,21 +1503,17 @@ function handleViewerUnread(line,payload){
   }
   if(!payload||typeof payload!=='object'){
     line.classList.remove('is-unread');
+    stopUnreadTracking(line);
     return;
   }
   const unread=messageIsUnreadForViewer(payload);
   if(!unread && payload.viewer_unread) payload.viewer_unread=false;
   if(unread){
     line.classList.add('is-unread');
+    trackUnreadLine(line);
   } else {
     line.classList.remove('is-unread');
-  }
-  if(payload.viewer_unread){
-    line.__viewerUnreadTimer=setTimeout(function(){
-      line.__viewerUnreadTimer=null;
-      payload.viewer_unread=false;
-      handleViewerUnread(line,payload);
-    },1200);
+    stopUnreadTracking(line);
   }
 }
 function determineIndicator(data,role){
@@ -1447,6 +1582,12 @@ function viewerHasAttention(){
   return true;
 }
 
+function handleAttentionGained(){
+  collectVisibleUnread();
+  processPendingVisibleUnread();
+  ensureReadSyncScheduled();
+}
+
 function ensureReadSyncScheduled(){
   if(!readSyncPending) return;
   if(readSyncInFlight) return;
@@ -1504,19 +1645,26 @@ function scheduleReadSync(){
 }
 
 focusHandler=function(){
-  ensureReadSyncScheduled();
+  handleAttentionGained();
 };
 visibilityHandler=function(){
   if(typeof document==='undefined') return;
   if(typeof document.hidden==='boolean' && document.hidden) return;
-  ensureReadSyncScheduled();
+  handleAttentionGained();
 };
 pageShowHandler=function(){
-  ensureReadSyncScheduled();
+  handleAttentionGained();
 };
 window.addEventListener('focus',focusHandler);
 window.addEventListener('pageshow',pageShowHandler);
 document.addEventListener('visibilitychange',visibilityHandler);
+if(list && typeof list.addEventListener==='function'){
+  scrollHandler=function(){
+    collectVisibleUnread();
+    processPendingVisibleUnread();
+  };
+  list.addEventListener('scroll',scrollHandler);
+}
 
 function appendChatLine(source){
   if(!source) return;
@@ -1591,7 +1739,9 @@ function appendChatLine(source){
     handleViewerUnread(existing,merged);
     updateLatestFromPayload(merged);
     if(!isRenderingHistory && role!=='sys' && (merged.user||0)!==myId){
-      scheduleReadSync();
+      if(!messageIsUnreadForViewer(merged)){
+        scheduleReadSync();
+      }
     }
     return;
   }
@@ -1612,12 +1762,14 @@ function appendChatLine(source){
   else delete line.dataset.at;
   if(messageId) line.dataset.messageId=messageId;
   if(userId) line.dataset.user=userId;
-  handleViewerUnread(line,data);
   list.appendChild(line);
+  handleViewerUnread(line,data);
   list.scrollTop=list.scrollHeight;
   updateLatestFromPayload(data);
   if(!isRenderingHistory && role!=='sys' && (data.user||0)!==myId){
-    scheduleReadSync();
+    if(!messageIsUnreadForViewer(data)){
+      scheduleReadSync();
+    }
   }
 }
 function fingerprint(project,user,content){
@@ -1715,6 +1867,10 @@ function cleanup(){
   if(focusHandler){ window.removeEventListener('focus',focusHandler); focusHandler=null; }
   if(pageShowHandler){ window.removeEventListener('pageshow',pageShowHandler); pageShowHandler=null; }
   if(visibilityHandler){ document.removeEventListener('visibilitychange',visibilityHandler); visibilityHandler=null; }
+  if(scrollHandler && list && typeof list.removeEventListener==='function'){ list.removeEventListener('scroll',scrollHandler); scrollHandler=null; }
+  if(unreadObserverInstance){ try{ unreadObserverInstance.disconnect(); }catch(e){} unreadObserverInstance=null; }
+  pendingVisibleUnread.clear();
+  trackedUnreadLines.clear();
 }
 
 const observer=new MutationObserver(function(){ if(!document.body.contains(root)){ observer.disconnect(); cleanup(); }});
