@@ -437,6 +437,231 @@ const hdr={'X-WP-Nonce':nonce};
 const projectId=parseInt(pid,10)||0;
 const localEchoes=new Map();
 let realtimeCleanup=null;
+let busCleanup=null;
+
+const chatBus=ensureChatBus();
+const normalizePayload=ensureChatNormalizer();
+const broadcastMessage=ensureChatBroadcaster();
+
+function ensureChatBus(){
+  if(window.ELXAO_CHAT_BUS && window.ELXAO_CHAT_BUS.emit){
+    return window.ELXAO_CHAT_BUS;
+  }
+  const origin=Math.random().toString(36).slice(2);
+  let channel=null;
+  if('BroadcastChannel' in window){
+    try{
+      channel=new BroadcastChannel('elxao-chat');
+    }catch(e){
+      channel=null;
+    }
+  }
+  const state={
+    origin:origin,
+    channel:channel,
+    emit:function(detail){
+      if(!detail || typeof detail!=='object') return;
+      const message=Object.assign({},detail,{originId:origin});
+      if(channel){
+        try{ channel.postMessage(message); }catch(e){}
+      }
+      window.dispatchEvent(new CustomEvent('elxao:chat',{detail:message}));
+    }
+  };
+  if(channel){
+    window.addEventListener('beforeunload',function(){
+      try{ channel.close(); }catch(e){}
+    },{once:true});
+  }
+  window.ELXAO_CHAT_BUS=state;
+  return state;
+}
+
+function ensureChatNormalizer(){
+  if(window.ELXAO_CHAT_NORMALIZE){
+    return window.ELXAO_CHAT_NORMALIZE;
+  }
+  const allowedRoles=new Set(['client','pm','admin','other','sys']);
+  function toISO(value){
+    if(!value && value!==0) return new Date().toISOString();
+    if(value instanceof Date) return value.toISOString();
+    if(typeof value==='number' && Number.isFinite(value)){
+      return new Date(value).toISOString();
+    }
+    return String(value);
+  }
+  function normalize(data,fallbackProject){
+    const source=(data && typeof data==='object')?data:{};
+    const projectRaw=(source.project??source.project_id??fallbackProject??0);
+    const projectNum=Number(projectRaw);
+    const project=Number.isFinite(projectNum)?projectNum:0;
+    const typeRaw=source.type||source.content_type||'text';
+    const type=String(typeRaw||'text');
+    const messageRaw=source.message??source.content??'';
+    const userRaw=source.user??source.user_id??0;
+    const userNum=Number(userRaw);
+    const user=Number.isFinite(userNum)?userNum:0;
+    const displayRaw=source.user_display||source.userDisplay||source.user_name||source.username||'';
+    let display=displayRaw?String(displayRaw):'';
+    if(!display){
+      display=user?('User '+user):'User';
+    }
+    let roleRaw=source.role||'';
+    if(typeof roleRaw==='string') roleRaw=roleRaw.toLowerCase();
+    let role=allowedRoles.has(roleRaw)?roleRaw:'';
+    if(!role){
+      role=(type==='system')?'sys':'other';
+    }
+    const atRaw=source.at??source.published_at??source.created_at??null;
+    const at=toISO(atRaw);
+    return {
+      type:type||'text',
+      message:String(messageRaw??''),
+      project:project||0,
+      user:user||0,
+      user_display:display,
+      role:role,
+      at:at
+    };
+  }
+  window.ELXAO_CHAT_NORMALIZE=normalize;
+  return normalize;
+}
+
+function ensureChatBroadcaster(){
+  if(window.ELXAO_CHAT_BROADCAST){
+    return window.ELXAO_CHAT_BROADCAST;
+  }
+  const normalize=ensureChatNormalizer();
+  function broadcast(projectHint,data,extras){
+    const bus=ensureChatBus();
+    const payload=normalize(data,projectHint);
+    const fallback=Number(projectHint)||0;
+    if(!payload.project && fallback){
+      payload.project=fallback;
+    }
+    const project=payload.project||0;
+    const detail=Object.assign({project:project,payload:payload},(extras&&typeof extras==='object')?extras:{});
+    bus.emit(detail);
+    if(project){
+      const bumpAt=payload.at||Date.now();
+      window.dispatchEvent(new CustomEvent('elxao:room-bump',{detail:{projectId:project,at:bumpAt}}));
+    }
+    return payload;
+  }
+  window.ELXAO_CHAT_BROADCAST=broadcast;
+  return broadcast;
+}
+
+function ensureChatBus(){
+  if(window.ELXAO_CHAT_BUS && window.ELXAO_CHAT_BUS.emit){
+    return window.ELXAO_CHAT_BUS;
+  }
+  const origin=Math.random().toString(36).slice(2);
+  let channel=null;
+  if('BroadcastChannel' in window){
+    try{
+      channel=new BroadcastChannel('elxao-chat');
+    }catch(e){
+      channel=null;
+    }
+  }
+  const state={
+    origin:origin,
+    channel:channel,
+    emit:function(detail){
+      if(!detail || typeof detail!=='object') return;
+      const message=Object.assign({},detail,{originId:origin});
+      if(channel){
+        try{ channel.postMessage(message); }catch(e){}
+      }
+      window.dispatchEvent(new CustomEvent('elxao:chat',{detail:message}));
+    }
+  };
+  if(channel){
+    window.addEventListener('beforeunload',function(){
+      try{ channel.close(); }catch(e){}
+    },{once:true});
+  }
+  window.ELXAO_CHAT_BUS=state;
+  return state;
+}
+
+function ensureChatNormalizer(){
+  if(window.ELXAO_CHAT_NORMALIZE){
+    return window.ELXAO_CHAT_NORMALIZE;
+  }
+  const allowedRoles=new Set(['client','pm','admin','other','sys']);
+  function toISO(value){
+    if(!value && value!==0) return new Date().toISOString();
+    if(value instanceof Date) return value.toISOString();
+    if(typeof value==='number' && Number.isFinite(value)){
+      return new Date(value).toISOString();
+    }
+    return String(value);
+  }
+  function normalize(data,fallbackProject){
+    const source=(data && typeof data==='object')?data:{};
+    const projectRaw=(source.project??source.project_id??fallbackProject??0);
+    const projectNum=Number(projectRaw);
+    const project=Number.isFinite(projectNum)?projectNum:0;
+    const typeRaw=source.type||source.content_type||'text';
+    const type=String(typeRaw||'text');
+    const messageRaw=source.message??source.content??'';
+    const userRaw=source.user??source.user_id??0;
+    const userNum=Number(userRaw);
+    const user=Number.isFinite(userNum)?userNum:0;
+    const displayRaw=source.user_display||source.userDisplay||source.user_name||source.username||'';
+    let display=displayRaw?String(displayRaw):'';
+    if(!display){
+      display=user?('User '+user):'User';
+    }
+    let roleRaw=source.role||'';
+    if(typeof roleRaw==='string') roleRaw=roleRaw.toLowerCase();
+    let role=allowedRoles.has(roleRaw)?roleRaw:'';
+    if(!role){
+      role=(type==='system')?'sys':'other';
+    }
+    const atRaw=source.at??source.published_at??source.created_at??null;
+    const at=toISO(atRaw);
+    return {
+      type:type||'text',
+      message:String(messageRaw??''),
+      project:project||0,
+      user:user||0,
+      user_display:display,
+      role:role,
+      at:at
+    };
+  }
+  window.ELXAO_CHAT_NORMALIZE=normalize;
+  return normalize;
+}
+
+function ensureChatBroadcaster(){
+  if(window.ELXAO_CHAT_BROADCAST){
+    return window.ELXAO_CHAT_BROADCAST;
+  }
+  const normalize=ensureChatNormalizer();
+  function broadcast(projectHint,data,extras){
+    const bus=ensureChatBus();
+    const payload=normalize(data,projectHint);
+    const fallback=Number(projectHint)||0;
+    if(!payload.project && fallback){
+      payload.project=fallback;
+    }
+    const project=payload.project||0;
+    const detail=Object.assign({project:project,payload:payload},(extras&&typeof extras==='object')?extras:{});
+    bus.emit(detail);
+    if(project){
+      const bumpAt=payload.at||Date.now();
+      window.dispatchEvent(new CustomEvent('elxao:room-bump',{detail:{projectId:project,at:bumpAt}}));
+    }
+    return payload;
+  }
+  window.ELXAO_CHAT_BROADCAST=broadcast;
+  return broadcast;
+}
 
 function ensureAblyState(){
   if(!window.ELXAO_ABLY){
@@ -518,14 +743,10 @@ function ensureAblyState(){
         entry.handler=function(msg){
           const data=msg&&msg.data?msg.data:{};
           const projectId=data.project||entry.projectId||project;
-          const detail={project:projectId,payload:data};
-          if(msg && typeof msg.id!=='undefined') detail.id=msg.id;
-          if(msg && typeof msg.name!=='undefined') detail.name=msg.name;
-          window.dispatchEvent(new CustomEvent('elxao:chat',{detail:detail}));
-          const bumpAt=data.at||data.published_at||Date.now();
-          if(projectId){
-            window.dispatchEvent(new CustomEvent('elxao:room-bump',{detail:{projectId:projectId,at:bumpAt}}));
-          }
+          const extras={};
+          if(msg && typeof msg.id!=='undefined') extras.id=msg.id;
+          if(msg && typeof msg.name!=='undefined') extras.name=msg.name;
+          broadcastMessage(projectId,data,extras);
         };
         entry.channel.subscribe(entry.handler);
       }
@@ -606,9 +827,10 @@ function send(content){
 
 function handleChatPayload(payload){
   if(!payload) return;
-  const name=payload.user_display||('User '+payload.user);
-  const role=(payload.type==='system')?'sys':(payload.role||'other');
-  const message=normalizeContent(payload.message);
+  const data=normalizePayload(payload,projectId);
+  const name=data.user_display||('User '+(data.user||''));
+  const role=(data.type==='system')?'sys':(data.role||'other');
+  const message=normalizeContent(data.message);
   if(!message && role!=='sys') return;
   addLine(name+': '+message, role);
 }
@@ -617,8 +839,8 @@ function onChatEvent(ev){
   const detail=ev&&ev.detail?ev.detail:{};
   const project=detail.project?parseInt(detail.project,10):0;
   if(project!==projectId) return;
-  const payload=detail.payload||{};
-  const fp=fingerprint(projectId,parseInt(payload.user||0,10)||0,payload.message||'');
+  const payload=normalizePayload(detail.payload||{},projectId);
+  const fp=fingerprint(projectId,payload.user||0,payload.message||'');
   if(isRecentLocal(fp)) return;
   handleChatPayload(payload);
 }
@@ -639,6 +861,10 @@ function cleanup(){
     try{ realtimeCleanup(); }catch(e){}
     realtimeCleanup=null;
   }
+  if(busCleanup){
+    try{ busCleanup(); }catch(e){}
+    busCleanup=null;
+  }
   window.removeEventListener('elxao:chat',onChatEvent);
   window.removeEventListener('beforeunload',cleanup);
 }
@@ -651,26 +877,53 @@ const observer=new MutationObserver(function(){
 });
 observer.observe(document.body,{childList:true,subtree:true});
 window.addEventListener('elxao:chat',onChatEvent);
+if(chatBus.channel && chatBus.channel.addEventListener){
+  const busHandler=function(ev){
+    const detail=ev&&ev.data?ev.data:null;
+    if(!detail) return;
+    if(detail.originId && detail.originId===chatBus.origin) return;
+    onChatEvent({detail:detail});
+  };
+  chatBus.channel.addEventListener('message',busHandler);
+  busCleanup=function(){
+    chatBus.channel.removeEventListener('message',busHandler);
+  };
+}
 window.addEventListener('beforeunload',cleanup,{once:true});
 
 function renderHistory(items){
   if(!items||!Array.isArray(items)) return;
   items.forEach(function(m){
-    const name=m.user_display||('User '+m.user_id);
-    const role=(m.content_type==='system')?'sys':(m.role||'other');
-    addLine(name+': '+m.content, role);
+    const payload=normalizePayload({
+      type:m.content_type,
+      message:m.content,
+      project:m.project_id||projectId,
+      user:m.user_id,
+      user_display:m.user_display||m.user_name,
+      role:m.role,
+      at:m.published_at
+    },projectId);
+    handleChatPayload(payload);
   });
 }
 
-load().then(function(r){
-  if(r&&r.items) renderHistory(r.items);
-  return token();
-}).then(function(tk){
-  if(!tk||tk.error) return;
-  return subscribeRealtime(tk);
-}).catch(function(err){
-  console.warn('ELXAO chat realtime unavailable',err);
-});
+token()
+  .then(function(tk){
+    if(!tk||tk.error) throw tk||new Error('token');
+    return subscribeRealtime(tk);
+  })
+  .catch(function(err){
+    console.warn('ELXAO chat realtime unavailable',err);
+  })
+  .then(function(){
+    return load();
+  })
+  .then(function(r){
+    if(r&&r.items) renderHistory(r.items);
+  })
+  .catch(function(err){
+    console.error('ELXAO chat history unavailable',err);
+  });
 
 btn.addEventListener('click', function(){
   const v = ta.value.replace(/\s+$/,'');
@@ -685,9 +938,15 @@ btn.addEventListener('click', function(){
         const detailProject=resp.project_id?parseInt(resp.project_id,10):projectId;
         const resolvedProject=detailProject||projectId;
         if(resolvedProject){
-          const payload={ projectId: resolvedProject };
-          if(resp.at) payload.at=resp.at;
-          window.dispatchEvent(new CustomEvent('elxao:room-bump',{detail:payload}));
+          broadcastMessage(resolvedProject,{
+            type:'text',
+            message:v,
+            project:resolvedProject,
+            user:myId,
+            user_display:meName,
+            role:myRole,
+            at:resp.at||new Date().toISOString()
+          });
         }
       }
     })
@@ -786,6 +1045,11 @@ const roomMap=new Map();
 const channelCleanups=new Map();
 const cleanupFns=[];
 let active=null;
+let busCleanup=null;
+
+const chatBus=ensureChatBus();
+const normalizePayload=ensureChatNormalizer();
+const broadcastMessage=ensureChatBroadcaster();
 
 function ensureAblyState(){
   if(!window.ELXAO_ABLY){
@@ -867,14 +1131,10 @@ function ensureAblyState(){
         entry.handler=function(msg){
           const data=msg&&msg.data?msg.data:{};
           const projectId=data.project||entry.projectId||project;
-          const detail={project:projectId,payload:data};
-          if(msg && typeof msg.id!=='undefined') detail.id=msg.id;
-          if(msg && typeof msg.name!=='undefined') detail.name=msg.name;
-          window.dispatchEvent(new CustomEvent('elxao:chat',{detail:detail}));
-          const bumpAt=data.at||data.published_at||Date.now();
-          if(projectId){
-            window.dispatchEvent(new CustomEvent('elxao:room-bump',{detail:{projectId:projectId,at:bumpAt}}));
-          }
+          const extras={};
+          if(msg && typeof msg.id!=='undefined') extras.id=msg.id;
+          if(msg && typeof msg.name!=='undefined') extras.name=msg.name;
+          broadcastMessage(projectId,data,extras);
         };
         entry.channel.subscribe(entry.handler);
       }
@@ -1071,13 +1331,34 @@ function subscribeInbox(){
 function onChatEvent(ev){
   const detail=ev&&ev.detail?ev.detail:{};
   if(!detail || typeof detail.project==='undefined') return;
-  const payload=detail.payload||{};
-  const bumpAt=payload.at||payload.published_at||Date.now();
-  bumpRoom(detail.project,bumpAt);
+  const payload=normalizePayload(detail.payload||{},detail.project);
+  const projectId=payload.project||parseInt(detail.project,10)||0;
+  if(!projectId) return;
+  const bumpAt=payload.at||Date.now();
+  bumpRoom(projectId,bumpAt);
 }
 
 window.addEventListener('elxao:chat',onChatEvent);
 registerCleanup(function(){ window.removeEventListener('elxao:chat',onChatEvent); });
+
+if(chatBus.channel && chatBus.channel.addEventListener){
+  const busHandler=function(ev){
+    const detail=ev&&ev.data?ev.data:null;
+    if(!detail) return;
+    if(detail.originId && detail.originId===chatBus.origin) return;
+    onChatEvent({detail:detail});
+  };
+  chatBus.channel.addEventListener('message',busHandler);
+  registerCleanup(function(){
+    if(busCleanup){
+      try{ busCleanup(); }catch(e){}
+      busCleanup=null;
+    }
+  });
+  busCleanup=function(){
+    chatBus.channel.removeEventListener('message',busHandler);
+  };
+}
 
 registerCleanup(function(){
   channelCleanups.forEach(function(unsub){ try{ unsub(); }catch(e){} });
