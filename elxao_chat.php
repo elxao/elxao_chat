@@ -752,6 +752,9 @@ const DEBUG=false;
 const indicatorStates=(typeof WeakMap==='function')?new WeakMap():new Map();
 let indicatorObserverInstance=null;
 let indicatorObserverDisabled=false;
+let focusHandler=null;
+let visibilityHandler=null;
+let pageShowHandler=null;
 
 /* ---------- Shared helpers (guarded singletons) ---------- */
 if(!window.ELXAO_CHAT_BUS){
@@ -1429,10 +1432,48 @@ function applyReadReceipt(data){
     handleViewerUnread(line,payload);
   });
 }
+
+function viewerHasAttention(){
+  if(typeof document==='undefined') return true;
+  if(typeof document.visibilityState==='string' && document.visibilityState!=='visible') return false;
+  if(typeof document.hidden==='boolean' && document.hidden) return false;
+  if(typeof document.hasFocus==='function'){
+    try {
+      if(!document.hasFocus()) return false;
+    } catch(e) {
+      return false;
+    }
+  }
+  return true;
+}
+
+function ensureReadSyncScheduled(){
+  if(!readSyncPending) return;
+  if(readSyncInFlight) return;
+  if(!viewerHasAttention()) return;
+  if(readSyncTimer) return;
+  readSyncTimer=setTimeout(()=>{
+    readSyncTimer=null;
+    if(!readSyncPending) return;
+    if(!viewerHasAttention()){
+      ensureReadSyncScheduled();
+      return;
+    }
+    sendReadSync();
+  },400);
+}
+
 function sendReadSync(){
   if(readSyncInFlight) return;
+  if(!viewerHasAttention()){
+    ensureReadSyncScheduled();
+    return;
+  }
   const targetProject=projectId||parseInt(pid,10)||0;
-  if(!targetProject || !rest || !myId) return;
+  if(!targetProject || !rest || !myId){
+    readSyncPending=false;
+    return;
+  }
   readSyncPending=false;
   readSyncInFlight=true;
   fetch(rest+'elxao/v1/messages/read',{
@@ -1451,22 +1492,32 @@ function sendReadSync(){
     .catch(()=>{})
     .finally(()=>{
       readSyncInFlight=false;
-      if(readSyncPending){
-        scheduleReadSync();
-      }
+      ensureReadSyncScheduled();
     });
 }
+
 function scheduleReadSync(){
   if(!projectId || !rest || !myId) return;
   if(myRole==='other') return;
   readSyncPending=true;
-  if(readSyncInFlight) return;
-  if(readSyncTimer) return;
-  readSyncTimer=setTimeout(()=>{
-    readSyncTimer=null;
-    if(readSyncPending) sendReadSync();
-  },400);
+  ensureReadSyncScheduled();
 }
+
+focusHandler=function(){
+  ensureReadSyncScheduled();
+};
+visibilityHandler=function(){
+  if(typeof document==='undefined') return;
+  if(typeof document.hidden==='boolean' && document.hidden) return;
+  ensureReadSyncScheduled();
+};
+pageShowHandler=function(){
+  ensureReadSyncScheduled();
+};
+window.addEventListener('focus',focusHandler);
+window.addEventListener('pageshow',pageShowHandler);
+document.addEventListener('visibilitychange',visibilityHandler);
+
 function appendChatLine(source){
   if(!source) return;
   const data=Object.assign({},source);
@@ -1661,6 +1712,9 @@ function cleanup(){
   stopFallbackPolling();
   window.removeEventListener('elxao:chat',onChatEvent);
   window.removeEventListener('beforeunload',cleanup);
+  if(focusHandler){ window.removeEventListener('focus',focusHandler); focusHandler=null; }
+  if(pageShowHandler){ window.removeEventListener('pageshow',pageShowHandler); pageShowHandler=null; }
+  if(visibilityHandler){ document.removeEventListener('visibilitychange',visibilityHandler); visibilityHandler=null; }
 }
 
 const observer=new MutationObserver(function(){ if(!document.body.contains(root)){ observer.disconnect(); cleanup(); }});
