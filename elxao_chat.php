@@ -122,46 +122,197 @@ function elxao_chat_parse_datetime($value){
     return 0;
 }
 
-function elxao_chat_get_last_reads($pid){
+function elxao_chat_normalize_read_record($value){
+    $record = ['at'=>'','id'=>0];
+    if (is_array($value)) {
+        if (isset($value['at'])) {
+            $record['at'] = elxao_chat_normalize_datetime_value($value['at']);
+        } elseif (isset($value['time'])) {
+            $record['at'] = elxao_chat_normalize_datetime_value($value['time']);
+        } elseif (isset($value['timestamp'])) {
+            $record['at'] = elxao_chat_normalize_datetime_value($value['timestamp']);
+        } elseif (isset($value['read_at'])) {
+            $record['at'] = elxao_chat_normalize_datetime_value($value['read_at']);
+        }
+        if (isset($value['id'])) {
+            $record['id'] = max(0,(int)$value['id']);
+        } elseif (isset($value['message_id'])) {
+            $record['id'] = max(0,(int)$value['message_id']);
+        } elseif (isset($value['max_id'])) {
+            $record['id'] = max(0,(int)$value['max_id']);
+        }
+    } else {
+        $record['at'] = elxao_chat_normalize_datetime_value($value);
+    }
+    if (!$record['at']) $record['at'] = '';
+    return $record;
+}
+
+function elxao_chat_get_read_state($pid){
     $stored = get_post_meta($pid,ELXAO_CHAT_READ_META_KEY,true);
-    $result = ['client'=>'','pm'=>'','admin'=>''];
+    $state = [
+        'client' => ['at'=>'','id'=>0],
+        'pm'     => ['at'=>'','id'=>0],
+        'admin'  => ['at'=>'','id'=>0],
+    ];
+    $needs_update = false;
     if (is_array($stored)) {
-        foreach ($result as $role => $_) {
-            if (!empty($stored[$role])) {
-                $normalized = elxao_chat_normalize_datetime_value($stored[$role]);
-                if ($normalized) $result[$role] = $normalized;
+        if (isset($stored['roles']) && is_array($stored['roles'])) {
+            foreach ($stored['roles'] as $role => $value) {
+                if (isset($state[$role])) {
+                    $normalized = elxao_chat_normalize_read_record($value);
+                    if (!is_array($stored[$role] ?? null) || $normalized !== $stored['roles'][$role]) {
+                        $needs_update = true;
+                    }
+                    $state[$role] = $normalized;
+                }
+            }
+        }
+        foreach ($state as $role => $default) {
+            if (isset($stored[$role])) {
+                $normalized = elxao_chat_normalize_read_record($stored[$role]);
+                if (!is_array($stored[$role]) || $normalized !== $stored[$role]) {
+                    $needs_update = true;
+                }
+                $state[$role] = $normalized;
+            }
+        }
+    } elseif (!empty($stored)) {
+        // Legacy string storage: treat as all roles at the same timestamp
+        $normalized = elxao_chat_normalize_read_record($stored);
+        $state['client'] = $normalized;
+        $state['pm'] = $normalized;
+        $state['admin'] = $normalized;
+        $needs_update = true;
+    }
+    if ($needs_update) {
+        update_post_meta($pid,ELXAO_CHAT_READ_META_KEY,$state);
+    }
+    return $state;
+}
+
+function elxao_chat_read_state_times(array $state){
+    return [
+        'client' => $state['client']['at'] ?? '',
+        'pm'     => $state['pm']['at'] ?? '',
+        'admin'  => $state['admin']['at'] ?? '',
+    ];
+}
+
+function elxao_chat_read_state_ids(array $state){
+    return [
+        'client' => $state['client']['id'] ?? 0,
+        'pm'     => $state['pm']['id'] ?? 0,
+        'admin'  => $state['admin']['id'] ?? 0,
+    ];
+}
+
+function elxao_chat_read_state_role_flags($pid,array $state,?array $participants=null){
+    if ($participants === null) $participants = elxao_chat_get_client_pm_ids($pid);
+    $times = elxao_chat_read_state_times($state);
+    $ids = elxao_chat_read_state_ids($state);
+    return [
+        'client' => ($ids['client'] ?? 0) > 0 || elxao_chat_parse_datetime($times['client'] ?? '') > 0 || empty($participants['client']),
+        'pm'     => ($ids['pm'] ?? 0) > 0 || elxao_chat_parse_datetime($times['pm'] ?? '') > 0 || empty($participants['pm']),
+        'admin'  => ($ids['admin'] ?? 0) > 0 || elxao_chat_parse_datetime($times['admin'] ?? '') > 0,
+    ];
+}
+
+function elxao_chat_normalize_read_state_input(?array $reads){
+    $state = [
+        'client' => ['at'=>'','id'=>0],
+        'pm'     => ['at'=>'','id'=>0],
+        'admin'  => ['at'=>'','id'=>0],
+    ];
+    if ($reads === null) return $state;
+    if (isset($reads['records']) && is_array($reads['records'])) {
+        $reads = $reads['records'];
+    }
+    if (isset($reads['roles']) && is_array($reads['roles'])) {
+        foreach ($reads['roles'] as $role => $value) {
+            if (isset($state[$role])) {
+                $state[$role] = elxao_chat_normalize_read_record($value);
             }
         }
     }
-    return $result;
+    foreach ($state as $role => $_) {
+        if (isset($reads[$role])) {
+            $state[$role] = elxao_chat_normalize_read_record($reads[$role]);
+        }
+    }
+    if (isset($reads['times']) && is_array($reads['times'])) {
+        foreach ($reads['times'] as $role => $value) {
+            if (isset($state[$role])) {
+                $state[$role]['at'] = elxao_chat_normalize_datetime_value($value);
+            }
+        }
+    }
+    if (isset($reads['ids']) && is_array($reads['ids'])) {
+        foreach ($reads['ids'] as $role => $value) {
+            if (isset($state[$role])) {
+                $state[$role]['id'] = max(0,(int)$value);
+            }
+        }
+    }
+    return $state;
 }
 
-function elxao_chat_update_last_read($pid,$role,$timestamp=null){
+function elxao_chat_get_last_reads($pid){
+    $state = elxao_chat_get_read_state($pid);
+    return elxao_chat_read_state_times($state);
+}
+
+function elxao_chat_update_last_read($pid,$role,$timestamp=null,$message_id=0){
     if (!in_array($role,['client','pm','admin'],true)) return false;
+    $state = elxao_chat_get_read_state($pid);
     $normalized = elxao_chat_normalize_datetime_value(
         $timestamp === null ? current_time('timestamp') : $timestamp
     );
     if (!$normalized) return false;
 
-    $reads = elxao_chat_get_last_reads($pid);
-    $current = $reads[$role] ?? '';
-    $current_ts = $current ? elxao_chat_parse_datetime($current) : 0;
+    $current = $state[$role] ?? ['at'=>'','id'=>0];
+    $current_ts = elxao_chat_parse_datetime($current['at'] ?? '');
     $new_ts = elxao_chat_parse_datetime($normalized);
-    if ($current_ts && $new_ts && $current_ts >= $new_ts) return false;
+    if ($current_ts && $new_ts && $new_ts < $current_ts) {
+        $normalized = $current['at'];
+        $new_ts = $current_ts;
+    }
 
-    $reads[$role] = $normalized;
-    update_post_meta($pid,ELXAO_CHAT_READ_META_KEY,$reads);
-    return $reads;
+    $current_id = max(0,(int)($current['id'] ?? 0));
+    $new_id = max(0,(int)$message_id);
+    if ($new_id <= 0) {
+        $new_id = $current_id;
+    } elseif ($current_id && $new_id < $current_id) {
+        $new_id = $current_id;
+    }
+
+    if ($current['at'] === $normalized && $current_id === $new_id) {
+        return false;
+    }
+
+    $state[$role] = ['at'=>$normalized,'id'=>$new_id];
+    update_post_meta($pid,ELXAO_CHAT_READ_META_KEY,$state);
+    return $state;
 }
 
-function elxao_chat_build_message_read_status($pid,$message_role,$published_at,?array $reads=null,?array $participants=null){
-    if ($reads === null) $reads = elxao_chat_get_last_reads($pid);
+function elxao_chat_build_message_read_status($pid,$message_role,$published_at,?array $reads=null,?array $participants=null,$message_id=0){
+    $state = $reads !== null ? elxao_chat_normalize_read_state_input($reads) : elxao_chat_get_read_state($pid);
     if ($participants === null) $participants = elxao_chat_get_client_pm_ids($pid);
 
-    $published_ts = elxao_chat_parse_datetime($published_at);
-    $client_ts    = elxao_chat_parse_datetime($reads['client'] ?? '');
-    $pm_ts        = elxao_chat_parse_datetime($reads['pm'] ?? '');
-    $admin_ts     = elxao_chat_parse_datetime($reads['admin'] ?? '');
+    $times = elxao_chat_read_state_times($state);
+    $ids   = elxao_chat_read_state_ids($state);
+
+    $message_role = (string)$message_role;
+    $message_id   = max(0,(int)$message_id);
+    $message_ts   = elxao_chat_parse_datetime($published_at);
+
+    $client_ts = elxao_chat_parse_datetime($times['client'] ?? '');
+    $pm_ts     = elxao_chat_parse_datetime($times['pm'] ?? '');
+    $admin_ts  = elxao_chat_parse_datetime($times['admin'] ?? '');
+
+    $client_id = max(0,(int)($ids['client'] ?? 0));
+    $pm_id     = max(0,(int)($ids['pm'] ?? 0));
+    $admin_id  = max(0,(int)($ids['admin'] ?? 0));
 
     $status = ['client'=>false,'pm'=>false,'admin'=>false];
     if ($message_role === 'client') $status['client'] = true;
@@ -171,35 +322,50 @@ function elxao_chat_build_message_read_status($pid,$message_role,$published_at,?
     if (empty($participants['client'])) $status['client'] = true;
     if (empty($participants['pm']) && $message_role !== 'admin') $status['pm'] = true;
 
-    if ($published_ts) {
-        if ($client_ts && $client_ts >= $published_ts) $status['client'] = true;
-        if ($pm_ts && $pm_ts >= $published_ts)         $status['pm']     = true;
-        if ($admin_ts && $admin_ts >= $published_ts)   $status['admin']  = true;
+    if ($message_id) {
+        if ($client_id >= $message_id) $status['client'] = true;
+        if ($pm_id >= $message_id)     $status['pm']     = true;
+        if ($admin_id >= $message_id)  $status['admin']  = true;
+    }
+
+    if ($message_ts) {
+        if ($client_ts && $client_ts >= $message_ts) $status['client'] = true;
+        if ($pm_ts && $pm_ts >= $message_ts)         $status['pm']     = true;
+        if ($admin_ts && $admin_ts >= $message_ts)   $status['admin']  = true;
     }
 
     return $status;
 }
 
-function elxao_chat_publish_read_receipt($pid,array $reads,$user_id=0){
-    $role_flags = [
-        'client' => elxao_chat_parse_datetime($reads['client'] ?? '') > 0,
-        'pm'     => elxao_chat_parse_datetime($reads['pm'] ?? '') > 0,
-        'admin'  => elxao_chat_parse_datetime($reads['admin'] ?? '') > 0,
-    ];
+function elxao_chat_publish_read_receipt($pid,array $state,$user_id=0,$role='',$participants=null){
+    if ($participants === null) $participants = elxao_chat_get_client_pm_ids($pid);
+    $times = elxao_chat_read_state_times($state);
+    $ids   = elxao_chat_read_state_ids($state);
+    $role_flags = elxao_chat_read_state_role_flags($pid,$state,$participants);
+    $role = in_array($role,['client','pm','admin'],true) ? $role : '';
+    $own_id = $role ? ($ids[$role] ?? 0) : 0;
+    $own_at = $role ? ($times[$role] ?? '') : '';
 
     elxao_chat_publish_to_ably(elxao_chat_room_id($pid),[
         'name' => 'read_receipt',
         'data' => [
-            'type'        => 'read_receipt',
-            'project'     => $pid,
-            'user'        => $user_id,
-            'read_times'  => $reads,
-            'read_status' => $role_flags,
-            'reads'       => [
+            'type'               => 'read_receipt',
+            'project'            => $pid,
+            'roomId'             => elxao_chat_room_id($pid),
+            'user'               => $user_id,
+            'read_times'         => $times,
+            'read_ids'           => $ids,
+            'read_upto'          => $ids,
+            'read_upto_message_id' => $ids,
+            'read_status'        => $role_flags,
+            'reads'              => [
                 'roles' => $role_flags,
-                'times' => $reads,
+                'times' => $times,
+                'ids'   => $ids,
             ],
-            'at'          => current_time('mysql'),
+            'readUptoMessageId'  => $own_id,
+            'readAt'             => $own_at,
+            'at'                 => current_time('mysql'),
         ],
     ]);
 }
@@ -408,9 +574,11 @@ function elxao_chat_rest_send(WP_REST_Request $r){
     $role    = elxao_chat_role_for_user($pid,$uid);
 
     $participants = elxao_chat_get_client_pm_ids($pid);
-    $reads = elxao_chat_update_last_read($pid,$role,$now);
-    if (!$reads) $reads = elxao_chat_get_last_reads($pid);
-    $read_status = elxao_chat_build_message_read_status($pid,$role,$now,$reads,$participants);
+    $state = elxao_chat_update_last_read($pid,$role,$now,$message_id);
+    if (!$state) $state = elxao_chat_get_read_state($pid);
+    $times = elxao_chat_read_state_times($state);
+    $ids   = elxao_chat_read_state_ids($state);
+    $read_status = elxao_chat_build_message_read_status($pid,$role,$now,$state,$participants,$message_id);
 
     elxao_chat_publish_to_ably(elxao_chat_room_id($pid),[
         'name'=>'text',
@@ -424,10 +592,12 @@ function elxao_chat_rest_send(WP_REST_Request $r){
             'role'=>$role,
             'at'=>$now,
             'read_status'=>$read_status,
-            'read_times'=>$reads,
+            'read_times'=>$times,
+            'read_ids'=>$ids,
             'reads'=>[
                 'roles'=>$read_status,
-                'times'=>$reads,
+                'times'=>$times,
+                'ids'=>$ids,
             ],
         ]
     ]);
@@ -437,10 +607,12 @@ function elxao_chat_rest_send(WP_REST_Request $r){
         'id'          => $message_id,
         'at'          => $now,
         'read_status' => $read_status,
-        'read_times'  => $reads,
+        'read_times'  => $times,
+        'read_ids'    => $ids,
         'reads'       => [
             'roles' => $read_status,
-            'times' => $reads,
+            'times' => $times,
+            'ids'   => $ids,
         ],
     ],200);
 }
@@ -493,41 +665,31 @@ function elxao_chat_rest_history(WP_REST_Request $r){
 
     $role = elxao_chat_role_for_user($pid,$uid);
     $participants = elxao_chat_get_client_pm_ids($pid);
-    $reads = elxao_chat_get_last_reads($pid);
-    $reads_before = $reads;
-    $updated_reads = false;
-
-    if(in_array($role,['client','pm','admin'],true)){
-        $maybe = elxao_chat_update_last_read($pid,$role,current_time('timestamp'));
-        if($maybe){
-            $reads = $maybe;
-            $updated_reads = true;
-        }
-    }
+    $state = elxao_chat_get_read_state($pid);
+    $times = elxao_chat_read_state_times($state);
+    $ids   = elxao_chat_read_state_ids($state);
 
     foreach($rows as &$row){
-        $pre_status = elxao_chat_build_message_read_status($pid,$row['role'],$row['published_at'],$reads_before,$participants);
-        $status = elxao_chat_build_message_read_status($pid,$row['role'],$row['published_at'],$reads,$participants);
+        $status = elxao_chat_build_message_read_status($pid,$row['role'],$row['published_at'],$state,$participants,(int)($row['id']??0));
         $row['read_status']=$status;
         $row['reads']=[
             'roles'=>$status,
-            'times'=>$reads,
+            'times'=>$times,
+            'ids'=>$ids,
         ];
-        if(in_array($role,['client','pm','admin'],true) && isset($pre_status[$role])){
-            $row['viewer_unread'] = !$pre_status[$role];
+        if(in_array($role,['client','pm','admin'],true) && isset($status[$role])){
+            $row['viewer_unread'] = !$status[$role];
         } else {
             $row['viewer_unread'] = false;
         }
     }
     unset($row);
 
-    if($updated_reads){
-        elxao_chat_publish_read_receipt($pid,$reads,$uid);
-    }
-
     return new WP_REST_Response([
         'items'=>$rows,
-        'reads'=>$reads,
+        'reads'=>$times,
+        'read_ids'=>$ids,
+        'read_state'=>$state,
         'role'=>$role,
     ],200);
 }
@@ -538,38 +700,62 @@ function elxao_chat_rest_mark_read(WP_REST_Request $r){
     if(!elxao_chat_user_can_access_project($pid,$uid))
         return new WP_Error('forbidden','Not allowed',['status'=>403]);
 
-    $role = elxao_chat_role_for_user($pid,$uid);
-    $reads = elxao_chat_get_last_reads($pid);
-    $participants = elxao_chat_get_client_pm_ids($pid);
-    $updated = false;
+    global $wpdb; $t=$wpdb->prefix.'elxao_chat_messages';
 
+    $role = elxao_chat_role_for_user($pid,$uid);
+    $participants = elxao_chat_get_client_pm_ids($pid);
+    $state = elxao_chat_get_read_state($pid);
+    $times = elxao_chat_read_state_times($state);
+    $ids   = elxao_chat_read_state_ids($state);
+
+    $message_id = (int)$r->get_param('message_id');
+    if ($message_id > 0) {
+        $validated = $wpdb->get_var($wpdb->prepare("SELECT id FROM $t WHERE project_id=%d AND id<=%d ORDER BY id DESC LIMIT 1",$pid,$message_id));
+        if ($validated) {
+            $message_id = (int)$validated;
+        } else {
+            $fallback_id = $wpdb->get_var($wpdb->prepare("SELECT MAX(id) FROM $t WHERE project_id=%d",$pid));
+            $message_id = $fallback_id ? (int)$fallback_id : $message_id;
+        }
+    }
+
+    $updated = false;
     if(in_array($role,['client','pm','admin'],true)){
-        $maybe = elxao_chat_update_last_read($pid,$role,current_time('timestamp'));
+        $maybe = elxao_chat_update_last_read($pid,$role,current_time('timestamp'),$message_id);
         if($maybe){
-            $reads = $maybe;
+            $state = $maybe;
+            $times = elxao_chat_read_state_times($state);
+            $ids   = elxao_chat_read_state_ids($state);
             $updated = true;
         }
     }
 
-    if($updated){
-        elxao_chat_publish_read_receipt($pid,$reads,$uid);
+    $role_flags = elxao_chat_read_state_role_flags($pid,$state,$participants);
+
+    if(function_exists('error_log')){
+        $room_id = elxao_chat_room_id($pid);
+        $log_id = $role && isset($ids[$role]) ? (int)$ids[$role] : 0;
+        $log_at = $role && isset($times[$role]) ? $times[$role] : '';
+        error_log(sprintf('[elxao_chat] read-accept user=%d room=%s readUpto=%d ts=%s',$uid,$room_id,$log_id,$log_at));
     }
 
-    $role_flags = [
-        'client' => elxao_chat_parse_datetime($reads['client'] ?? '') > 0 || empty($participants['client']),
-        'pm'     => elxao_chat_parse_datetime($reads['pm'] ?? '') > 0 || empty($participants['pm']),
-        'admin'  => elxao_chat_parse_datetime($reads['admin'] ?? '') > 0,
-    ];
+    if($updated){
+        elxao_chat_publish_read_receipt($pid,$state,$uid,$role,$participants);
+    }
 
     return new WP_REST_Response([
         'project'=>$pid,
         'role'=>$role,
         'reads'=>[
             'roles'=>$role_flags,
-            'times'=>$reads,
+            'times'=>$times,
+            'ids'=>$ids,
         ],
-        'read_times'=>$reads,
+        'read_times'=>$times,
+        'read_ids'=>$ids,
         'read_status'=>$role_flags,
+        'readUptoMessageId'=> $role && isset($ids[$role]) ? (int)$ids[$role] : 0,
+        'readAt'=> $role && isset($times[$role]) ? $times[$role] : '',
         'updated'=>$updated,
         'type'=>'read_receipt',
         'user'=>$uid,
@@ -747,7 +933,25 @@ let fallbackActive=false;
 let fallbackTimer=null;
 let fallbackInFlight=false;
 const FALLBACK_INTERVAL=4000;
+const READ_THRESHOLD=0.75;
+const READ_STABILITY_MS=120;
+const READ_RENEW_MS=5000;
+const READ_EXPIRE_MS=8000;
+const READ_TELEMETRY_SAMPLE=0.1;
 const currentReadTimes={client:'',pm:'',admin:''};
+const currentReadIds={client:0,pm:0,admin:0};
+let lastKnownServerReadId=0;
+let lastKnownServerReadAt='';
+const tabId=(window.crypto&&typeof window.crypto.randomUUID==='function')?window.crypto.randomUUID():(Date.now().toString(36)+'-'+Math.random().toString(16).slice(2));
+const readLockKeyBase='elxao:readlock:'+String(myId||0)+':'+String(room||'');
+const readLockSignalKey=readLockKeyBase+':signal';
+const readLockStateKey=readLockKeyBase+':state';
+let lockChannel=null;
+let readLockOwner=null;
+let readLockTimestamp=0;
+let readLockRenewInterval=null;
+let readLockCleanupHandlers=[];
+let lastUserIntentTs=0;
 const DEBUG=false;
 const indicatorStates=(typeof WeakMap==='function')?new WeakMap():new Map();
 let indicatorObserverInstance=null;
@@ -815,6 +1019,170 @@ if(!window.ELXAO_CHAT_RESOLVE_PROJECT_ID){
     return 0;
   };
 }
+
+function documentIsVisible(){
+  if(typeof document==='undefined') return true;
+  if(typeof document.visibilityState==='string') return document.visibilityState==='visible';
+  if(typeof document.hidden==='boolean') return !document.hidden;
+  return true;
+}
+function documentHasFocusSafe(){
+  if(typeof document==='undefined') return true;
+  if(typeof document.hasFocus==='function'){
+    try{ return document.hasFocus(); }
+    catch(e){ return false; }
+  }
+  return true;
+}
+function canHoldReadLock(){
+  return documentIsVisible() && documentHasFocusSafe();
+}
+function updateLockStorage(owner,ts){
+  if(!window.localStorage) return;
+  try{
+    if(owner){
+      window.localStorage.setItem(readLockStateKey,JSON.stringify({tabId:owner,lastSeenAt:ts}));
+    } else {
+      window.localStorage.removeItem(readLockStateKey);
+    }
+  }catch(e){}
+}
+function broadcastLockMessage(type){
+  const payload={type,tabId,ts:Date.now()};
+  if(lockChannel){
+    try{
+      if(typeof lockChannel.postMessage==='function') lockChannel.postMessage(payload);
+      else if('postMessage' in lockChannel) lockChannel.postMessage(payload);
+    }catch(e){}
+  } else if(window.localStorage){
+    try{
+      window.localStorage.setItem(readLockSignalKey,JSON.stringify(payload));
+      window.localStorage.removeItem(readLockSignalKey);
+    }catch(e){}
+  }
+}
+function handleLockMessage(message){
+  if(!message || typeof message!=='object') return;
+  const other=message.tabId;
+  if(!other || other===tabId) return;
+  const type=message.type;
+  const ts=typeof message.ts==='number'?message.ts:Date.now();
+  if(type==='lock-claim' || type==='lock-renew'){
+    readLockOwner=other;
+    readLockTimestamp=ts;
+    updateLockStorage(other,ts);
+    if(canHoldReadLock()){
+      setTimeout(()=>tryAcquireReadLock(true),50);
+    }
+  } else if(type==='lock-release'){
+    if(readLockOwner===other){
+      readLockOwner=null;
+      readLockTimestamp=0;
+      updateLockStorage(null,0);
+    }
+  }
+}
+function hasReadLock(){
+  const now=Date.now();
+  if(readLockOwner===tabId){
+    if(now-readLockTimestamp>READ_EXPIRE_MS){
+      readLockOwner=null;
+      readLockTimestamp=0;
+      updateLockStorage(null,0);
+      return false;
+    }
+    return true;
+  }
+  if(readLockOwner && now-readLockTimestamp>READ_EXPIRE_MS){
+    readLockOwner=null;
+    readLockTimestamp=0;
+    updateLockStorage(null,0);
+  }
+  return false;
+}
+function tryAcquireReadLock(force){
+  if(!canHoldReadLock()) return false;
+  const now=Date.now();
+  if(hasReadLock()){
+    readLockTimestamp=now;
+    updateLockStorage(tabId,now);
+    return true;
+  }
+  if(!force && readLockOwner && readLockOwner!==tabId && now-readLockTimestamp<=READ_EXPIRE_MS){
+    return false;
+  }
+  readLockOwner=tabId;
+  readLockTimestamp=now;
+  updateLockStorage(tabId,now);
+  broadcastLockMessage('lock-claim');
+  return true;
+}
+function releaseReadLock(){
+  if(readLockOwner===tabId){
+    readLockOwner=null;
+    readLockTimestamp=0;
+    updateLockStorage(null,0);
+    broadcastLockMessage('lock-release');
+  }
+}
+function initializeReadLock(){
+  if('BroadcastChannel' in window){
+    try{ lockChannel=new BroadcastChannel(readLockKeyBase); }
+    catch(e){ lockChannel=null; }
+  }
+  if(lockChannel){
+    const handler=function(event){ handleLockMessage(event&&event.data); };
+    if(typeof lockChannel.addEventListener==='function') lockChannel.addEventListener('message',handler);
+    else lockChannel.onmessage=handler;
+    readLockCleanupHandlers.push(function(){
+      try{
+        if(lockChannel&&typeof lockChannel.removeEventListener==='function') lockChannel.removeEventListener('message',handler);
+      }catch(e){}
+      try{ if(lockChannel) lockChannel.close(); }catch(e){}
+      lockChannel=null;
+    });
+  } else if(typeof window.addEventListener==='function'){
+    const storageListener=function(ev){
+      if(ev&&ev.key===readLockSignalKey&&ev.newValue){
+        try{ handleLockMessage(JSON.parse(ev.newValue)); }
+        catch(e){}
+      }
+    };
+    window.addEventListener('storage',storageListener);
+    readLockCleanupHandlers.push(()=>window.removeEventListener('storage',storageListener));
+  }
+  if(window.localStorage){
+    try{
+      const stored=window.localStorage.getItem(readLockStateKey);
+      if(stored){
+        const parsed=JSON.parse(stored);
+        if(parsed && parsed.tabId){
+          readLockOwner=parsed.tabId;
+          readLockTimestamp=typeof parsed.lastSeenAt==='number'?parsed.lastSeenAt:0;
+        }
+      }
+    }catch(e){}
+  }
+  tryAcquireReadLock(false);
+  readLockRenewInterval=setInterval(function(){
+    if(readLockOwner===tabId){
+      if(canHoldReadLock()){
+        readLockTimestamp=Date.now();
+        updateLockStorage(tabId,readLockTimestamp);
+        broadcastLockMessage('lock-renew');
+      } else {
+        releaseReadLock();
+      }
+    } else if(canHoldReadLock()){
+      tryAcquireReadLock(false);
+    }
+  },READ_RENEW_MS);
+  readLockCleanupHandlers.push(function(){ if(readLockRenewInterval){ clearInterval(readLockRenewInterval); readLockRenewInterval=null; } });
+  window.addEventListener('beforeunload',function(){ releaseReadLock(); },{once:true});
+}
+
+initializeReadLock();
+
 if(!window.ELXAO_CHAT_BUILD_NORMALIZER){
   window.ELXAO_CHAT_BUILD_NORMALIZER=function(){
     const roles=new Set(['client','pm','admin','other','sys']);
@@ -1074,35 +1442,103 @@ function createTextFragment(text){
   });
   return fragment;
 }
-function extractReadTimes(source){
-  if(!source || typeof source!=='object') return null;
-  if(source.read_times && typeof source.read_times==='object') return source.read_times;
-  if(source.readTimes && typeof source.readTimes==='object') return source.readTimes;
-  if(source.reads && typeof source.reads==='object'){
-    if(source.reads.times && typeof source.reads.times==='object') return source.reads.times;
-    if('client' in source.reads || 'pm' in source.reads || 'admin' in source.reads) return source.reads;
-  }
+const ROLE_KEY_MAP={
+  client:['client','customer'],
+  pm:['pm','manager','project_manager'],
+  admin:['admin','administrator']
+};
+function mapKeyToRole(key){
+  if(!key&&key!==0) return null;
+  const normalized=String(key).toLowerCase();
+  if(ROLE_KEY_MAP.client.includes(normalized)) return 'client';
+  if(ROLE_KEY_MAP.pm.includes(normalized)) return 'pm';
+  if(ROLE_KEY_MAP.admin.includes(normalized)) return 'admin';
+  if(normalized==='client' || normalized==='pm' || normalized==='admin') return normalized;
   return null;
 }
-function updateCurrentReadTimes(times){
-  if(!times || typeof times!=='object') return false;
+function extractReadState(source){
+  if(!source || typeof source!=='object') return null;
+  const result={times:{},ids:{}};
+  const apply=function(obj,target){
+    if(!obj || typeof obj!=='object') return;
+    Object.keys(obj).forEach(function(rawKey){
+      const role=mapKeyToRole(rawKey);
+      if(!role) return;
+      const value=obj[rawKey];
+      if(value===undefined||value===null) return;
+      target[role]=value;
+    });
+  };
+  if(source.read_state && typeof source.read_state==='object'){
+    const nested=extractReadState(source.read_state);
+    if(nested){ apply(nested.times,result.times); apply(nested.ids,result.ids); }
+  }
+  if(source.records && typeof source.records==='object'){
+    const nested=extractReadState(source.records);
+    if(nested){ apply(nested.times,result.times); apply(nested.ids,result.ids); }
+  }
+  if(source.reads && typeof source.reads==='object'){
+    if(source.reads.times) apply(source.reads.times,result.times);
+    if(source.reads.ids) apply(source.reads.ids,result.ids);
+    if(source.reads.max_ids) apply(source.reads.max_ids,result.ids);
+    if(source.reads.state){
+      const nested=extractReadState(source.reads.state);
+      if(nested){ apply(nested.times,result.times); apply(nested.ids,result.ids); }
+    }
+  }
+  if(source.read_times) apply(source.read_times,result.times);
+  if(source.readTimes) apply(source.readTimes,result.times);
+  if(source.read_ids) apply(source.read_ids,result.ids);
+  if(source.readIds) apply(source.readIds,result.ids);
+  if(source.read_upto) apply(source.read_upto,result.ids);
+  if(source.read_upto_message_id && typeof source.read_upto_message_id==='object') apply(source.read_upto_message_id,result.ids);
+  if(source.times) apply(source.times,result.times);
+  if(source.ids) apply(source.ids,result.ids);
+  apply(source,result.times);
+  if(Object.keys(result.times).length===0 && Object.keys(result.ids).length===0) return null;
+  return result;
+}
+function normalizeReadTimeValue(value){
+  if(value===undefined||value===null) return '';
+  if(value instanceof Date) return value.toISOString();
+  if(typeof value==='number'){
+    if(!Number.isFinite(value)) return '';
+    return value>1e12?String(Math.round(value)):String(Math.round(value));
+  }
+  const str=String(value).trim();
+  return str;
+}
+function parseReadId(value){
+  if(value===undefined||value===null||value==='') return 0;
+  const num=parseInt(value,10);
+  return Number.isFinite(num)&&num>0?num:0;
+}
+function updateCurrentReadState(input){
+  const extracted=extractReadState(input);
+  if(!extracted) return false;
   let changed=false;
   ['client','pm','admin'].forEach(function(role){
-    if(Object.prototype.hasOwnProperty.call(times,role)){
-      const value=(times[role]!==undefined && times[role]!==null)?times[role]:'';
-      const existing=currentReadTimes[role];
-      const normalize=function(v){
-        if(v===undefined||v===null||v==='') return '';
-        if(v instanceof Date) return v.getTime();
-        if(typeof v==='number') return v;
-        return String(v);
-      };
-      if(normalize(existing)!==normalize(value)){
-        currentReadTimes[role]=value;
+    if(Object.prototype.hasOwnProperty.call(extracted.times,role)){
+      const normalized=normalizeReadTimeValue(extracted.times[role]);
+      if(normalizeReadTimeValue(currentReadTimes[role])!==normalized){
+        currentReadTimes[role]=normalized;
+        changed=true;
+      }
+    }
+    if(Object.prototype.hasOwnProperty.call(extracted.ids,role)){
+      const normalized=parseReadId(extracted.ids[role]);
+      if(currentReadIds[role]!==normalized){
+        currentReadIds[role]=normalized;
         changed=true;
       }
     }
   });
+  if(changed && myRole && Object.prototype.hasOwnProperty.call(currentReadIds,myRole)){
+    const knownId=currentReadIds[myRole]||0;
+    if(knownId>lastKnownServerReadId) lastKnownServerReadId=knownId;
+    const knownAt=currentReadTimes[myRole];
+    if(knownAt) lastKnownServerReadAt=knownAt;
+  }
   return changed;
 }
 function updateLatestFromPayload(data){
@@ -1142,29 +1578,35 @@ function parseReadTime(value){
   const ms=date.getTime();
   return Number.isFinite(ms)?ms:0;
 }
-function buildStatusFromTimes(payload,times){
+function getMessageId(payload){
+  if(!payload||typeof payload!=='object') return 0;
+  if('id' in payload) return parseReadId(payload.id);
+  if('message_id' in payload) return parseReadId(payload.message_id);
+  if('messageId' in payload) return parseReadId(payload.messageId);
+  return 0;
+}
+function buildStatusFromReadState(payload,times,ids){
   const status={client:false,pm:false,admin:false};
   const role=(payload&&payload.role)||'other';
-  if(role==='client') status.client=true;
-  if(role==='pm') status.pm=true;
-  if(role==='admin') status.admin=true;
+  const normalizedRole=String(role||'').toLowerCase();
+  if(normalizedRole==='client') status.client=true;
+  if(normalizedRole==='pm') status.pm=true;
+  if(normalizedRole==='admin') status.admin=true;
   if(!clientId) status.client=true;
-  if(!pmId && role!=='admin') status.pm=true;
-  const messageTime= parseReadTime(payload&&payload.at) || parseReadTime(payload&&payload.published_at) || parseReadTime(payload&&payload.created_at);
-  const pickTime=function(map,keys){
-    if(!map || typeof map!=='object') return undefined;
-    for(let i=0;i<keys.length;i++){
-      const key=keys[i];
-      if(Object.prototype.hasOwnProperty.call(map,key)) return map[key];
-    }
-    return undefined;
-  };
-  const clientValue=pickTime(times,['client','customer']);
-  const pmValue=pickTime(times,['pm','manager','project_manager']);
-  const adminValue=pickTime(times,['admin','administrator']);
-  const clientTime=parseReadTime(clientValue);
-  const pmTime=parseReadTime(pmValue);
-  const adminTime=parseReadTime(adminValue);
+  if(!pmId && normalizedRole!=='admin') status.pm=true;
+  const messageId=getMessageId(payload);
+  const messageTime=parseReadTime(payload&&payload.at) || parseReadTime(payload&&payload.published_at) || parseReadTime(payload&&payload.created_at);
+  const clientTime=parseReadTime(times&&times.client);
+  const pmTime=parseReadTime(times&&times.pm);
+  const adminTime=parseReadTime(times&&times.admin);
+  const clientIdValue=parseReadId(ids&&ids.client);
+  const pmIdValue=parseReadId(ids&&ids.pm);
+  const adminIdValue=parseReadId(ids&&ids.admin);
+  if(messageId){
+    if(clientIdValue && clientIdValue>=messageId) status.client=true;
+    if(pmIdValue && pmIdValue>=messageId) status.pm=true;
+    if(adminIdValue && adminIdValue>=messageId) status.admin=true;
+  }
   if(messageTime){
     if(clientTime && clientTime>=messageTime) status.client=true;
     if(pmTime && pmTime>=messageTime) status.pm=true;
@@ -1293,7 +1735,7 @@ function ensureUnreadObserver(){
     return null;
   }
   try{
-    unreadObserverInstance=new IntersectionObserver(handleUnreadVisibility,{root:list||null,threshold:[0,0.15,0.6]});
+    unreadObserverInstance=new IntersectionObserver(handleUnreadVisibility,{root:list||null,threshold:[0,READ_THRESHOLD]});
   }catch(err){
     unreadObserverDisabled=true;
     unreadObserverInstance=null;
@@ -1305,12 +1747,12 @@ function handleUnreadVisibility(entries){
   entries.forEach(entry=>{
     const line=entry.target;
     if(!line || !trackedUnreadLines.has(line)) return;
-    const visible=entry.isIntersecting||entry.intersectionRatio>0;
-    if(visible){
-      pendingVisibleUnread.add(line);
-      processPendingVisibleUnread();
+    const ratio=entry.intersectionRatio||0;
+    line.__lastVisibilityRatio=ratio;
+    if((entry.isIntersecting||ratio>0) && ratio>=READ_THRESHOLD){
+      startVisibilityTimer(line);
     } else {
-      pendingVisibleUnread.delete(line);
+      cancelVisibilityTimer(line);
     }
   });
 }
@@ -1325,24 +1767,24 @@ function observeUnreadLine(line){
 function unobserveUnreadLine(line){
   if(!line) return;
   pendingVisibleUnread.delete(line);
+  cancelVisibilityTimer(line);
   if(line.__unreadObserved && unreadObserverInstance){
     try{ unreadObserverInstance.unobserve(line); }
     catch(e){}
   }
   line.__unreadObserved=false;
 }
-function lineIsVisible(line){
-  if(!line || typeof line.getBoundingClientRect!=='function') return false;
-  if(!list || typeof list.getBoundingClientRect!=='function') return false;
+function computeVisibilityRatio(line){
+  if(!line || typeof line.getBoundingClientRect!=='function') return 0;
+  if(!list || typeof list.getBoundingClientRect!=='function') return 0;
   const rect=line.getBoundingClientRect();
   const containerRect=list.getBoundingClientRect();
   const top=Math.max(rect.top,containerRect.top);
   const bottom=Math.min(rect.bottom,containerRect.bottom);
-  const visibleHeight=bottom-top;
-  const lineHeight=rect.height || (rect.bottom-rect.top);
-  if(!Number.isFinite(lineHeight) || lineHeight<=0) return false;
-  const threshold=Math.min(Math.max(lineHeight*0.25,1),lineHeight);
-  return visibleHeight>=threshold;
+  const visible=Math.max(0,bottom-top);
+  const total=rect.height || (rect.bottom-rect.top) || 1;
+  const ratio=visible/total;
+  return ratio>1?1:ratio;
 }
 function evaluateUnreadVisibility(line){
   if(!line || !trackedUnreadLines.has(line)) return;
@@ -1350,9 +1792,12 @@ function evaluateUnreadVisibility(line){
     stopUnreadTracking(line);
     return;
   }
-  if(lineIsVisible(line)){
-    pendingVisibleUnread.add(line);
-    processPendingVisibleUnread();
+  const ratio=computeVisibilityRatio(line);
+  line.__lastVisibilityRatio=ratio;
+  if(ratio>=READ_THRESHOLD){
+    startVisibilityTimer(line);
+  } else {
+    cancelVisibilityTimer(line);
   }
 }
 function scheduleUnreadEvaluation(line){
@@ -1365,18 +1810,76 @@ function scheduleUnreadEvaluation(line){
 function trackUnreadLine(line){
   if(!line || !line.__chatPayload) return;
   trackedUnreadLines.add(line);
+  line.__arrivalAt=Date.now();
+  line.__hasStableVisibility=false;
+  if(line.__visibilityTimer){ clearTimeout(line.__visibilityTimer); }
+  line.__visibilityTimer=null;
+  line.__lastVisibilityRatio=line.__lastVisibilityRatio||0;
   observeUnreadLine(line);
   scheduleUnreadEvaluation(line);
 }
 function stopUnreadTracking(line){
   if(!line) return;
   trackedUnreadLines.delete(line);
+  cancelVisibilityTimer(line);
   unobserveUnreadLine(line);
+  line.__arrivalAt=0;
+}
+function hasUserIntentForLine(line){
+  const arrival=line&&line.__arrivalAt?line.__arrivalAt:0;
+  if(!arrival) return false;
+  if(!lastUserIntentTs) return false;
+  return lastUserIntentTs>=arrival;
+}
+function startVisibilityTimer(line){
+  if(!line) return;
+  if(line.__hasStableVisibility) return;
+  if(line.__visibilityTimer) return;
+  line.__visibilityTimer=setTimeout(()=>{
+    line.__visibilityTimer=null;
+    if(!trackedUnreadLines.has(line)) return;
+    if((line.__lastVisibilityRatio||0) >= READ_THRESHOLD){
+      line.__hasStableVisibility=true;
+      pendingVisibleUnread.add(line);
+      processPendingVisibleUnread();
+    }
+  },READ_STABILITY_MS);
+}
+function cancelVisibilityTimer(line){
+  if(!line) return;
+  if(line.__visibilityTimer){ clearTimeout(line.__visibilityTimer); line.__visibilityTimer=null; }
+  line.__hasStableVisibility=false;
+  pendingVisibleUnread.delete(line);
+}
+function logReadTelemetry(line,result){
+  if(Math.random()>READ_TELEMETRY_SAMPLE) return;
+  const ratio=line && typeof line.__lastVisibilityRatio==='number'?line.__lastVisibilityRatio:0;
+  const messageId=line && line.dataset ? parseInt(line.dataset.messageId||'0',10)||0 : 0;
+  const visibility=(typeof document!=='undefined' && typeof document.visibilityState==='string')?document.visibilityState:'';
+  let hasFocus=false;
+  try{ hasFocus=documentHasFocusSafe(); }catch(e){ hasFocus=false; }
+  try{
+    console.debug('[elxao_chat] read-attempt',{
+      tabId,
+      visibility,
+      hasFocus,
+      hasUserIntent:hasUserIntentForLine(line),
+      intersectionRatio:Math.round((ratio||0)*1000)/1000,
+      msgId:messageId,
+      roomId:room||'',
+      userId:myId||0,
+      ts:Date.now(),
+      result:result||'seen'
+    });
+  }catch(e){}
 }
 function markLineAsSeen(line){
   if(!line || !line.__chatPayload) return;
   const payload=line.__chatPayload;
   let changed=false;
+  cancelVisibilityTimer(line);
+  stopUnreadTracking(line);
+  const messageId=parseInt(line.dataset&&line.dataset.messageId?line.dataset.messageId:'0',10)||0;
   if(payload.viewer_unread){
     payload.viewer_unread=false;
     changed=true;
@@ -1385,10 +1888,26 @@ function markLineAsSeen(line){
     line.classList.remove('is-unread');
     changed=true;
   }
-  stopUnreadTracking(line);
+  if(myRole){
+    if(!payload.read_status || typeof payload.read_status!=='object') payload.read_status={};
+    if(payload.read_status[myRole]!==true){
+      payload.read_status[myRole]=true;
+      changed=true;
+    }
+    if(!payload.reads || typeof payload.reads!=='object') payload.reads={};
+    if(!payload.reads.roles || typeof payload.reads.roles!=='object') payload.reads.roles={};
+    payload.reads.roles[myRole]=true;
+    if(!payload.reads.times || typeof payload.reads.times!=='object') payload.reads.times={};
+    if(!payload.reads.ids || typeof payload.reads.ids!=='object') payload.reads.ids={};
+    if(messageId>0){
+      payload.reads.ids[myRole]=messageId;
+      if(currentReadIds[myRole]<messageId) currentReadIds[myRole]=messageId;
+    }
+  }
   if(changed){
     scheduleReadSync();
   }
+  logReadTelemetry(line,'seen');
 }
 function collectVisibleUnread(){
   trackedUnreadLines.forEach(line=>{
@@ -1400,65 +1919,57 @@ function collectVisibleUnread(){
       stopUnreadTracking(line);
       return;
     }
-    if(lineIsVisible(line)){
-      pendingVisibleUnread.add(line);
+    const ratio=computeVisibilityRatio(line);
+    line.__lastVisibilityRatio=ratio;
+    if(ratio>=READ_THRESHOLD){
+      startVisibilityTimer(line);
+    } else {
+      cancelVisibilityTimer(line);
     }
   });
 }
 function processPendingVisibleUnread(){
   if(!pendingVisibleUnread.size) return;
-  if(!viewerHasAttention()) return;
+  if(!viewerHasAttention() || !hasReadLock()) return;
   const lines=Array.from(pendingVisibleUnread);
-  pendingVisibleUnread.clear();
   lines.forEach(line=>{
+    pendingVisibleUnread.delete(line);
     if(!line || !trackedUnreadLines.has(line)) return;
     if(!line.__chatPayload || !messageIsUnreadForViewer(line.__chatPayload)){
       stopUnreadTracking(line);
       return;
     }
+    if(!line.__hasStableVisibility || (line.__lastVisibilityRatio||0) < READ_THRESHOLD){
+      startVisibilityTimer(line);
+      return;
+    }
+    if(!hasUserIntentForLine(line)){
+      pendingVisibleUnread.add(line);
+      return;
+    }
     markLineAsSeen(line);
   });
 }
+function recordUserIntent(){
+  lastUserIntentTs=Date.now();
+  tryAcquireReadLock(false);
+  collectVisibleUnread();
+  processPendingVisibleUnread();
+  ensureReadSyncScheduled();
+}
 function buildReadState(data){
-  const reads=(data&&data.reads&&typeof data.reads==='object')?data.reads:{};
-  const roleMap=(reads.roles&&typeof reads.roles==='object')?reads.roles:{};
-  const userSet=new Set();
-  const addUser=function(value){
-    if(value===undefined||value===null) return;
-    if(Array.isArray(value)){ value.forEach(addUser); return; }
-    if(typeof value==='object'){
-      if('id' in value) addUser(value.id);
-      if('user_id' in value) addUser(value.user_id);
-      if('user' in value) addUser(value.user);
-      if(Array.isArray(value.users)) addUser(value.users);
-      if(Array.isArray(value.user_ids)) addUser(value.user_ids);
-      if(Array.isArray(value.ids)) addUser(value.ids);
-      return;
-    }
-    const num=parseInt(value,10);
-    if(!Number.isNaN(num) && num>0) userSet.add(num);
+  const extracted=extractReadState(data)||{times:{},ids:{}};
+  const times={
+    client:Object.prototype.hasOwnProperty.call(extracted.times||{},'client')?extracted.times.client:currentReadTimes.client,
+    pm:Object.prototype.hasOwnProperty.call(extracted.times||{},'pm')?extracted.times.pm:currentReadTimes.pm,
+    admin:Object.prototype.hasOwnProperty.call(extracted.times||{},'admin')?extracted.times.admin:currentReadTimes.admin
   };
-  if(Array.isArray(reads.users)) addUser(reads.users);
-  if(Array.isArray(reads.user_ids)) addUser(reads.user_ids);
-  if(Array.isArray(reads.ids)) addUser(reads.ids);
-  [data&&data.read_by,data&&data.readBy,data&&data.readers,data&&data.read_receipts,data&&data.readReceipts].forEach(src=>{ if(src) addUser(src); });
-  const roleValue=function(keys){
-    for(const key of keys){
-      if(key && Object.prototype.hasOwnProperty.call(roleMap,key)) return !!roleMap[key];
-    }
-    return undefined;
+  const ids={
+    client:Object.prototype.hasOwnProperty.call(extracted.ids||{},'client')?extracted.ids.client:currentReadIds.client,
+    pm:Object.prototype.hasOwnProperty.call(extracted.ids||{},'pm')?extracted.ids.pm:currentReadIds.pm,
+    admin:Object.prototype.hasOwnProperty.call(extracted.ids||{},'admin')?extracted.ids.admin:currentReadIds.admin
   };
-  const resolved={
-    client:roleValue(['client','customer']),
-    pm:roleValue(['pm','project_manager','manager']),
-    admin:roleValue(['admin','administrator'])
-  };
-  const fallbackIds={ client:clientId, pm:pmId, admin:(myRole==='admin'&&myId)?myId:0 };
-  Object.keys(fallbackIds).forEach(role=>{
-    if(resolved[role]===undefined && fallbackIds[role]) resolved[role]=userSet.has(fallbackIds[role]);
-  });
-  Object.keys(resolved).forEach(role=>{ resolved[role]=!!resolved[role]; });
-  return resolved;
+  return buildStatusFromReadState(data,times,ids);
 }
 function interpretViewerFlag(value){
   if(value===undefined||value===null) return undefined;
@@ -1546,22 +2057,28 @@ function determineIndicator(data,role){
   return {className:anyRead?'chat-read-indicator--read':'chat-read-indicator--unread',label:anyRead?'Read':'Unread'};
 }
 function applyReadReceipt(data){
-  const times=extractReadTimes(data);
-  if(times) updateCurrentReadTimes(times);
+  const state=extractReadState(data);
+  if(state) updateCurrentReadState(state);
   const effectiveTimes={
     client:currentReadTimes.client,
     pm:currentReadTimes.pm,
     admin:currentReadTimes.admin
   };
+  const effectiveIds={
+    client:currentReadIds.client,
+    pm:currentReadIds.pm,
+    admin:currentReadIds.admin
+  };
   if(!list) return;
   Array.from(list.children||[]).forEach(function(line){
     if(!line || !line.__chatPayload) return;
     const payload=line.__chatPayload;
-    const status=buildStatusFromTimes(payload,effectiveTimes);
+    const status=buildStatusFromReadState(payload,effectiveTimes,effectiveIds);
     payload.read_status=Object.assign({},status);
     if(!payload.reads || typeof payload.reads!=='object') payload.reads={};
     payload.reads.roles=Object.assign({},status);
     payload.reads.times=Object.assign({},effectiveTimes);
+    payload.reads.ids=Object.assign({},effectiveIds);
     const indicator=line.querySelector('.chat-read-indicator');
     if(indicator) applyIndicatorState(indicator,determineIndicator(payload,payload.role||line.dataset.role||'other'));
     handleViewerUnread(line,payload);
@@ -1569,17 +2086,7 @@ function applyReadReceipt(data){
 }
 
 function viewerHasAttention(){
-  if(typeof document==='undefined') return true;
-  if(typeof document.visibilityState==='string' && document.visibilityState!=='visible') return false;
-  if(typeof document.hidden==='boolean' && document.hidden) return false;
-  if(typeof document.hasFocus==='function'){
-    try {
-      if(!document.hasFocus()) return false;
-    } catch(e) {
-      return false;
-    }
-  }
-  return true;
+  return canHoldReadLock();
 }
 
 function handleAttentionGained(){
@@ -1588,25 +2095,64 @@ function handleAttentionGained(){
   ensureReadSyncScheduled();
 }
 
+function findMaxReadableMessageId(){
+  let baseline=lastKnownServerReadId||0;
+  if(!list || !myRole) return baseline;
+  const children=list.children?Array.from(list.children):[];
+  if(!children.length) return baseline;
+  const items=children.map(line=>{
+    if(!line || !line.dataset) return null;
+    const rawId=typeof line.dataset.messageId==='string'?line.dataset.messageId:'';
+    const parsed=parseInt(rawId,10);
+    if(!(parsed>0)) return null;
+    return {line,id:parsed};
+  }).filter(Boolean).sort((a,b)=>a.id-b.id);
+  let candidate=baseline;
+  for(let i=0;i<items.length;i++){
+    const entry=items[i];
+    if(entry.id<=candidate) continue;
+    const payload=entry.line.__chatPayload;
+    if(!payload) break;
+    if(messageIsUnreadForViewer(payload)) break;
+    let isRead=false;
+    if(payload.read_status && payload.read_status[myRole]===true) isRead=true;
+    if(!isRead && payload.reads && payload.reads.roles && payload.reads.roles[myRole]===true) isRead=true;
+    if(!isRead) break;
+    candidate=entry.id;
+  }
+  return candidate;
+}
+
 function ensureReadSyncScheduled(){
   if(!readSyncPending) return;
   if(readSyncInFlight) return;
-  if(!viewerHasAttention()) return;
+  if(!viewerHasAttention() || !hasReadLock()) return;
+  const nextReadableId=findMaxReadableMessageId();
+  if(nextReadableId<=lastKnownServerReadId){
+    readSyncPending=false;
+    return;
+  }
   if(readSyncTimer) return;
   readSyncTimer=setTimeout(()=>{
     readSyncTimer=null;
     if(!readSyncPending) return;
-    if(!viewerHasAttention()){
+    if(!viewerHasAttention() || !hasReadLock()){
       ensureReadSyncScheduled();
       return;
     }
-    sendReadSync();
+    const currentCandidate=findMaxReadableMessageId();
+    if(currentCandidate<=lastKnownServerReadId){
+      readSyncPending=false;
+      ensureReadSyncScheduled();
+      return;
+    }
+    sendReadSync(currentCandidate);
   },400);
 }
 
-function sendReadSync(){
+function sendReadSync(precomputedId){
   if(readSyncInFlight) return;
-  if(!viewerHasAttention()){
+  if(!viewerHasAttention() || !hasReadLock()){
     ensureReadSyncScheduled();
     return;
   }
@@ -1615,13 +2161,19 @@ function sendReadSync(){
     readSyncPending=false;
     return;
   }
+  const resolvedId=(typeof precomputedId==='number' && precomputedId>0)?precomputedId:findMaxReadableMessageId();
+  if(!(resolvedId>0) || resolvedId<=lastKnownServerReadId){
+    readSyncPending=false;
+    return;
+  }
   readSyncPending=false;
   readSyncInFlight=true;
+  const payload={project_id:targetProject,message_id:resolvedId};
   fetch(rest+'elxao/v1/messages/read',{
     method:'POST',
     credentials:'same-origin',
     headers:Object.assign({'Content-Type':'application/json'},hdr),
-    body:JSON.stringify({project_id:targetProject})
+    body:JSON.stringify(payload)
   }).then(r=>{ if(!r.ok) throw new Error(''+r.status); return r.json(); })
     .then(resp=>{
       if(!resp) return;
@@ -1630,7 +2182,7 @@ function sendReadSync(){
       if(!resp.user) resp.user=myId;
       window.ELXAO_CHAT_BROADCAST(resp.project,resp);
     })
-    .catch(()=>{})
+    .catch(()=>{ readSyncPending=true; })
     .finally(()=>{
       readSyncInFlight=false;
       ensureReadSyncScheduled();
@@ -1645,49 +2197,80 @@ function scheduleReadSync(){
 }
 
 focusHandler=function(){
+  tryAcquireReadLock(true);
+  recordUserIntent();
   handleAttentionGained();
 };
 visibilityHandler=function(){
   if(typeof document==='undefined') return;
-  if(typeof document.hidden==='boolean' && document.hidden) return;
+  if(!documentIsVisible()){
+    releaseReadLock();
+    return;
+  }
+  tryAcquireReadLock(true);
+  recordUserIntent();
   handleAttentionGained();
 };
 pageShowHandler=function(){
+  tryAcquireReadLock(true);
+  recordUserIntent();
   handleAttentionGained();
 };
 window.addEventListener('focus',focusHandler);
 window.addEventListener('pageshow',pageShowHandler);
+window.addEventListener('blur',()=>{ releaseReadLock(); });
 document.addEventListener('visibilitychange',visibilityHandler);
 if(list && typeof list.addEventListener==='function'){
   scrollHandler=function(){
-    collectVisibleUnread();
-    processPendingVisibleUnread();
+    recordUserIntent();
   };
   list.addEventListener('scroll',scrollHandler);
+}
+['pointerdown','touchstart','wheel'].forEach(evt=>{
+  if(root && typeof root.addEventListener==='function'){
+    root.addEventListener(evt,function(ev){
+      if(!ev||!ev.target) return;
+      if(root.contains(ev.target)) recordUserIntent();
+    },{passive:true});
+  }
+});
+if(root && typeof root.addEventListener==='function'){
+  root.addEventListener('keydown',function(){
+    const active=document && document.activeElement ? document.activeElement : null;
+    if(active && root.contains(active)) recordUserIntent();
+  });
+  root.addEventListener('focusin',function(ev){
+    if(ev && root.contains(ev.target)) recordUserIntent();
+  });
 }
 
 function appendChatLine(source){
   if(!source) return;
   const data=Object.assign({},source);
-  const times=extractReadTimes(data);
-  if(times) updateCurrentReadTimes(times);
+  const state=extractReadState(data);
+  if(state) updateCurrentReadState(state);
   const effectiveTimes={
     client:currentReadTimes.client,
     pm:currentReadTimes.pm,
     admin:currentReadTimes.admin
   };
+  const effectiveIds={
+    client:currentReadIds.client,
+    pm:currentReadIds.pm,
+    admin:currentReadIds.admin
+  };
+  const combinedTimes=Object.assign({},effectiveTimes,state&&state.times?state.times:{});
+  const combinedIds=Object.assign({},effectiveIds,state&&state.ids?state.ids:{});
+  const computed=buildStatusFromReadState(data,combinedTimes,combinedIds);
   if(!data.read_status || typeof data.read_status!=='object'){
-    const computed=buildStatusFromTimes(data,effectiveTimes);
     data.read_status=Object.assign({},computed);
-    if(!data.reads || typeof data.reads!=='object') data.reads={};
-    data.reads.roles=Object.assign({},computed);
-    data.reads.times=Object.assign({},effectiveTimes);
   } else {
-    if(!data.reads || typeof data.reads!=='object') data.reads={};
-    if(!data.reads.roles || typeof data.reads.roles!=='object') data.reads.roles=Object.assign({},data.read_status);
-    if(times) data.reads.times=Object.assign({},times);
-    else if(!data.reads.times) data.reads.times=Object.assign({},effectiveTimes);
+    data.read_status=Object.assign({},data.read_status,computed);
   }
+  if(!data.reads || typeof data.reads!=='object') data.reads={};
+  data.reads.roles=Object.assign({},computed);
+  data.reads.times=Object.assign({},combinedTimes);
+  data.reads.ids=Object.assign({},combinedIds);
   const role=(data.type==='system')?'sys':(data.role||'other');
   data.role=role;
   const messageText=normalizeContent(data.message);
@@ -1862,6 +2445,12 @@ function cleanup(){
   if(readSyncTimer){ clearTimeout(readSyncTimer); readSyncTimer=null; }
   readSyncPending=false;
   stopFallbackPolling();
+  if(readLockRenewInterval){ clearInterval(readLockRenewInterval); readLockRenewInterval=null; }
+  if(readLockCleanupHandlers&&readLockCleanupHandlers.length){
+    readLockCleanupHandlers.forEach(fn=>{ try{ fn(); }catch(e){} });
+    readLockCleanupHandlers=[];
+  }
+  releaseReadLock();
   window.removeEventListener('elxao:chat',onChatEvent);
   window.removeEventListener('beforeunload',cleanup);
   if(focusHandler){ window.removeEventListener('focus',focusHandler); focusHandler=null; }
@@ -1930,7 +2519,7 @@ function pollForUpdates(){
     .then(function(r){
       if(r && typeof r==='object'){
         let readsChanged=false;
-        if(r.reads) readsChanged=updateCurrentReadTimes(r.reads);
+        if(r) readsChanged=updateCurrentReadState(r);
         if(r.items && Array.isArray(r.items) && r.items.length){
           processIncrementalHistory(r.items);
         }
@@ -1971,7 +2560,8 @@ function applyServerAck(resp){
   if(!resp || !list) return;
   const ackId=('id' in resp && resp.id!==undefined && resp.id!==null)?parseInt(resp.id,10):0;
   const ackAt=resp.at||resp.published_at||'';
-  const ackTimes=extractReadTimes(resp);
+  const ackState=extractReadState(resp);
+  if(ackState) updateCurrentReadState(ackState);
   const ackStatus=(resp && resp.read_status && typeof resp.read_status==='object')?resp.read_status:null;
   const lines=list.children?Array.from(list.children):[];
   for(let i=lines.length-1;i>=0;i--){
@@ -1988,10 +2578,10 @@ function applyServerAck(resp){
       payload.at=ackAt;
       line.dataset.at=String(ackAt);
     }
-    if(ackTimes){
+    if(ackState){
       payload.reads=payload.reads||{};
-      payload.reads.times=Object.assign({},ackTimes);
-      updateCurrentReadTimes(ackTimes);
+      payload.reads.times=Object.assign({},currentReadTimes,ackState.times||{});
+      payload.reads.ids=Object.assign({},currentReadIds,ackState.ids||{});
     }
     if(ackStatus){
       payload.read_status=Object.assign({},ackStatus);
@@ -2013,7 +2603,7 @@ token()
   .then(function(){ return load(); })
   .then(function(r){
     if(r && typeof r==='object'){
-      if(r.reads) updateCurrentReadTimes(r.reads);
+      updateCurrentReadState(r);
       if(r.items && Array.isArray(r.items)) renderHistory(r.items);
     }
   })
