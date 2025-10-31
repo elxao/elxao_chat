@@ -706,12 +706,15 @@ ob_start();?>
 #elxao-chat-<?php echo $pid;?> .chat-line::before{content:"";position:absolute;inset:0;border-radius:10px;background:rgba(248,113,113,0.18);opacity:0;transition:opacity .35s ease}
 #elxao-chat-<?php echo $pid;?> .chat-line.is-unread::before{opacity:1}
 #elxao-chat-<?php echo $pid;?> .chat-line .chat-text{flex:1;color:inherit;word-break:break-word;white-space:pre-wrap;position:relative;z-index:1}
-#elxao-chat-<?php echo $pid;?> .chat-read-indicator{width:10px;height:10px;border-radius:999px;background:var(--chat-read-unread);margin-top:6px;flex:0 0 10px;box-shadow:0 0 0 1px rgba(0,0,0,0.35);position:relative;z-index:1}
+#elxao-chat-<?php echo $pid;?> .chat-read-indicator{width:10px;height:10px;border-radius:999px;background:var(--chat-read-unread);margin-top:6px;flex:0 0 10px;box-shadow:0 0 0 1px rgba(0,0,0,0.35);position:relative;z-index:1;opacity:0;transform:scale(.75);transition:opacity .28s ease,transform .28s ease,background-color .25s ease}
+#elxao-chat-<?php echo $pid;?> .chat-read-indicator.is-visible{opacity:1;transform:scale(1)}
+#elxao-chat-<?php echo $pid;?> .chat-read-indicator.is-transitioning{animation:elxao-chat-indicator-pop .35s cubic-bezier(.33,1,.68,1)}
 #elxao-chat-<?php echo $pid;?> .chat-read-indicator.chat-read-indicator--unread{background:var(--chat-read-unread)}
-#elxao-chat-<?php echo $pid;?> .chat-read-indicator.is-hidden{opacity:0;visibility:hidden}
+#elxao-chat-<?php echo $pid;?> .chat-read-indicator.is-hidden{opacity:0;visibility:hidden;transform:scale(.6)}
 #elxao-chat-<?php echo $pid;?> .chat-read-indicator.chat-read-indicator--read{background:var(--chat-read-read)}
 #elxao-chat-<?php echo $pid;?> .chat-read-indicator.chat-read-indicator--client{background:var(--chat-read-client)}
 #elxao-chat-<?php echo $pid;?> .chat-read-indicator.chat-read-indicator--pm{background:var(--chat-read-pm)}
+#elxao-chat-<?php echo $pid;?> @keyframes elxao-chat-indicator-pop{0%{transform:scale(.6)}55%{transform:scale(1.15)}100%{transform:scale(1)}}
 #elxao-chat-<?php echo $pid;?> .composer{display:flex;gap:8px;border-top:1px solid #4b5563;padding:10px}
 #elxao-chat-<?php echo $pid;?> textarea{flex:1;resize:none;background:transparent;border:1px solid #6b7280;border-radius:8px;padding:10px;color:inherit}
 #elxao-chat-<?php echo $pid;?> .send{display:inline-flex;align-items:center;justify-content:center;border:1px solid #6b7280;border-radius:10px;padding:0 10px;background:transparent;cursor:pointer;min-width:44px;color:inherit}
@@ -746,6 +749,9 @@ let fallbackInFlight=false;
 const FALLBACK_INTERVAL=4000;
 const currentReadTimes={client:'',pm:'',admin:''};
 const DEBUG=false;
+const indicatorStates=(typeof WeakMap==='function')?new WeakMap():new Map();
+let indicatorObserverInstance=null;
+let indicatorObserverDisabled=false;
 
 /* ---------- Shared helpers (guarded singletons) ---------- */
 if(!window.ELXAO_CHAT_BUS){
@@ -1158,16 +1164,82 @@ function buildStatusFromTimes(payload,times){
   }
   return status;
 }
-function applyIndicatorState(indicator,info){
+function buildIndicatorSignature(info){
+  if(!info) return 'hidden';
+  const classes=(info.className||'').split(/\s+/).filter(Boolean).join(' ');
+  const label=info.label||'';
+  const title=info.title||'';
+  return classes+'|'+label+'|'+title;
+}
+function ensureIndicatorObserver(){
+  if(indicatorObserverDisabled) return null;
+  if(indicatorObserverInstance) return indicatorObserverInstance;
+  if(typeof IntersectionObserver==='undefined'){
+    indicatorObserverDisabled=true;
+    return null;
+  }
+  try{
+    indicatorObserverInstance=new IntersectionObserver(handleIndicatorVisibility,{root:list||null,threshold:[0,0.15,0.6]});
+  }catch(err){
+    indicatorObserverDisabled=true;
+    indicatorObserverInstance=null;
+    return null;
+  }
+  return indicatorObserverInstance;
+}
+function handleIndicatorVisibility(entries){
+  entries.forEach(entry=>{
+    const indicator=entry.target;
+    const state=indicatorStates.get(indicator);
+    if(!state) return;
+    const visible=entry.isIntersecting||entry.intersectionRatio>0;
+    state.visible=visible;
+    if(visible){
+      indicator.classList.add('is-visible');
+      if(state.pending){
+        const pending=state.pending;
+        state.pending=null;
+        renderIndicatorState(indicator,pending.info,state,pending.signature);
+      }
+    } else {
+      indicator.classList.remove('is-visible');
+    }
+  });
+}
+function getIndicatorState(indicator){
+  let state=indicatorStates.get(indicator);
+  if(!state){
+    state={visible:false,pending:null,signature:null,lastInfo:null};
+    indicatorStates.set(indicator,state);
+    const observer=ensureIndicatorObserver();
+    if(observer){
+      observer.observe(indicator);
+    } else {
+      state.visible=true;
+      indicator.classList.add('is-visible');
+    }
+  }
+  return state;
+}
+function renderIndicatorState(indicator,info,state,signature){
+  state.pending=null;
+  state.signature=signature;
+  state.lastInfo=info||null;
   indicator.className='chat-read-indicator';
   indicator.removeAttribute('aria-hidden');
   indicator.removeAttribute('aria-label');
   indicator.removeAttribute('title');
   indicator.removeAttribute('role');
+  indicator.classList.remove('is-transitioning');
   if(!info){
     indicator.classList.add('is-hidden');
     indicator.setAttribute('aria-hidden','true');
+    indicator.classList.remove('is-visible');
     return;
+  }
+  indicator.classList.remove('is-hidden');
+  if(state.visible){
+    indicator.classList.add('is-visible');
   }
   const classes=(info.className||'').split(/\s+/).filter(Boolean);
   classes.forEach(cls=>indicator.classList.add(cls));
@@ -1180,6 +1252,30 @@ function applyIndicatorState(indicator,info){
   if(title){
     indicator.title=title;
   }
+  if(state.visible){
+    void indicator.offsetWidth;
+    indicator.classList.add('is-transitioning');
+    const handle=()=>{
+      indicator.classList.remove('is-transitioning');
+      indicator.removeEventListener('animationend',handle);
+      indicator.removeEventListener('animationcancel',handle);
+    };
+    indicator.addEventListener('animationend',handle);
+    indicator.addEventListener('animationcancel',handle);
+  }
+}
+function applyIndicatorState(indicator,info){
+  if(!indicator) return;
+  const signature=buildIndicatorSignature(info);
+  const state=getIndicatorState(indicator);
+  if(state.visible){
+    if(state.signature===signature) return;
+    renderIndicatorState(indicator,info,state,signature);
+    return;
+  }
+  state.pending={info,signature};
+  state.signature=signature;
+  state.lastInfo=info||null;
 }
 function buildReadState(data){
   const reads=(data&&data.reads&&typeof data.reads==='object')?data.reads:{};
