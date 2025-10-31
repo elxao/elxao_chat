@@ -1423,10 +1423,17 @@ function handleRealtimePayload(payload){
 }
 
 function onChatEvent(ev){
-  const detail=ev&&ev.detail?ev.detail:{}; const project=detail.project?parseInt(detail.project,10):0;
-  if(project!==projectId) return;
-  const payload=window.ELXAO_CHAT_NORMALIZE(detail.payload||{},projectId);
-  const fp=fingerprint(projectId,payload.user||0,payload.message||''); if(isRecentLocal(fp)) return;
+  const detail=(ev&&ev.detail)?ev.detail:{};
+  const hintedProject=detail.project?parseInt(detail.project,10):0;
+  const rawPayload=(detail&&detail.payload)?detail.payload:{};
+  const payload=window.ELXAO_CHAT_NORMALIZE(rawPayload,hintedProject||projectId);
+  if(!payload) return;
+  const payloadProject=payload&&payload.project?parseInt(payload.project,10):0;
+  const targetProject=hintedProject||payloadProject||0;
+  if(targetProject && targetProject!==projectId) return;
+  if(!payload.project) payload.project=projectId;
+  const fp=fingerprint(projectId,payload.user||0,payload.message||'');
+  if(isRecentLocal(fp)) return;
   handleChatPayload(payload);
 }
 
