@@ -1038,13 +1038,25 @@ function extractReadTimes(source){
   return null;
 }
 function updateCurrentReadTimes(times){
-  if(!times || typeof times!=='object') return;
+  if(!times || typeof times!=='object') return false;
+  let changed=false;
   ['client','pm','admin'].forEach(function(role){
     if(Object.prototype.hasOwnProperty.call(times,role)){
-      const value=times[role];
-      currentReadTimes[role]=(value!==undefined && value!==null)?value:'';
+      const value=(times[role]!==undefined && times[role]!==null)?times[role]:'';
+      const existing=currentReadTimes[role];
+      const normalize=function(v){
+        if(v===undefined||v===null||v==='') return '';
+        if(v instanceof Date) return v.getTime();
+        if(typeof v==='number') return v;
+        return String(v);
+      };
+      if(normalize(existing)!==normalize(value)){
+        currentReadTimes[role]=value;
+        changed=true;
+      }
     }
   });
+  return changed;
 }
 function updateLatestFromPayload(data){
   if(!data || typeof data!=='object') return;
@@ -1514,9 +1526,13 @@ function pollForUpdates(){
   return load(params)
     .then(function(r){
       if(r && typeof r==='object'){
-        if(r.reads) updateCurrentReadTimes(r.reads);
+        let readsChanged=false;
+        if(r.reads) readsChanged=updateCurrentReadTimes(r.reads);
         if(r.items && Array.isArray(r.items) && r.items.length){
           processIncrementalHistory(r.items);
+        }
+        if(readsChanged){
+          applyReadReceipt({read_times:r.reads});
         }
       }
     })
