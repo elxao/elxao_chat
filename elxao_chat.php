@@ -435,6 +435,121 @@ const myId=parseInt(root.dataset.myid,10)||0;
 const myRole=(root.dataset.myrole||'other');
 const hdr={'X-WP-Nonce':nonce};
 const projectId=parseInt(pid,10)||0;
+const localEchoes=new Map();
+let realtimeCleanup=null;
+
+function ensureAblyState(){
+  if(!window.ELXAO_ABLY){
+    window.ELXAO_ABLY={client:null,clientPromise:null,libraryPromise:null,channels:new Map()};
+  } else if(!window.ELXAO_ABLY.channels){
+    window.ELXAO_ABLY.channels=new Map();
+  }
+  const state=window.ELXAO_ABLY;
+
+  if(!state.loadLibrary){
+    state.loadLibrary=function(){
+      if(state.libraryPromise) return state.libraryPromise;
+      if(window.Ably&&window.Ably.Realtime&&window.Ably.Realtime.Promise){
+        state.libraryPromise=Promise.resolve();
+        return state.libraryPromise;
+      }
+      state.libraryPromise=new Promise(function(resolve,reject){
+        const existing=document.querySelector('script[data-elxao-ably]');
+        if(existing){
+          existing.addEventListener('load',()=>resolve(),{once:true});
+          existing.addEventListener('error',()=>reject(new Error('Failed to load Ably library')),{once:true});
+          return;
+        }
+        const s=document.createElement('script');
+        s.src='https://cdn.ably.io/lib/ably.min-1.js';
+        s.async=true;
+        s.setAttribute('data-elxao-ably','1');
+        s.onload=()=>resolve();
+        s.onerror=()=>reject(new Error('Failed to load Ably library'));
+        document.head.appendChild(s);
+      });
+      return state.libraryPromise;
+    };
+  }
+
+  if(!state.ensureClient){
+    state.ensureClient=function(tokenDetails){
+      if(state.clientPromise){
+        return state.clientPromise.then(function(client){
+          if(tokenDetails){
+            return client.auth.authorize(null,{tokenDetails:tokenDetails}).then(function(){ return client; });
+          }
+          return client;
+        });
+      }
+      state.clientPromise=state.loadLibrary().then(function(){
+        if(!window.Ably||!window.Ably.Realtime||!window.Ably.Realtime.Promise){
+          throw new Error('Ably unavailable');
+        }
+        state.client=new window.Ably.Realtime.Promise({tokenDetails:tokenDetails});
+        return state.client;
+      }).catch(function(err){
+        state.client=null;
+        state.clientPromise=null;
+        throw err;
+      });
+      return state.clientPromise;
+    };
+  }
+
+  if(!state.registerChannel){
+    state.registerChannel=function(client,channelName,project){
+      if(!channelName) return function(){};
+      const channels=state.channels;
+      let entry=channels.get(channelName);
+      if(!entry){
+        entry={refCount:0,handler:null,channel:client.channels.get(channelName),projectId:project};
+        channels.set(channelName,entry);
+      } else {
+        if(!entry.channel){
+          entry.channel=client.channels.get(channelName);
+        }
+        if(project && !entry.projectId){
+          entry.projectId=project;
+        }
+      }
+      entry.refCount++;
+      if(!entry.handler){
+        entry.handler=function(msg){
+          const data=msg&&msg.data?msg.data:{};
+          const projectId=data.project||entry.projectId||project;
+          const detail={project:projectId,payload:data};
+          if(msg && typeof msg.id!=='undefined') detail.id=msg.id;
+          if(msg && typeof msg.name!=='undefined') detail.name=msg.name;
+          window.dispatchEvent(new CustomEvent('elxao:chat',{detail:detail}));
+          const bumpAt=data.at||data.published_at||Date.now();
+          if(projectId){
+            window.dispatchEvent(new CustomEvent('elxao:room-bump',{detail:{projectId:projectId,at:bumpAt}}));
+          }
+        };
+        entry.channel.subscribe(entry.handler);
+      }
+      entry.channel.attach().catch(function(){});
+      return function(){
+        entry.refCount--;
+        if(entry.refCount<=0){
+          if(entry.channel&&entry.handler){
+            entry.channel.unsubscribe(entry.handler);
+          }
+          channels.delete(channelName);
+        }
+      };
+    };
+  }
+
+  return state;
+}
+
+const ablyState=ensureAblyState();
+
+function normalizeContent(value){
+  return String(value||'').replace(/<[^>]*?>/g,'');
+}
 
 function addLine(text, cls){
   const d=document.createElement('div'); d.className=cls||'';
@@ -445,8 +560,42 @@ function addLine(text, cls){
   });
   list.appendChild(d); list.scrollTop=list.scrollHeight;
 }
-function load(){return fetch(rest+'elxao/v1/messages?project_id='+pid,{credentials:'same-origin',headers:hdr}).then(r=>r.json());}
-function token(){return fetch(rest+'elxao/v1/chat-token?project_id='+pid,{credentials:'same-origin',headers:hdr}).then(r=>r.json());}
+
+function fingerprint(project,user,content){
+  if(!project||!user) return '';
+  const normalized=normalizeContent(content).replace(/\r\n?/g,'\n').trim();
+  if(!normalized) return '';
+  return project+'|'+user+'|'+normalized;
+}
+
+function rememberLocal(fp){
+  if(!fp) return;
+  const now=Date.now();
+  localEchoes.set(fp,now);
+  const cutoff=now-5000;
+  localEchoes.forEach(function(ts,key){ if(ts<cutoff) localEchoes.delete(key); });
+}
+
+function isRecentLocal(fp){
+  if(!fp||!localEchoes.has(fp)) return false;
+  const ts=localEchoes.get(fp);
+  if(!ts) return false;
+  if(Date.now()-ts<=5000){
+    localEchoes.delete(fp);
+    return true;
+  }
+  localEchoes.delete(fp);
+  return false;
+}
+
+function load(){
+  return fetch(rest+'elxao/v1/messages?project_id='+pid,{credentials:'same-origin',headers:hdr}).then(r=>r.json());
+}
+
+function token(){
+  return fetch(rest+'elxao/v1/chat-token?project_id='+pid,{credentials:'same-origin',headers:hdr}).then(r=>r.json());
+}
+
 function send(content){
   return fetch(rest+'elxao/v1/messages',{
     method:'POST', credentials:'same-origin',
@@ -455,40 +604,80 @@ function send(content){
   }).then(r=>r.json());
 }
 
-// HISTORY render (role provided by API)
-load().then(r=>{
-  if(r&&r.items){
-    r.items.forEach(m=>{
-      const name=m.user_display||('User '+m.user_id);
-      const role=(m.role||'other'); // 'client' | 'pm' | 'admin' | 'sys'/'other'
-      const cls=(m.content_type==='system')?'sys':role;
-      addLine(name+': '+m.content, cls);
-    });
-  }
-  return token();
-}).then(tk=>{
-  if(tk&&!tk.error){
-    function start(){
-      const c=new Ably.Realtime.Promise({tokenDetails:tk});
-      const ch=c.channels.get(room);
-      ch.subscribe(msg=>{
-        const d=msg.data||{};
-        const name=d.user_display||('User '+d.user);
-        const cls=(d.type==='system')?'sys':(d.role||'other');
-        addLine(name+': '+(d.message||JSON.stringify(d)), cls);
-      });
+function handleChatPayload(payload){
+  if(!payload) return;
+  const name=payload.user_display||('User '+payload.user);
+  const role=(payload.type==='system')?'sys':(payload.role||'other');
+  const message=normalizeContent(payload.message);
+  if(!message && role!=='sys') return;
+  addLine(name+': '+message, role);
+}
+
+function onChatEvent(ev){
+  const detail=ev&&ev.detail?ev.detail:{};
+  const project=detail.project?parseInt(detail.project,10):0;
+  if(project!==projectId) return;
+  const payload=detail.payload||{};
+  const fp=fingerprint(projectId,parseInt(payload.user||0,10)||0,payload.message||'');
+  if(isRecentLocal(fp)) return;
+  handleChatPayload(payload);
+}
+
+function subscribeRealtime(tokenDetails){
+  return ablyState.ensureClient(tokenDetails).then(function(client){
+    if(realtimeCleanup){
+      try{ realtimeCleanup(); }catch(e){}
+      realtimeCleanup=null;
     }
-    if(window.Ably&&window.Ably.Realtime) start();
-    else { const s=document.createElement('script'); s.src='https://cdn.ably.io/lib/ably.min-1.js'; s.onload=start; document.head.appendChild(s); }
+    const unsubscribe=ablyState.registerChannel(client,room,projectId);
+    realtimeCleanup=unsubscribe;
+  });
+}
+
+function cleanup(){
+  if(realtimeCleanup){
+    try{ realtimeCleanup(); }catch(e){}
+    realtimeCleanup=null;
+  }
+  window.removeEventListener('elxao:chat',onChatEvent);
+  window.removeEventListener('beforeunload',cleanup);
+}
+
+const observer=new MutationObserver(function(){
+  if(!document.body.contains(root)){
+    observer.disconnect();
+    cleanup();
   }
 });
+observer.observe(document.body,{childList:true,subtree:true});
+window.addEventListener('elxao:chat',onChatEvent);
+window.addEventListener('beforeunload',cleanup,{once:true});
 
-// SEND (local echo uses current user's ROLE color)
+function renderHistory(items){
+  if(!items||!Array.isArray(items)) return;
+  items.forEach(function(m){
+    const name=m.user_display||('User '+m.user_id);
+    const role=(m.content_type==='system')?'sys':(m.role||'other');
+    addLine(name+': '+m.content, role);
+  });
+}
+
+load().then(function(r){
+  if(r&&r.items) renderHistory(r.items);
+  return token();
+}).then(function(tk){
+  if(!tk||tk.error) return;
+  return subscribeRealtime(tk);
+}).catch(function(err){
+  console.warn('ELXAO chat realtime unavailable',err);
+});
+
 btn.addEventListener('click', function(){
   const v = ta.value.replace(/\s+$/,'');
   if(!v.trim()) return;
   const meName = '<?php echo $meName;?>';
   addLine(meName+': '+v, myRole);
+  rememberLocal(fingerprint(projectId,myId,v));
   ta.value=''; btn.disabled=true;
   send(v)
     .then(function(resp){
@@ -506,7 +695,6 @@ btn.addEventListener('click', function(){
     .finally(()=>{ btn.disabled=false; ta.focus(); });
 });
 
-// Ctrl/Cmd+Enter quick send; Enter alone makes new line
 ta.addEventListener('keydown', function(e){
   if ((e.key === 'Enter') && (e.ctrlKey || e.metaKey)) {
     e.preventDefault(); btn.click();
@@ -595,8 +783,145 @@ const roomList=root.querySelector('.room-list');
 const rooms=Array.from(roomList?roomList.querySelectorAll('.room'):[]);
 const headers={'X-WP-Nonce':nonce,'Accept':'application/json'};
 const roomMap=new Map();
-const subscribedChannels=new Set();
+const channelCleanups=new Map();
+const cleanupFns=[];
 let active=null;
+
+function ensureAblyState(){
+  if(!window.ELXAO_ABLY){
+    window.ELXAO_ABLY={client:null,clientPromise:null,libraryPromise:null,channels:new Map()};
+  } else if(!window.ELXAO_ABLY.channels){
+    window.ELXAO_ABLY.channels=new Map();
+  }
+  const state=window.ELXAO_ABLY;
+
+  if(!state.loadLibrary){
+    state.loadLibrary=function(){
+      if(state.libraryPromise) return state.libraryPromise;
+      if(window.Ably&&window.Ably.Realtime&&window.Ably.Realtime.Promise){
+        state.libraryPromise=Promise.resolve();
+        return state.libraryPromise;
+      }
+      state.libraryPromise=new Promise(function(resolve,reject){
+        const existing=document.querySelector('script[data-elxao-ably]');
+        if(existing){
+          existing.addEventListener('load',()=>resolve(),{once:true});
+          existing.addEventListener('error',()=>reject(new Error('Failed to load Ably library')),{once:true});
+          return;
+        }
+        const s=document.createElement('script');
+        s.src='https://cdn.ably.io/lib/ably.min-1.js';
+        s.async=true;
+        s.setAttribute('data-elxao-ably','1');
+        s.onload=()=>resolve();
+        s.onerror=()=>reject(new Error('Failed to load Ably library'));
+        document.head.appendChild(s);
+      });
+      return state.libraryPromise;
+    };
+  }
+
+  if(!state.ensureClient){
+    state.ensureClient=function(tokenDetails){
+      if(state.clientPromise){
+        return state.clientPromise.then(function(client){
+          if(tokenDetails){
+            return client.auth.authorize(null,{tokenDetails:tokenDetails}).then(function(){ return client; });
+          }
+          return client;
+        });
+      }
+      state.clientPromise=state.loadLibrary().then(function(){
+        if(!window.Ably||!window.Ably.Realtime||!window.Ably.Realtime.Promise){
+          throw new Error('Ably unavailable');
+        }
+        state.client=new window.Ably.Realtime.Promise({tokenDetails:tokenDetails});
+        return state.client;
+      }).catch(function(err){
+        state.client=null;
+        state.clientPromise=null;
+        throw err;
+      });
+      return state.clientPromise;
+    };
+  }
+
+  if(!state.registerChannel){
+    state.registerChannel=function(client,channelName,project){
+      if(!channelName) return function(){};
+      const channels=state.channels;
+      let entry=channels.get(channelName);
+      if(!entry){
+        entry={refCount:0,handler:null,channel:client.channels.get(channelName),projectId:project};
+        channels.set(channelName,entry);
+      } else {
+        if(!entry.channel){
+          entry.channel=client.channels.get(channelName);
+        }
+        if(project && !entry.projectId){
+          entry.projectId=project;
+        }
+      }
+      entry.refCount++;
+      if(!entry.handler){
+        entry.handler=function(msg){
+          const data=msg&&msg.data?msg.data:{};
+          const projectId=data.project||entry.projectId||project;
+          const detail={project:projectId,payload:data};
+          if(msg && typeof msg.id!=='undefined') detail.id=msg.id;
+          if(msg && typeof msg.name!=='undefined') detail.name=msg.name;
+          window.dispatchEvent(new CustomEvent('elxao:chat',{detail:detail}));
+          const bumpAt=data.at||data.published_at||Date.now();
+          if(projectId){
+            window.dispatchEvent(new CustomEvent('elxao:room-bump',{detail:{projectId:projectId,at:bumpAt}}));
+          }
+        };
+        entry.channel.subscribe(entry.handler);
+      }
+      entry.channel.attach().catch(function(){});
+      return function(){
+        entry.refCount--;
+        if(entry.refCount<=0){
+          if(entry.channel&&entry.handler){
+            entry.channel.unsubscribe(entry.handler);
+          }
+          channels.delete(channelName);
+        }
+      };
+    };
+  }
+
+  return state;
+}
+
+const ablyState=ensureAblyState();
+
+function registerCleanup(fn){
+  if(typeof fn==='function') cleanupFns.push(fn);
+}
+
+function runCleanup(){
+  while(cleanupFns.length){
+    const fn=cleanupFns.pop();
+    try{ fn(); }catch(e){}
+  }
+}
+
+rooms.forEach(function(room){
+  const pid=room.getAttribute('data-project');
+  if(pid) roomMap.set(String(pid),room);
+  const latestAttr=room.getAttribute('data-latest');
+  const tsAttr=room.getAttribute('data-timestamp');
+  const tsNumeric=tsAttr?parseInt(tsAttr,10):0;
+  if(latestAttr){
+    setRoomActivity(room,latestAttr);
+  } else if(tsNumeric>0){
+    setRoomActivity(room,tsAttr);
+  } else {
+    room.dataset.timestamp=room.dataset.timestamp||'0';
+    room.dataset.latest=room.dataset.latest||'';
+  }
+});
 
 function parseTimestamp(value){
   if(value instanceof Date) return value;
@@ -638,22 +963,6 @@ function setRoomActivity(room,source){
   room.dataset.latest=date.toISOString();
   updateMetaText(room,date);
 }
-
-rooms.forEach(function(room){
-  const pid=room.getAttribute('data-project');
-  if(pid) roomMap.set(String(pid),room);
-  const latestAttr=room.getAttribute('data-latest');
-  const tsAttr=room.getAttribute('data-timestamp');
-  const tsNumeric=tsAttr?parseInt(tsAttr,10):0;
-  if(latestAttr){
-    setRoomActivity(room,latestAttr);
-  } else if(tsNumeric>0){
-    setRoomActivity(room,tsAttr);
-  } else {
-    room.dataset.timestamp=room.dataset.timestamp||'0';
-    room.dataset.latest=room.dataset.latest||'';
-  }
-});
 
 function bumpRoom(projectId,activity){
   if(!projectId) return;
@@ -720,60 +1029,14 @@ rooms.forEach(function(room){
   room.addEventListener('click',function(){ loadRoom(room); });
 });
 
-function ensureAblyClient(token){
-  function subscribeChannels(client){
-    rooms.forEach(function(room){
-      const channelName=room.getAttribute('data-room');
-      if(!channelName) return;
-      if(subscribedChannels.has(channelName)) return;
-      subscribedChannels.add(channelName);
-      const channel=client.channels.get(channelName);
-      channel.subscribe(function(msg){
-        const data=msg&&msg.data?msg.data:{};
-        const project=data.project||room.getAttribute('data-project');
-        const at=data.at||data.published_at||Date.now();
-        bumpRoom(project,at);
-      });
-    });
-  }
-
-  function start(){
-    if(root._ablyClient){
-      subscribeChannels(root._ablyClient);
-      return;
-    }
-    if(!window.Ably || !window.Ably.Realtime || !window.Ably.Realtime.Promise) return;
-    const client=new window.Ably.Realtime.Promise({tokenDetails:token});
-    root._ablyClient=client;
-    subscribeChannels(client);
-  }
-
-  if(window.Ably && window.Ably.Realtime && window.Ably.Realtime.Promise){
-    start();
-  } else {
-    const existing=document.querySelector('script[data-elxao-ably]');
-    if(existing){
-      existing.addEventListener('load',start,{once:true});
-    } else {
-      const s=document.createElement('script');
-      s.src='https://cdn.ably.io/lib/ably.min-1.js';
-      s.async=true;
-      s.setAttribute('data-elxao-ably','1');
-      s.onload=start;
-      s.onerror=function(){ console.error('Failed to load Ably library'); };
-      document.head.appendChild(s);
-    }
-  }
-}
-
 function subscribeInbox(){
   if(!rooms.length || !rest) return;
   const params=[];
-  const seen=new Set();
+  const seenProjects=new Set();
   rooms.forEach(function(room){
     const pid=room.getAttribute('data-project');
-    if(!pid || seen.has(pid)) return;
-    seen.add(pid);
+    if(!pid || seenProjects.has(pid)) return;
+    seenProjects.add(pid);
     params.push('project_ids[]='+encodeURIComponent(pid));
   });
   if(!params.length) return;
@@ -784,25 +1047,67 @@ function subscribeInbox(){
     if(!r.ok) throw new Error(''+r.status);
     return r.json();
   }).then(function(token){
-    if(token && !token.error){
-      ensureAblyClient(token);
-    }
+    if(!token || token.error) return;
+    return ablyState.ensureClient(token).then(function(client){
+      const seenChannels=new Set();
+      rooms.forEach(function(room){
+        const channelName=room.getAttribute('data-room');
+        if(!channelName || seenChannels.has(channelName)) return;
+        seenChannels.add(channelName);
+        if(channelCleanups.has(channelName)) return;
+        const pid=room.getAttribute('data-project');
+        const projectId=pid?parseInt(pid,10):0;
+        const unsubscribe=ablyState.registerChannel(client,channelName,projectId);
+        if(typeof unsubscribe==='function'){
+          channelCleanups.set(channelName,unsubscribe);
+        }
+      });
+    });
   }).catch(function(err){
     console.warn('ELXAO inbox realtime unavailable',err);
   });
 }
 
-if(rooms.length){
-  loadRoom(rooms[0]);
-  subscribeInbox();
+function onChatEvent(ev){
+  const detail=ev&&ev.detail?ev.detail:{};
+  if(!detail || typeof detail.project==='undefined') return;
+  const payload=detail.payload||{};
+  const bumpAt=payload.at||payload.published_at||Date.now();
+  bumpRoom(detail.project,bumpAt);
 }
 
-window.addEventListener('elxao:room-bump',function(ev){
+window.addEventListener('elxao:chat',onChatEvent);
+registerCleanup(function(){ window.removeEventListener('elxao:chat',onChatEvent); });
+
+registerCleanup(function(){
+  channelCleanups.forEach(function(unsub){ try{ unsub(); }catch(e){} });
+  channelCleanups.clear();
+});
+
+const observer=new MutationObserver(function(){
+  if(!document.body.contains(root)){
+    observer.disconnect();
+    runCleanup();
+  }
+});
+observer.observe(document.body,{childList:true,subtree:true});
+registerCleanup(function(){ observer.disconnect(); });
+window.addEventListener('beforeunload',runCleanup,{once:true});
+
+function handleRoomBump(ev){
   const detail=ev&&ev.detail?ev.detail:{};
   if(detail && detail.projectId){
     bumpRoom(detail.projectId,detail.at||Date.now());
   }
-});
+}
+
+window.addEventListener('elxao:room-bump',handleRoomBump);
+registerCleanup(function(){ window.removeEventListener('elxao:room-bump',handleRoomBump); });
+
+if(rooms.length){
+  loadRoom(rooms[0]);
+  subscribeInbox();
+}
 })();
 </script>
 <?php
