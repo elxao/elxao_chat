@@ -16,6 +16,10 @@ if ( ! defined('ELXAO_CHAT_COLOR_CLIENT') )  define('ELXAO_CHAT_COLOR_CLIENT', '
 if ( ! defined('ELXAO_CHAT_COLOR_PM') )      define('ELXAO_CHAT_COLOR_PM',     '#e5e7eb'); // PM messages
 if ( ! defined('ELXAO_CHAT_COLOR_ADMIN') )   define('ELXAO_CHAT_COLOR_ADMIN',  '#60a5fa'); // admin messages
 if ( ! defined('ELXAO_CHAT_COLOR_SYS') )     define('ELXAO_CHAT_COLOR_SYS',    '#94a3b8'); // system lines
+if ( ! defined('ELXAO_CHAT_COLOR_READ_UNREAD') )      define('ELXAO_CHAT_COLOR_READ_UNREAD',      '#6b7280'); // unread indicator
+if ( ! defined('ELXAO_CHAT_COLOR_READ_ALL') )         define('ELXAO_CHAT_COLOR_READ_ALL',         ELXAO_CHAT_COLOR_CLIENT); // fully read indicator
+if ( ! defined('ELXAO_CHAT_COLOR_READ_PM_ONLY') )     define('ELXAO_CHAT_COLOR_READ_PM_ONLY',     '#f472b6'); // admin message read by PM only
+if ( ! defined('ELXAO_CHAT_COLOR_READ_CLIENT_ONLY') ) define('ELXAO_CHAT_COLOR_READ_CLIENT_ONLY', ELXAO_CHAT_COLOR_ADMIN); // admin message read by client only
 
 /* ===========================================================
    ABLY CONFIG (set in wp-config.php if you want)
@@ -376,12 +380,16 @@ function elxao_chat_render_window($pid){
 
     // CSS variables from hard-coded constants
     $style_vars = sprintf(
-        '--chat-color:%s; --chat-client:%s; --chat-pm:%s; --chat-admin:%s; --chat-sys:%s;',
+        '--chat-color:%s; --chat-client:%s; --chat-pm:%s; --chat-admin:%s; --chat-sys:%s; --chat-read-unread:%s; --chat-read-read:%s; --chat-read-client:%s; --chat-read-pm:%s;',
         esc_attr(ELXAO_CHAT_COLOR_BASE),
         esc_attr(ELXAO_CHAT_COLOR_CLIENT),
         esc_attr(ELXAO_CHAT_COLOR_PM),
         esc_attr(ELXAO_CHAT_COLOR_ADMIN),
-        esc_attr(ELXAO_CHAT_COLOR_SYS)
+        esc_attr(ELXAO_CHAT_COLOR_SYS),
+        esc_attr(ELXAO_CHAT_COLOR_READ_UNREAD),
+        esc_attr(ELXAO_CHAT_COLOR_READ_ALL),
+        esc_attr(ELXAO_CHAT_COLOR_READ_CLIENT_ONLY),
+        esc_attr(ELXAO_CHAT_COLOR_READ_PM_ONLY)
     );
 
 ob_start();?>
@@ -418,6 +426,14 @@ ob_start();?>
 #elxao-chat-<?php echo $pid;?> .client { color:var(--chat-client) }
 #elxao-chat-<?php echo $pid;?> .pm     { color:var(--chat-pm) }
 #elxao-chat-<?php echo $pid;?> .admin  { color:var(--chat-admin) }
+#elxao-chat-<?php echo $pid;?> .chat-line{display:flex;gap:8px;align-items:flex-start;margin-bottom:8px}
+#elxao-chat-<?php echo $pid;?> .chat-line:last-child{margin-bottom:0}
+#elxao-chat-<?php echo $pid;?> .chat-line .chat-text{flex:1;color:inherit;word-break:break-word;white-space:pre-wrap}
+#elxao-chat-<?php echo $pid;?> .chat-read-indicator{width:10px;height:10px;border-radius:999px;background:var(--chat-read-unread);margin-top:6px;flex:0 0 10px;box-shadow:0 0 0 1px rgba(0,0,0,0.35)}
+#elxao-chat-<?php echo $pid;?> .chat-read-indicator.is-hidden{opacity:0;visibility:hidden}
+#elxao-chat-<?php echo $pid;?> .chat-read-indicator.chat-read-indicator--read{background:var(--chat-read-read)}
+#elxao-chat-<?php echo $pid;?> .chat-read-indicator.chat-read-indicator--client{background:var(--chat-read-client)}
+#elxao-chat-<?php echo $pid;?> .chat-read-indicator.chat-read-indicator--pm{background:var(--chat-read-pm)}
 #elxao-chat-<?php echo $pid;?> .composer{display:flex;gap:8px;border-top:1px solid #4b5563;padding:10px}
 #elxao-chat-<?php echo $pid;?> textarea{flex:1;resize:none;background:transparent;border:1px solid #6b7280;border-radius:8px;padding:10px;color:inherit}
 #elxao-chat-<?php echo $pid;?> .send{display:inline-flex;align-items:center;justify-content:center;border:1px solid #6b7280;border-radius:10px;padding:0 10px;background:transparent;cursor:pointer;min-width:44px;color:inherit}
@@ -435,6 +451,8 @@ const myId=parseInt(root.dataset.myid,10)||0;
 const myRole=(root.dataset.myrole||'other');
 const hdr={'X-WP-Nonce':nonce};
 const projectId=parseInt(pid,10)||0;
+const clientId=parseInt(root.dataset.client,10)||0;
+const pmId=parseInt(root.dataset.pm,10)||0;
 const localEchoes=new Map();
 let realtimeCleanup=null;
 let busCleanup=null;
@@ -457,11 +475,95 @@ if(!window.ELXAO_CHAT_BUS){
     window.ELXAO_CHAT_BUS=state;
   })();
 }
-if(!window.ELXAO_CHAT_NORMALIZE){
-  window.ELXAO_CHAT_NORMALIZE=(function(){
+if(!window.ELXAO_CHAT_BUILD_NORMALIZER){
+  window.ELXAO_CHAT_BUILD_NORMALIZER=function(){
     const roles=new Set(['client','pm','admin','other','sys']);
     const fd=(...a)=>a.find(v=>v!==undefined&&v!==null);
     const toISO=v=>!v&&v!==0?new Date().toISOString():(v instanceof Date?v.toISOString():(typeof v==='number'?new Date(v).toISOString():String(v)));
+    const canonicalRole=function(role){
+      if(role===undefined||role===null) return '';
+      let str=String(role).trim().toLowerCase();
+      if(!str) return '';
+      str=str.replace(/\s+/g,'_').replace(/-+/g,'_');
+      if(str==='project_manager'||str==='projectmanager'||str==='manager'||str==='pm_user'||str==='pmid'||str==='pm') return 'pm';
+      if(str==='customer'||str==='client_user'||str==='clientid'||str==='customer_user'||str==='client') return 'client';
+      if(str==='administrator'||str==='admin_user'||str==='adminid'||str==='admin') return 'admin';
+      return str;
+    };
+    const boolish=function(value){
+      if(value===undefined||value===null) return false;
+      if(typeof value==='boolean') return value;
+      if(typeof value==='number') return value>0;
+      if(typeof value==='string'){
+        const str=value.trim().toLowerCase();
+        if(!str) return false;
+        if(str==='false'||str==='0'||str==='no'||str==='off'||str==='null'||str==='undefined') return false;
+        return true;
+      }
+      if(value instanceof Date) return true;
+      if(typeof value==='object'){
+        if('read' in value) return boolish(value.read);
+        if('value' in value) return boolish(value.value);
+        if('state' in value) return boolish(value.state);
+        if('status' in value) return boolish(value.status);
+        if('seen' in value) return boolish(value.seen);
+        if('at' in value) return boolish(value.at);
+        if('timestamp' in value) return boolish(value.timestamp);
+      }
+      return !!value;
+    };
+    const mergeRole=function(map,role,value){
+      const key=canonicalRole(role);
+      if(!key) return;
+      const bool=boolish(value);
+      if(!(key in map)) map[key]=bool;
+      else map[key]=map[key]||bool;
+    };
+    const collectSource=function(source,userSet,roleMap){
+      if(source===undefined||source===null) return;
+      if(Array.isArray(source)){
+        source.forEach(item=>collectSource(item,userSet,roleMap));
+        return;
+      }
+      if(typeof source==='object'){
+        if(source){
+          if('role' in source && source.role!==undefined && 'value' in source) mergeRole(roleMap,source.role,source.value);
+          if(source.roles && typeof source.roles==='object') Object.entries(source.roles).forEach(([k,v])=>mergeRole(roleMap,k,v));
+          if(source.byRole && typeof source.byRole==='object') Object.entries(source.byRole).forEach(([k,v])=>mergeRole(roleMap,k,v));
+          if(source.read_roles && typeof source.read_roles==='object') Object.entries(source.read_roles).forEach(([k,v])=>mergeRole(roleMap,k,v));
+          if(source.readRoles && typeof source.readRoles==='object') Object.entries(source.readRoles).forEach(([k,v])=>mergeRole(roleMap,k,v));
+          if(source.read_status && typeof source.read_status==='object') Object.entries(source.read_status).forEach(([k,v])=>mergeRole(roleMap,k,v));
+          if(source.readStatus && typeof source.readStatus==='object') Object.entries(source.readStatus).forEach(([k,v])=>mergeRole(roleMap,k,v));
+          if(source.status && typeof source.status==='object') Object.entries(source.status).forEach(([k,v])=>mergeRole(roleMap,k,v));
+          if(source.client!==undefined) mergeRole(roleMap,'client',source.client);
+          if(source.customer!==undefined) mergeRole(roleMap,'client',source.customer);
+          if(source.pm!==undefined) mergeRole(roleMap,'pm',source.pm);
+          if(source.project_manager!==undefined) mergeRole(roleMap,'pm',source.project_manager);
+          if(source.manager!==undefined) mergeRole(roleMap,'pm',source.manager);
+          if(source.admin!==undefined) mergeRole(roleMap,'admin',source.admin);
+          if(source.administrator!==undefined) mergeRole(roleMap,'admin',source.administrator);
+          if('id' in source) collectSource(source.id,userSet,roleMap);
+          if('user_id' in source) collectSource(source.user_id,userSet,roleMap);
+          if('user' in source) collectSource(source.user,userSet,roleMap);
+          if('users' in source) collectSource(source.users,userSet,roleMap);
+          if('user_ids' in source) collectSource(source.user_ids,userSet,roleMap);
+          if('ids' in source) collectSource(source.ids,userSet,roleMap);
+          if('readers' in source) collectSource(source.readers,userSet,roleMap);
+          if('entries' in source) collectSource(source.entries,userSet,roleMap);
+          if('list' in source) collectSource(source.list,userSet,roleMap);
+          if('byUser' in source) collectSource(source.byUser,userSet,roleMap);
+          Object.keys(source).forEach(key=>{ if(/^\d+$/.test(key)) collectSource(parseInt(key,10),userSet,roleMap); });
+        }
+        return;
+      }
+      const num=Number(source);
+      if(Number.isFinite(num) && num>0) userSet.add(num);
+    };
+    const directRoleKeys={
+      client:['client_read','read_client','client_seen','seen_client','client_read_at','client_seen_at','read_by_client','clientRead','readClient','clientViewed','client_viewed','client_seenAt','seen_by_client','client_has_read','clientReadAt'],
+      pm:['pm_read','read_pm','pm_seen','seen_pm','pm_read_at','pm_seen_at','read_by_pm','pmRead','readPm','pmViewed','pm_viewed','pm_seenAt','seen_by_pm','project_manager_read','read_project_manager','project_manager_seen','seen_project_manager','project_manager_read_at','project_manager_seen_at','manager_read','read_manager','manager_seen','seen_manager'],
+      admin:['admin_read','read_admin','admin_seen','seen_admin','admin_read_at','admin_seen_at','read_by_admin','adminRead','readAdmin','adminViewed','admin_viewed','admin_seenAt','seen_by_admin','administrator_read','read_administrator','administrator_seen','seen_administrator']
+    };
     return function(data,fallbackProject){
       const s=(data&&typeof data==='object')?data:{};
       const p=Number(fd(s.project,s.project_id,fallbackProject,0))||0;
@@ -472,9 +574,33 @@ if(!window.ELXAO_CHAT_NORMALIZE){
       let role=(s.role||'').toString().toLowerCase();
       if(!roles.has(role)) role=(type==='system')?'sys':'other';
       const at=toISO(fd(s.at,s.published_at,s.created_at,null));
-      return {type:type,message:msg,project:p,user:user,user_display:display,role:role,at:at};
+      const result=Object.assign({},s,{type:type,message:msg,project:p,user:user,user_display:display,role:role,at:at});
+      const readUsers=new Set();
+      const roleFlags={};
+      collectSource(s.reads,readUsers,roleFlags);
+      collectSource(s.read_receipts,readUsers,roleFlags);
+      collectSource(s.readReceipts,readUsers,roleFlags);
+      collectSource(s.read_status,readUsers,roleFlags);
+      collectSource(s.readStatus,readUsers,roleFlags);
+      collectSource(s.readBy,readUsers,roleFlags);
+      collectSource(s.read_by,readUsers,roleFlags);
+      collectSource(s.readers,readUsers,roleFlags);
+      collectSource(s.receipts,readUsers,roleFlags);
+      collectSource(s.seen_by,readUsers,roleFlags);
+      collectSource(s.seenBy,readUsers,roleFlags);
+      collectSource(s.seen_status,readUsers,roleFlags);
+      ['read_by','readBy','readers','read_receipts','readReceipts','read_entries','readEntries','seen_by','seenBy'].forEach(key=>{ if(key in s) collectSource(s[key],readUsers,roleFlags); });
+      Object.entries(directRoleKeys).forEach(([roleKey,keys])=>{ keys.forEach(key=>{ if(Object.prototype.hasOwnProperty.call(s,key)) mergeRole(roleFlags,roleKey,s[key]); }); });
+      const normalizedReads={ users:Array.from(readUsers), roles:{} };
+      Object.entries(roleFlags).forEach(([k,v])=>{ normalizedReads.roles[k]=!!v; });
+      if(s.reads && typeof s.reads==='object' && !Array.isArray(s.reads)) normalizedReads.raw=s.reads;
+      result.reads=normalizedReads;
+      return result;
     };
-  })();
+  };
+}
+if(!window.ELXAO_CHAT_NORMALIZE){
+  window.ELXAO_CHAT_NORMALIZE=window.ELXAO_CHAT_BUILD_NORMALIZER();
 }
 if(!window.ELXAO_CHAT_BROADCAST){
   window.ELXAO_CHAT_BROADCAST=function(projectHint,data,extras){
@@ -543,11 +669,103 @@ if(!window.ELXAO_ABLY){
 /* ---------- end helpers ---------- */
 
 function normalizeContent(value){ return String(value||'').replace(/<[^>]*?>/g,''); }
-function addLine(text, cls){
-  const d=document.createElement('div'); d.className=cls||'';
-  d.textContent='';
-  String(text).split('\n').forEach((p,i)=>{ d.appendChild(document.createTextNode(p)); if(i) d.insertBefore(document.createElement('br'), d.lastChild); });
-  list.appendChild(d); list.scrollTop=list.scrollHeight;
+function createTextFragment(text){
+  const fragment=document.createDocumentFragment();
+  String(text||'').split('\n').forEach((part,index)=>{
+    if(index) fragment.appendChild(document.createElement('br'));
+    fragment.appendChild(document.createTextNode(part));
+  });
+  return fragment;
+}
+function buildReadState(data){
+  const reads=(data&&data.reads&&typeof data.reads==='object')?data.reads:{};
+  const roleMap=(reads.roles&&typeof reads.roles==='object')?reads.roles:{};
+  const userSet=new Set();
+  const addUser=function(value){
+    if(value===undefined||value===null) return;
+    if(Array.isArray(value)){ value.forEach(addUser); return; }
+    if(typeof value==='object'){
+      if('id' in value) addUser(value.id);
+      if('user_id' in value) addUser(value.user_id);
+      if('user' in value) addUser(value.user);
+      if(Array.isArray(value.users)) addUser(value.users);
+      if(Array.isArray(value.user_ids)) addUser(value.user_ids);
+      if(Array.isArray(value.ids)) addUser(value.ids);
+      return;
+    }
+    const num=parseInt(value,10);
+    if(!Number.isNaN(num) && num>0) userSet.add(num);
+  };
+  if(Array.isArray(reads.users)) addUser(reads.users);
+  if(Array.isArray(reads.user_ids)) addUser(reads.user_ids);
+  if(Array.isArray(reads.ids)) addUser(reads.ids);
+  [data&&data.read_by,data&&data.readBy,data&&data.readers,data&&data.read_receipts,data&&data.readReceipts].forEach(src=>{ if(src) addUser(src); });
+  const roleValue=function(keys){
+    for(const key of keys){
+      if(key && Object.prototype.hasOwnProperty.call(roleMap,key)) return !!roleMap[key];
+    }
+    return undefined;
+  };
+  const resolved={
+    client:roleValue(['client','customer']),
+    pm:roleValue(['pm','project_manager','manager']),
+    admin:roleValue(['admin','administrator'])
+  };
+  const fallbackIds={ client:clientId, pm:pmId, admin:(myRole==='admin'&&myId)?myId:0 };
+  Object.keys(fallbackIds).forEach(role=>{
+    if(resolved[role]===undefined && fallbackIds[role]) resolved[role]=userSet.has(fallbackIds[role]);
+  });
+  Object.keys(resolved).forEach(role=>{ resolved[role]=!!resolved[role]; });
+  return resolved;
+}
+function determineIndicator(data,role){
+  if(role==='sys') return null;
+  const reads=buildReadState(data);
+  const clientRead=!!reads.client;
+  const pmRead=!!reads.pm;
+  if(role==='client'){
+    return {className:pmRead?'chat-read-indicator--read':'chat-read-indicator--unread',label:pmRead?'Read by PM':'Unread by PM'};
+  }
+  if(role==='pm'){
+    return {className:clientRead?'chat-read-indicator--read':'chat-read-indicator--unread',label:clientRead?'Read by client':'Unread by client'};
+  }
+  if(role==='admin'){
+    if(clientRead && pmRead) return {className:'chat-read-indicator--read',label:'Read by client and PM'};
+    if(pmRead) return {className:'chat-read-indicator--pm',label:'Read by PM'};
+    if(clientRead) return {className:'chat-read-indicator--client',label:'Read by client'};
+    return {className:'chat-read-indicator--unread',label:'Unread by client and PM'};
+  }
+  const anyRead=clientRead||pmRead;
+  return {className:anyRead?'chat-read-indicator--read':'chat-read-indicator--unread',label:anyRead?'Read':'Unread'};
+}
+function appendChatLine(data){
+  const role=(data.type==='system')?'sys':(data.role||'other');
+  const messageText=normalizeContent(data.message);
+  if(!messageText && role!=='sys') return;
+  const display=data.user_display||('User '+(data.user||''));
+  const fullText=(role==='sys')?messageText:(display+': '+messageText);
+  const line=document.createElement('div');
+  line.className='chat-line '+role;
+  const indicatorInfo=determineIndicator(data,role);
+  const indicator=document.createElement('span');
+  indicator.className='chat-read-indicator';
+  if(indicatorInfo){
+    indicator.classList.add(indicatorInfo.className);
+    indicator.setAttribute('role','img');
+    const label=indicatorInfo.label||'';
+    indicator.setAttribute('aria-label',label);
+    indicator.title=indicatorInfo.title||label;
+  } else {
+    indicator.classList.add('is-hidden');
+    indicator.setAttribute('aria-hidden','true');
+  }
+  line.appendChild(indicator);
+  const textNode=document.createElement('div');
+  textNode.className='chat-text';
+  textNode.appendChild(createTextFragment(fullText));
+  line.appendChild(textNode);
+  list.appendChild(line);
+  list.scrollTop=list.scrollHeight;
 }
 function fingerprint(project,user,content){
   if(!project||!user) return '';
@@ -575,9 +793,8 @@ function send(content){
 function handleChatPayload(payload){
   if(!payload) return;
   const data=window.ELXAO_CHAT_NORMALIZE(payload,projectId);
-  const name=data.user_display||('User '+(data.user||'')); const role=(data.type==='system')?'sys':(data.role||'other');
-  const message=normalizeContent(data.message); if(!message && role!=='sys') return;
-  addLine(name+': '+message, role);
+  if(!data) return;
+  appendChatLine(data);
 }
 
 function onChatEvent(ev){
@@ -615,7 +832,15 @@ window.addEventListener('beforeunload',cleanup,{once:true});
 function renderHistory(items){
   if(!items||!Array.isArray(items)) return;
   items.forEach(function(m){
-    const payload=window.ELXAO_CHAT_NORMALIZE({ type:m.content_type, message:m.content, project:m.project_id||projectId, user:m.user_id, user_display:m.user_display||m.user_name, role:m.role, at:m.published_at },projectId);
+    const payload=Object.assign({},m,{
+      type:m.content_type,
+      message:m.content,
+      project:m.project_id||projectId,
+      user:m.user_id,
+      user_display:m.user_display||m.user_name,
+      role:m.role,
+      at:m.published_at
+    });
     handleChatPayload(payload);
   });
 }
@@ -630,7 +855,8 @@ token()
 
 btn.addEventListener('click', function(){
   const v = ta.value.replace(/\s+$/,''); if(!v.trim()) return;
-  const meName = '<?php echo $meName;?>'; addLine(meName+': '+v, myRole);
+  const meName = '<?php echo $meName;?>';
+  handleChatPayload({ type:'text', message:v, project:projectId||parseInt(pid,10), user:myId, user_display:meName, role:myRole });
   rememberLocal(fingerprint(projectId,myId,v)); ta.value=''; btn.disabled=true;
   send(v).then(function(resp){
     if(resp && resp.ok){
@@ -743,21 +969,132 @@ if(!window.ELXAO_CHAT_BUS){
   };
   if(channel){ window.addEventListener('beforeunload',()=>{ try{ channel.close(); }catch(e){} },{once:true}); }
 }
-if(!window.ELXAO_CHAT_NORMALIZE){
-  const roles=new Set(['client','pm','admin','other','sys']);
-  const fd=(...a)=>a.find(v=>v!==undefined&&v!==null);
-  const toISO=v=>!v&&v!==0?new Date().toISOString():(v instanceof Date?v.toISOString():(typeof v==='number'?new Date(v).toISOString():String(v)));
-  window.ELXAO_CHAT_NORMALIZE=function(data,fallbackProject){
-    const s=(data&&typeof data==='object')?data:{};
-    const p=Number(fd(s.project,s.project_id,fallbackProject,0))||0;
-    const type=String(fd(s.type,s.content_type,'text')||'text');
-    const msg=String(fd(s.message,s.content,'')||'');
-    const user=Number(fd(s.user,s.user_id,0))||0;
-    const display=String(fd(s.user_display,s.userDisplay,s.user_name,s.username,user?('User '+user):'User'));
-    let role=(s.role||'').toString().toLowerCase(); if(!roles.has(role)) role=(type==='system')?'sys':'other';
-    const at=toISO(fd(s.at,s.published_at,s.created_at,null));
-    return {type:type,message:msg,project:p,user:user,user_display:display,role:role,at:at};
+if(!window.ELXAO_CHAT_BUILD_NORMALIZER){
+  window.ELXAO_CHAT_BUILD_NORMALIZER=function(){
+    const roles=new Set(['client','pm','admin','other','sys']);
+    const fd=(...a)=>a.find(v=>v!==undefined&&v!==null);
+    const toISO=v=>!v&&v!==0?new Date().toISOString():(v instanceof Date?v.toISOString():(typeof v==='number'?new Date(v).toISOString():String(v)));
+    const canonicalRole=function(role){
+      if(role===undefined||role===null) return '';
+      let str=String(role).trim().toLowerCase();
+      if(!str) return '';
+      str=str.replace(/\s+/g,'_').replace(/-+/g,'_');
+      if(str==='project_manager'||str==='projectmanager'||str==='manager'||str==='pm_user'||str==='pmid'||str==='pm') return 'pm';
+      if(str==='customer'||str==='client_user'||str==='clientid'||str==='customer_user'||str==='client') return 'client';
+      if(str==='administrator'||str==='admin_user'||str==='adminid'||str==='admin') return 'admin';
+      return str;
+    };
+    const boolish=function(value){
+      if(value===undefined||value===null) return false;
+      if(typeof value==='boolean') return value;
+      if(typeof value==='number') return value>0;
+      if(typeof value==='string'){
+        const str=value.trim().toLowerCase();
+        if(!str) return false;
+        if(str==='false'||str==='0'||str==='no'||str==='off'||str==='null'||str==='undefined') return false;
+        return true;
+      }
+      if(value instanceof Date) return true;
+      if(typeof value==='object'){
+        if('read' in value) return boolish(value.read);
+        if('value' in value) return boolish(value.value);
+        if('state' in value) return boolish(value.state);
+        if('status' in value) return boolish(value.status);
+        if('seen' in value) return boolish(value.seen);
+        if('at' in value) return boolish(value.at);
+        if('timestamp' in value) return boolish(value.timestamp);
+      }
+      return !!value;
+    };
+    const mergeRole=function(map,role,value){
+      const key=canonicalRole(role);
+      if(!key) return;
+      const bool=boolish(value);
+      if(!(key in map)) map[key]=bool;
+      else map[key]=map[key]||bool;
+    };
+    const collectSource=function(source,userSet,roleMap){
+      if(source===undefined||source===null) return;
+      if(Array.isArray(source)){
+        source.forEach(item=>collectSource(item,userSet,roleMap));
+        return;
+      }
+      if(typeof source==='object'){
+        if(source){
+          if('role' in source && source.role!==undefined && 'value' in source) mergeRole(roleMap,source.role,source.value);
+          if(source.roles && typeof source.roles==='object') Object.entries(source.roles).forEach(([k,v])=>mergeRole(roleMap,k,v));
+          if(source.byRole && typeof source.byRole==='object') Object.entries(source.byRole).forEach(([k,v])=>mergeRole(roleMap,k,v));
+          if(source.read_roles && typeof source.read_roles==='object') Object.entries(source.read_roles).forEach(([k,v])=>mergeRole(roleMap,k,v));
+          if(source.readRoles && typeof source.readRoles==='object') Object.entries(source.readRoles).forEach(([k,v])=>mergeRole(roleMap,k,v));
+          if(source.read_status && typeof source.read_status==='object') Object.entries(source.read_status).forEach(([k,v])=>mergeRole(roleMap,k,v));
+          if(source.readStatus && typeof source.readStatus==='object') Object.entries(source.readStatus).forEach(([k,v])=>mergeRole(roleMap,k,v));
+          if(source.status && typeof source.status==='object') Object.entries(source.status).forEach(([k,v])=>mergeRole(roleMap,k,v));
+          if(source.client!==undefined) mergeRole(roleMap,'client',source.client);
+          if(source.customer!==undefined) mergeRole(roleMap,'client',source.customer);
+          if(source.pm!==undefined) mergeRole(roleMap,'pm',source.pm);
+          if(source.project_manager!==undefined) mergeRole(roleMap,'pm',source.project_manager);
+          if(source.manager!==undefined) mergeRole(roleMap,'pm',source.manager);
+          if(source.admin!==undefined) mergeRole(roleMap,'admin',source.admin);
+          if(source.administrator!==undefined) mergeRole(roleMap,'admin',source.administrator);
+          if('id' in source) collectSource(source.id,userSet,roleMap);
+          if('user_id' in source) collectSource(source.user_id,userSet,roleMap);
+          if('user' in source) collectSource(source.user,userSet,roleMap);
+          if('users' in source) collectSource(source.users,userSet,roleMap);
+          if('user_ids' in source) collectSource(source.user_ids,userSet,roleMap);
+          if('ids' in source) collectSource(source.ids,userSet,roleMap);
+          if('readers' in source) collectSource(source.readers,userSet,roleMap);
+          if('entries' in source) collectSource(source.entries,userSet,roleMap);
+          if('list' in source) collectSource(source.list,userSet,roleMap);
+          if('byUser' in source) collectSource(source.byUser,userSet,roleMap);
+          Object.keys(source).forEach(key=>{ if(/^\d+$/.test(key)) collectSource(parseInt(key,10),userSet,roleMap); });
+        }
+        return;
+      }
+      const num=Number(source);
+      if(Number.isFinite(num) && num>0) userSet.add(num);
+    };
+    const directRoleKeys={
+      client:['client_read','read_client','client_seen','seen_client','client_read_at','client_seen_at','read_by_client','clientRead','readClient','clientViewed','client_viewed','client_seenAt','seen_by_client','client_has_read','clientReadAt'],
+      pm:['pm_read','read_pm','pm_seen','seen_pm','pm_read_at','pm_seen_at','read_by_pm','pmRead','readPm','pmViewed','pm_viewed','pm_seenAt','seen_by_pm','project_manager_read','read_project_manager','project_manager_seen','seen_project_manager','project_manager_read_at','project_manager_seen_at','manager_read','read_manager','manager_seen','seen_manager'],
+      admin:['admin_read','read_admin','admin_seen','seen_admin','admin_read_at','admin_seen_at','read_by_admin','adminRead','readAdmin','adminViewed','admin_viewed','admin_seenAt','seen_by_admin','administrator_read','read_administrator','administrator_seen','seen_administrator']
+    };
+    return function(data,fallbackProject){
+      const s=(data&&typeof data==='object')?data:{};
+      const p=Number(fd(s.project,s.project_id,fallbackProject,0))||0;
+      const type=String(fd(s.type,s.content_type,'text')||'text');
+      const msg=String(fd(s.message,s.content,'')||'');
+      const user=Number(fd(s.user,s.user_id,0))||0;
+      const display=String(fd(s.user_display,s.userDisplay,s.user_name,s.username,user?('User '+user):'User'));
+      let role=(s.role||'').toString().toLowerCase();
+      if(!roles.has(role)) role=(type==='system')?'sys':'other';
+      const at=toISO(fd(s.at,s.published_at,s.created_at,null));
+      const result=Object.assign({},s,{type:type,message:msg,project:p,user:user,user_display:display,role:role,at:at});
+      const readUsers=new Set();
+      const roleFlags={};
+      collectSource(s.reads,readUsers,roleFlags);
+      collectSource(s.read_receipts,readUsers,roleFlags);
+      collectSource(s.readReceipts,readUsers,roleFlags);
+      collectSource(s.read_status,readUsers,roleFlags);
+      collectSource(s.readStatus,readUsers,roleFlags);
+      collectSource(s.readBy,readUsers,roleFlags);
+      collectSource(s.read_by,readUsers,roleFlags);
+      collectSource(s.readers,readUsers,roleFlags);
+      collectSource(s.receipts,readUsers,roleFlags);
+      collectSource(s.seen_by,readUsers,roleFlags);
+      collectSource(s.seenBy,readUsers,roleFlags);
+      collectSource(s.seen_status,readUsers,roleFlags);
+      ['read_by','readBy','readers','read_receipts','readReceipts','read_entries','readEntries','seen_by','seenBy'].forEach(key=>{ if(key in s) collectSource(s[key],readUsers,roleFlags); });
+      Object.entries(directRoleKeys).forEach(([roleKey,keys])=>{ keys.forEach(key=>{ if(Object.prototype.hasOwnProperty.call(s,key)) mergeRole(roleFlags,roleKey,s[key]); }); });
+      const normalizedReads={ users:Array.from(readUsers), roles:{} };
+      Object.entries(roleFlags).forEach(([k,v])=>{ normalizedReads.roles[k]=!!v; });
+      if(s.reads && typeof s.reads==='object' && !Array.isArray(s.reads)) normalizedReads.raw=s.reads;
+      result.reads=normalizedReads;
+      return result;
+    };
   };
+}
+if(!window.ELXAO_CHAT_NORMALIZE){
+  window.ELXAO_CHAT_NORMALIZE=window.ELXAO_CHAT_BUILD_NORMALIZER();
 }
 if(!window.ELXAO_ABLY){
   window.ELXAO_ABLY={client:null,clientPromise:null,libraryPromise:null,channels:new Map()};
