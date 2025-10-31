@@ -903,12 +903,17 @@ if(!window.ELXAO_ABLY){
     }).catch(err=>{ st.client=null; st.clientPromise=null; throw err; });
     return st.clientPromise;
   };
-  window.ELXAO_ABLY.registerChannel=function(client,channelName,project){
+  window.ELXAO_ABLY.registerChannel=function(client,channelName,project,onMessage){
     if(!channelName) return function(){};
     const st=window.ELXAO_ABLY; const map=st.channels;
     let entry=map.get(channelName);
-    if(!entry){ entry={refCount:0,handler:null,channel:client.channels.get(channelName),projectId:project}; map.set(channelName,entry); }
-    else { if(!entry.channel) entry.channel=client.channels.get(channelName); if(project && !entry.projectId) entry.projectId=project; }
+    if(!entry){ entry={refCount:0,handler:null,channel:client.channels.get(channelName),projectId:project,callbacks:new Set()}; map.set(channelName,entry); }
+    else {
+      if(!entry.channel) entry.channel=client.channels.get(channelName);
+      if(project && !entry.projectId) entry.projectId=project;
+      if(!entry.callbacks) entry.callbacks=new Set();
+    }
+    if(onMessage && typeof onMessage==='function') entry.callbacks.add(onMessage);
     entry.refCount++;
     if(!entry.handler){
       entry.handler=function(msg){
@@ -932,13 +937,20 @@ if(!window.ELXAO_ABLY){
             payload=Object.assign({},payload,{project:projectId});
           }
         }
+        const normalizer=window.ELXAO_CHAT_NORMALIZE||null;
+        const normalized=normalizer?normalizer(payload,projectId):payload;
+        if(entry.callbacks && entry.callbacks.size){
+          entry.callbacks.forEach(function(cb){ try{ cb(normalized,msg,extras); }catch(e){} });
+        }
         window.ELXAO_CHAT_BROADCAST(projectId,payload,extras);
       };
       entry.channel.subscribe(entry.handler);
     }
     entry.channel.attach().catch(()=>{});
     return function(){
-      entry.refCount--; if(entry.refCount<=0){ if(entry.channel&&entry.handler) entry.channel.unsubscribe(entry.handler); map.delete(channelName); }
+      if(onMessage && entry.callbacks) entry.callbacks.delete(onMessage);
+      entry.refCount--;
+      if(entry.refCount<=0){ if(entry.channel&&entry.handler) entry.channel.unsubscribe(entry.handler); map.delete(channelName); }
     };
   };
 }
@@ -1256,6 +1268,21 @@ function handleChatPayload(payload){
   appendChatLine(data);
 }
 
+function handleRealtimePayload(payload){
+  if(!payload) return;
+  const data=window.ELXAO_CHAT_NORMALIZE(payload,projectId);
+  if(!data) return;
+  if(data.project && data.project!==projectId) return;
+  if(data.type==='read_receipt'){
+    applyReadReceipt(data);
+    return;
+  }
+  const fp=fingerprint(projectId,data.user||0,data.message||'');
+  if(fp && isRecentLocal(fp)){ rememberLocal(fp); return; }
+  if(fp) rememberLocal(fp);
+  appendChatLine(data);
+}
+
 function onChatEvent(ev){
   const detail=ev&&ev.detail?ev.detail:{}; const project=detail.project?parseInt(detail.project,10):0;
   if(project!==projectId) return;
@@ -1267,7 +1294,8 @@ function onChatEvent(ev){
 function subscribeRealtime(tokenDetails){
   return window.ELXAO_ABLY.ensureClient(tokenDetails).then(function(client){
     if(realtimeCleanup){ try{ realtimeCleanup(); }catch(e){} realtimeCleanup=null; }
-    const unsubscribe=window.ELXAO_ABLY.registerChannel(client,room,projectId); realtimeCleanup=unsubscribe;
+    const unsubscribe=window.ELXAO_ABLY.registerChannel(client,room,projectId,handleRealtimePayload);
+    realtimeCleanup=unsubscribe;
   });
 }
 
@@ -1633,12 +1661,17 @@ if(!window.ELXAO_ABLY){
     }).catch(err=>{ st.client=null; st.clientPromise=null; throw err; });
     return st.clientPromise;
   };
-  window.ELXAO_ABLY.registerChannel=function(client,channelName,project){
+  window.ELXAO_ABLY.registerChannel=function(client,channelName,project,onMessage){
     if(!channelName) return function(){};
     const st=window.ELXAO_ABLY; const map=st.channels;
     let entry=map.get(channelName);
-    if(!entry){ entry={refCount:0,handler:null,channel:client.channels.get(channelName),projectId:project}; map.set(channelName,entry); }
-    else { if(!entry.channel) entry.channel=client.channels.get(channelName); if(project && !entry.projectId) entry.projectId=project; }
+    if(!entry){ entry={refCount:0,handler:null,channel:client.channels.get(channelName),projectId:project,callbacks:new Set()}; map.set(channelName,entry); }
+    else {
+      if(!entry.channel) entry.channel=client.channels.get(channelName);
+      if(project && !entry.projectId) entry.projectId=project;
+      if(!entry.callbacks) entry.callbacks=new Set();
+    }
+    if(onMessage && typeof onMessage==='function') entry.callbacks.add(onMessage);
     entry.refCount++;
     if(!entry.handler){
       entry.handler=function(msg){
@@ -1670,16 +1703,25 @@ if(!window.ELXAO_ABLY){
             payload=Object.assign({},payload,{project:projectId});
           }
         }
-        window.ELXAO_CHAT_BUS.emit({project:projectId,payload:window.ELXAO_CHAT_NORMALIZE(payload,projectId)});
+        const normalizer=window.ELXAO_CHAT_NORMALIZE||null;
+        const normalized=normalizer?normalizer(payload,projectId):payload;
+        if(entry.callbacks && entry.callbacks.size){
+          entry.callbacks.forEach(function(cb){ try{ cb(normalized,msg,{projectId:projectId,channel:channelName}); }catch(e){} });
+        }
+        window.ELXAO_CHAT_BUS.emit({project:projectId,payload:normalized});
         if(projectId){
-          const bumpAt=(payload&&payload.at)||data.at||data.published_at||Date.now();
+          const bumpAt=(normalized&&normalized.at)|| (payload&&payload.at) || data.at || data.published_at || Date.now();
           window.dispatchEvent(new CustomEvent('elxao:room-bump',{detail:{projectId:projectId,at:bumpAt}}));
         }
       };
       entry.channel.subscribe(entry.handler);
     }
     entry.channel.attach().catch(()=>{});
-    return function(){ entry.refCount--; if(entry.refCount<=0){ if(entry.channel&&entry.handler) entry.channel.unsubscribe(entry.handler); map.delete(channelName); } };
+    return function(){
+      if(onMessage && entry.callbacks) entry.callbacks.delete(onMessage);
+      entry.refCount--;
+      if(entry.refCount<=0){ if(entry.channel&&entry.handler) entry.channel.unsubscribe(entry.handler); map.delete(channelName); }
+    };
   };
 }
 /* ---- end shared helpers ---- */
