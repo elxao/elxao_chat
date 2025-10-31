@@ -226,8 +226,6 @@ function elxao_chat_project_post_type(){
 function elxao_chat_collect_rooms_for_user($uid){
     if(!$uid) return [];
 
-    global $wpdb;
-
     $args=[
         'post_type'=>elxao_chat_project_post_type(),
         'post_status'=>['publish','private'],
@@ -247,7 +245,6 @@ function elxao_chat_collect_rooms_for_user($uid){
     wp_reset_postdata();
 
     $rooms=[];
-    $table=$wpdb->prefix.'elxao_chat_messages';
     foreach($ids as $pid){
         $pid=(int)$pid;
         if(!elxao_chat_user_can_access_project($pid,$uid)) continue;
@@ -265,32 +262,11 @@ function elxao_chat_collect_rooms_for_user($uid){
         }
         $timestamp=$latest?strtotime($latest):0;
 
-        $role=elxao_chat_role_for_user($pid,$uid);
-        $reads=elxao_chat_get_last_reads($pid);
-        $title=get_the_title($pid);
-        $unread=0;
-
-        if(in_array($role,['client','pm','admin'],true)){
-            $last_read=elxao_chat_normalize_datetime_value($reads[$role]??'');
-            if($last_read){
-                $sql=$wpdb->prepare("SELECT COUNT(*) FROM $table WHERE project_id=%d AND published_at > %s AND user_id <> %d",$pid,$last_read,$uid);
-            } else {
-                $sql=$wpdb->prepare("SELECT COUNT(*) FROM $table WHERE project_id=%d AND user_id <> %d",$pid,$uid);
-            }
-            $count=$wpdb->get_var($sql);
-            $unread=$count?(int)$count:0;
-        }
-
-        $label=sprintf('#%d · %s',$pid,$title);
-
         $rooms[]=[
             'id'=>$pid,
-            'title'=>$title,
+            'title'=>get_the_title($pid),
             'latest'=>$latest,
             'timestamp'=>$timestamp?:0,
-            'unread'=>$unread,
-            'role'=>$role,
-            'label'=>$label,
         ];
     }
 
@@ -494,7 +470,6 @@ function elxao_chat_rest_history(WP_REST_Request $r){
     $role = elxao_chat_role_for_user($pid,$uid);
     $participants = elxao_chat_get_client_pm_ids($pid);
     $reads = elxao_chat_get_last_reads($pid);
-    $reads_before = $reads;
     $updated_reads = false;
 
     if(in_array($role,['client','pm','admin'],true)){
@@ -506,18 +481,12 @@ function elxao_chat_rest_history(WP_REST_Request $r){
     }
 
     foreach($rows as &$row){
-        $pre_status = elxao_chat_build_message_read_status($pid,$row['role'],$row['published_at'],$reads_before,$participants);
         $status = elxao_chat_build_message_read_status($pid,$row['role'],$row['published_at'],$reads,$participants);
         $row['read_status']=$status;
         $row['reads']=[
             'roles'=>$status,
             'times'=>$reads,
         ];
-        if(in_array($role,['client','pm','admin'],true) && isset($pre_status[$role])){
-            $row['viewer_unread'] = !$pre_status[$role];
-        } else {
-            $row['viewer_unread'] = false;
-        }
     }
     unset($row);
 
@@ -701,20 +670,15 @@ ob_start();?>
 #elxao-chat-<?php echo $pid;?> .client { color:var(--chat-client) }
 #elxao-chat-<?php echo $pid;?> .pm     { color:var(--chat-pm) }
 #elxao-chat-<?php echo $pid;?> .admin  { color:var(--chat-admin) }
-#elxao-chat-<?php echo $pid;?> .chat-line{position:relative;display:flex;gap:8px;align-items:flex-start;margin-bottom:8px;padding:6px 8px;border-radius:10px;transition:background-color .3s ease,box-shadow .3s ease}
+#elxao-chat-<?php echo $pid;?> .chat-line{display:flex;gap:8px;align-items:flex-start;margin-bottom:8px}
 #elxao-chat-<?php echo $pid;?> .chat-line:last-child{margin-bottom:0}
-#elxao-chat-<?php echo $pid;?> .chat-line::before{content:"";position:absolute;inset:0;border-radius:10px;background:rgba(248,113,113,0.18);opacity:0;transition:opacity .35s ease}
-#elxao-chat-<?php echo $pid;?> .chat-line.is-unread::before{opacity:1}
-#elxao-chat-<?php echo $pid;?> .chat-line .chat-text{flex:1;color:inherit;word-break:break-word;white-space:pre-wrap;position:relative;z-index:1}
-#elxao-chat-<?php echo $pid;?> .chat-read-indicator{width:10px;height:10px;border-radius:999px;background:var(--chat-read-unread);margin-top:6px;flex:0 0 10px;box-shadow:0 0 0 1px rgba(0,0,0,0.35);position:relative;z-index:1;opacity:0;transform:scale(.75);transition:opacity .28s ease,transform .28s ease,background-color .25s ease}
-#elxao-chat-<?php echo $pid;?> .chat-read-indicator.is-visible{opacity:1;transform:scale(1)}
-#elxao-chat-<?php echo $pid;?> .chat-read-indicator.is-transitioning{animation:elxao-chat-indicator-pop .35s cubic-bezier(.33,1,.68,1)}
+#elxao-chat-<?php echo $pid;?> .chat-line .chat-text{flex:1;color:inherit;word-break:break-word;white-space:pre-wrap}
+#elxao-chat-<?php echo $pid;?> .chat-read-indicator{width:10px;height:10px;border-radius:999px;background:var(--chat-read-unread);margin-top:6px;flex:0 0 10px;box-shadow:0 0 0 1px rgba(0,0,0,0.35)}
 #elxao-chat-<?php echo $pid;?> .chat-read-indicator.chat-read-indicator--unread{background:var(--chat-read-unread)}
-#elxao-chat-<?php echo $pid;?> .chat-read-indicator.is-hidden{opacity:0;visibility:hidden;transform:scale(.6)}
+#elxao-chat-<?php echo $pid;?> .chat-read-indicator.is-hidden{opacity:0;visibility:hidden}
 #elxao-chat-<?php echo $pid;?> .chat-read-indicator.chat-read-indicator--read{background:var(--chat-read-read)}
 #elxao-chat-<?php echo $pid;?> .chat-read-indicator.chat-read-indicator--client{background:var(--chat-read-client)}
 #elxao-chat-<?php echo $pid;?> .chat-read-indicator.chat-read-indicator--pm{background:var(--chat-read-pm)}
-#elxao-chat-<?php echo $pid;?> @keyframes elxao-chat-indicator-pop{0%{transform:scale(.6)}55%{transform:scale(1.15)}100%{transform:scale(1)}}
 #elxao-chat-<?php echo $pid;?> .composer{display:flex;gap:8px;border-top:1px solid #4b5563;padding:10px}
 #elxao-chat-<?php echo $pid;?> textarea{flex:1;resize:none;background:transparent;border:1px solid #6b7280;border-radius:8px;padding:10px;color:inherit}
 #elxao-chat-<?php echo $pid;?> .send{display:inline-flex;align-items:center;justify-content:center;border:1px solid #6b7280;border-radius:10px;padding:0 10px;background:transparent;cursor:pointer;min-width:44px;color:inherit}
@@ -749,17 +713,6 @@ let fallbackInFlight=false;
 const FALLBACK_INTERVAL=4000;
 const currentReadTimes={client:'',pm:'',admin:''};
 const DEBUG=false;
-const indicatorStates=(typeof WeakMap==='function')?new WeakMap():new Map();
-let indicatorObserverInstance=null;
-let indicatorObserverDisabled=false;
-const trackedUnreadLines=new Set();
-const pendingVisibleUnread=new Set();
-let unreadObserverInstance=null;
-let unreadObserverDisabled=false;
-let focusHandler=null;
-let visibilityHandler=null;
-let pageShowHandler=null;
-let scrollHandler=null;
 
 /* ---------- Shared helpers (guarded singletons) ---------- */
 if(!window.ELXAO_CHAT_BUS){
@@ -1172,82 +1125,16 @@ function buildStatusFromTimes(payload,times){
   }
   return status;
 }
-function buildIndicatorSignature(info){
-  if(!info) return 'hidden';
-  const classes=(info.className||'').split(/\s+/).filter(Boolean).join(' ');
-  const label=info.label||'';
-  const title=info.title||'';
-  return classes+'|'+label+'|'+title;
-}
-function ensureIndicatorObserver(){
-  if(indicatorObserverDisabled) return null;
-  if(indicatorObserverInstance) return indicatorObserverInstance;
-  if(typeof IntersectionObserver==='undefined'){
-    indicatorObserverDisabled=true;
-    return null;
-  }
-  try{
-    indicatorObserverInstance=new IntersectionObserver(handleIndicatorVisibility,{root:list||null,threshold:[0,0.15,0.6]});
-  }catch(err){
-    indicatorObserverDisabled=true;
-    indicatorObserverInstance=null;
-    return null;
-  }
-  return indicatorObserverInstance;
-}
-function handleIndicatorVisibility(entries){
-  entries.forEach(entry=>{
-    const indicator=entry.target;
-    const state=indicatorStates.get(indicator);
-    if(!state) return;
-    const visible=entry.isIntersecting||entry.intersectionRatio>0;
-    state.visible=visible;
-    if(visible){
-      indicator.classList.add('is-visible');
-      if(state.pending){
-        const pending=state.pending;
-        state.pending=null;
-        renderIndicatorState(indicator,pending.info,state,pending.signature);
-      }
-    } else {
-      indicator.classList.remove('is-visible');
-    }
-  });
-}
-function getIndicatorState(indicator){
-  let state=indicatorStates.get(indicator);
-  if(!state){
-    state={visible:false,pending:null,signature:null,lastInfo:null};
-    indicatorStates.set(indicator,state);
-    const observer=ensureIndicatorObserver();
-    if(observer){
-      observer.observe(indicator);
-    } else {
-      state.visible=true;
-      indicator.classList.add('is-visible');
-    }
-  }
-  return state;
-}
-function renderIndicatorState(indicator,info,state,signature){
-  state.pending=null;
-  state.signature=signature;
-  state.lastInfo=info||null;
+function applyIndicatorState(indicator,info){
   indicator.className='chat-read-indicator';
   indicator.removeAttribute('aria-hidden');
   indicator.removeAttribute('aria-label');
   indicator.removeAttribute('title');
   indicator.removeAttribute('role');
-  indicator.classList.remove('is-transitioning');
   if(!info){
     indicator.classList.add('is-hidden');
     indicator.setAttribute('aria-hidden','true');
-    indicator.classList.remove('is-visible');
     return;
-  }
-  indicator.classList.remove('is-hidden');
-  if(state.visible){
-    indicator.classList.add('is-visible');
   }
   const classes=(info.className||'').split(/\s+/).filter(Boolean);
   classes.forEach(cls=>indicator.classList.add(cls));
@@ -1260,164 +1147,6 @@ function renderIndicatorState(indicator,info,state,signature){
   if(title){
     indicator.title=title;
   }
-  if(state.visible){
-    void indicator.offsetWidth;
-    indicator.classList.add('is-transitioning');
-    const handle=()=>{
-      indicator.classList.remove('is-transitioning');
-      indicator.removeEventListener('animationend',handle);
-      indicator.removeEventListener('animationcancel',handle);
-    };
-    indicator.addEventListener('animationend',handle);
-    indicator.addEventListener('animationcancel',handle);
-  }
-}
-function applyIndicatorState(indicator,info){
-  if(!indicator) return;
-  const signature=buildIndicatorSignature(info);
-  const state=getIndicatorState(indicator);
-  if(state.visible){
-    if(state.signature===signature) return;
-    renderIndicatorState(indicator,info,state,signature);
-    return;
-  }
-  state.pending={info,signature};
-  state.signature=signature;
-  state.lastInfo=info||null;
-}
-function ensureUnreadObserver(){
-  if(unreadObserverDisabled) return null;
-  if(unreadObserverInstance) return unreadObserverInstance;
-  if(typeof IntersectionObserver==='undefined'){
-    unreadObserverDisabled=true;
-    return null;
-  }
-  try{
-    unreadObserverInstance=new IntersectionObserver(handleUnreadVisibility,{root:list||null,threshold:[0,0.15,0.6]});
-  }catch(err){
-    unreadObserverDisabled=true;
-    unreadObserverInstance=null;
-    return null;
-  }
-  return unreadObserverInstance;
-}
-function handleUnreadVisibility(entries){
-  entries.forEach(entry=>{
-    const line=entry.target;
-    if(!line || !trackedUnreadLines.has(line)) return;
-    const visible=entry.isIntersecting||entry.intersectionRatio>0;
-    if(visible){
-      pendingVisibleUnread.add(line);
-      processPendingVisibleUnread();
-    } else {
-      pendingVisibleUnread.delete(line);
-    }
-  });
-}
-function observeUnreadLine(line){
-  if(!line || line.__unreadObserved) return;
-  const observer=ensureUnreadObserver();
-  if(observer){
-    try{ observer.observe(line); line.__unreadObserved=true; }
-    catch(e){ line.__unreadObserved=false; }
-  }
-}
-function unobserveUnreadLine(line){
-  if(!line) return;
-  pendingVisibleUnread.delete(line);
-  if(line.__unreadObserved && unreadObserverInstance){
-    try{ unreadObserverInstance.unobserve(line); }
-    catch(e){}
-  }
-  line.__unreadObserved=false;
-}
-function lineIsVisible(line){
-  if(!line || typeof line.getBoundingClientRect!=='function') return false;
-  if(!list || typeof list.getBoundingClientRect!=='function') return false;
-  const rect=line.getBoundingClientRect();
-  const containerRect=list.getBoundingClientRect();
-  const top=Math.max(rect.top,containerRect.top);
-  const bottom=Math.min(rect.bottom,containerRect.bottom);
-  const visibleHeight=bottom-top;
-  const lineHeight=rect.height || (rect.bottom-rect.top);
-  if(!Number.isFinite(lineHeight) || lineHeight<=0) return false;
-  const threshold=Math.min(Math.max(lineHeight*0.25,1),lineHeight);
-  return visibleHeight>=threshold;
-}
-function evaluateUnreadVisibility(line){
-  if(!line || !trackedUnreadLines.has(line)) return;
-  if(!line.__chatPayload || !messageIsUnreadForViewer(line.__chatPayload)){
-    stopUnreadTracking(line);
-    return;
-  }
-  if(lineIsVisible(line)){
-    pendingVisibleUnread.add(line);
-    processPendingVisibleUnread();
-  }
-}
-function scheduleUnreadEvaluation(line){
-  if(typeof requestAnimationFrame==='function'){
-    requestAnimationFrame(()=>evaluateUnreadVisibility(line));
-  } else {
-    setTimeout(()=>evaluateUnreadVisibility(line),50);
-  }
-}
-function trackUnreadLine(line){
-  if(!line || !line.__chatPayload) return;
-  trackedUnreadLines.add(line);
-  observeUnreadLine(line);
-  scheduleUnreadEvaluation(line);
-}
-function stopUnreadTracking(line){
-  if(!line) return;
-  trackedUnreadLines.delete(line);
-  unobserveUnreadLine(line);
-}
-function markLineAsSeen(line){
-  if(!line || !line.__chatPayload) return;
-  const payload=line.__chatPayload;
-  let changed=false;
-  if(payload.viewer_unread){
-    payload.viewer_unread=false;
-    changed=true;
-  }
-  if(line.classList && line.classList.contains('is-unread')){
-    line.classList.remove('is-unread');
-    changed=true;
-  }
-  stopUnreadTracking(line);
-  if(changed){
-    scheduleReadSync();
-  }
-}
-function collectVisibleUnread(){
-  trackedUnreadLines.forEach(line=>{
-    if(!line || !line.__chatPayload){
-      stopUnreadTracking(line);
-      return;
-    }
-    if(!messageIsUnreadForViewer(line.__chatPayload)){
-      stopUnreadTracking(line);
-      return;
-    }
-    if(lineIsVisible(line)){
-      pendingVisibleUnread.add(line);
-    }
-  });
-}
-function processPendingVisibleUnread(){
-  if(!pendingVisibleUnread.size) return;
-  if(!viewerHasAttention()) return;
-  const lines=Array.from(pendingVisibleUnread);
-  pendingVisibleUnread.clear();
-  lines.forEach(line=>{
-    if(!line || !trackedUnreadLines.has(line)) return;
-    if(!line.__chatPayload || !messageIsUnreadForViewer(line.__chatPayload)){
-      stopUnreadTracking(line);
-      return;
-    }
-    markLineAsSeen(line);
-  });
 }
 function buildReadState(data){
   const reads=(data&&data.reads&&typeof data.reads==='object')?data.reads:{};
@@ -1459,62 +1188,6 @@ function buildReadState(data){
   });
   Object.keys(resolved).forEach(role=>{ resolved[role]=!!resolved[role]; });
   return resolved;
-}
-function interpretViewerFlag(value){
-  if(value===undefined||value===null) return undefined;
-  if(typeof value==='boolean') return value;
-  if(typeof value==='number') return value>0;
-  if(typeof value==='string'){
-    const normalized=value.trim().toLowerCase();
-    if(!normalized) return undefined;
-    if(normalized==='false' || normalized==='0' || normalized==='no' || normalized==='off') return false;
-    if(normalized==='true' || normalized==='1' || normalized==='yes' || normalized==='on') return true;
-    return true;
-  }
-  return !!value;
-}
-function messageIsUnreadForViewer(payload){
-  if(!payload||typeof payload!=='object') return false;
-  if(!myRole||myRole==='other') return false;
-  const type=(payload.type||'').toString().toLowerCase();
-  if(type==='system') return false;
-  const role=(payload.role||'').toString().toLowerCase();
-  if(role==='sys') return false;
-  if(payload.viewer_unread===true) return true;
-  if(payload.viewer_unread===false) return false;
-  let statusMap=null;
-  if(payload.read_status && typeof payload.read_status==='object') statusMap=payload.read_status;
-  if(!statusMap && payload.reads && payload.reads.roles && typeof payload.reads.roles==='object') statusMap=payload.reads.roles;
-  if(statusMap && Object.prototype.hasOwnProperty.call(statusMap,myRole)){
-    const interpreted=interpretViewerFlag(statusMap[myRole]);
-    if(interpreted===true) return false;
-    if(interpreted===false) return true;
-  }
-  const resolved=buildReadState(payload);
-  if(resolved && Object.prototype.hasOwnProperty.call(resolved,myRole)) return !resolved[myRole];
-  if(role===myRole) return false;
-  return true;
-}
-function handleViewerUnread(line,payload){
-  if(!line) return;
-  if(line.__viewerUnreadTimer){
-    clearTimeout(line.__viewerUnreadTimer);
-    line.__viewerUnreadTimer=null;
-  }
-  if(!payload||typeof payload!=='object'){
-    line.classList.remove('is-unread');
-    stopUnreadTracking(line);
-    return;
-  }
-  const unread=messageIsUnreadForViewer(payload);
-  if(!unread && payload.viewer_unread) payload.viewer_unread=false;
-  if(unread){
-    line.classList.add('is-unread');
-    trackUnreadLine(line);
-  } else {
-    line.classList.remove('is-unread');
-    stopUnreadTracking(line);
-  }
 }
 function determineIndicator(data,role){
   if(role==='sys') return null;
@@ -1564,57 +1237,12 @@ function applyReadReceipt(data){
     payload.reads.times=Object.assign({},effectiveTimes);
     const indicator=line.querySelector('.chat-read-indicator');
     if(indicator) applyIndicatorState(indicator,determineIndicator(payload,payload.role||line.dataset.role||'other'));
-    handleViewerUnread(line,payload);
   });
 }
-
-function viewerHasAttention(){
-  if(typeof document==='undefined') return true;
-  if(typeof document.visibilityState==='string' && document.visibilityState!=='visible') return false;
-  if(typeof document.hidden==='boolean' && document.hidden) return false;
-  if(typeof document.hasFocus==='function'){
-    try {
-      if(!document.hasFocus()) return false;
-    } catch(e) {
-      return false;
-    }
-  }
-  return true;
-}
-
-function handleAttentionGained(){
-  collectVisibleUnread();
-  processPendingVisibleUnread();
-  ensureReadSyncScheduled();
-}
-
-function ensureReadSyncScheduled(){
-  if(!readSyncPending) return;
-  if(readSyncInFlight) return;
-  if(!viewerHasAttention()) return;
-  if(readSyncTimer) return;
-  readSyncTimer=setTimeout(()=>{
-    readSyncTimer=null;
-    if(!readSyncPending) return;
-    if(!viewerHasAttention()){
-      ensureReadSyncScheduled();
-      return;
-    }
-    sendReadSync();
-  },400);
-}
-
 function sendReadSync(){
   if(readSyncInFlight) return;
-  if(!viewerHasAttention()){
-    ensureReadSyncScheduled();
-    return;
-  }
   const targetProject=projectId||parseInt(pid,10)||0;
-  if(!targetProject || !rest || !myId){
-    readSyncPending=false;
-    return;
-  }
+  if(!targetProject || !rest || !myId) return;
   readSyncPending=false;
   readSyncInFlight=true;
   fetch(rest+'elxao/v1/messages/read',{
@@ -1633,39 +1261,22 @@ function sendReadSync(){
     .catch(()=>{})
     .finally(()=>{
       readSyncInFlight=false;
-      ensureReadSyncScheduled();
+      if(readSyncPending){
+        scheduleReadSync();
+      }
     });
 }
-
 function scheduleReadSync(){
   if(!projectId || !rest || !myId) return;
   if(myRole==='other') return;
   readSyncPending=true;
-  ensureReadSyncScheduled();
+  if(readSyncInFlight) return;
+  if(readSyncTimer) return;
+  readSyncTimer=setTimeout(()=>{
+    readSyncTimer=null;
+    if(readSyncPending) sendReadSync();
+  },400);
 }
-
-focusHandler=function(){
-  handleAttentionGained();
-};
-visibilityHandler=function(){
-  if(typeof document==='undefined') return;
-  if(typeof document.hidden==='boolean' && document.hidden) return;
-  handleAttentionGained();
-};
-pageShowHandler=function(){
-  handleAttentionGained();
-};
-window.addEventListener('focus',focusHandler);
-window.addEventListener('pageshow',pageShowHandler);
-document.addEventListener('visibilitychange',visibilityHandler);
-if(list && typeof list.addEventListener==='function'){
-  scrollHandler=function(){
-    collectVisibleUnread();
-    processPendingVisibleUnread();
-  };
-  list.addEventListener('scroll',scrollHandler);
-}
-
 function appendChatLine(source){
   if(!source) return;
   const data=Object.assign({},source);
@@ -1736,12 +1347,9 @@ function appendChatLine(source){
     else delete existing.dataset.at;
     if(messageId) existing.dataset.messageId=messageId;
     if(userId) existing.dataset.user=userId;
-    handleViewerUnread(existing,merged);
     updateLatestFromPayload(merged);
     if(!isRenderingHistory && role!=='sys' && (merged.user||0)!==myId){
-      if(!messageIsUnreadForViewer(merged)){
-        scheduleReadSync();
-      }
+      scheduleReadSync();
     }
     return;
   }
@@ -1763,13 +1371,10 @@ function appendChatLine(source){
   if(messageId) line.dataset.messageId=messageId;
   if(userId) line.dataset.user=userId;
   list.appendChild(line);
-  handleViewerUnread(line,data);
   list.scrollTop=list.scrollHeight;
   updateLatestFromPayload(data);
   if(!isRenderingHistory && role!=='sys' && (data.user||0)!==myId){
-    if(!messageIsUnreadForViewer(data)){
-      scheduleReadSync();
-    }
+    scheduleReadSync();
   }
 }
 function fingerprint(project,user,content){
@@ -1864,13 +1469,6 @@ function cleanup(){
   stopFallbackPolling();
   window.removeEventListener('elxao:chat',onChatEvent);
   window.removeEventListener('beforeunload',cleanup);
-  if(focusHandler){ window.removeEventListener('focus',focusHandler); focusHandler=null; }
-  if(pageShowHandler){ window.removeEventListener('pageshow',pageShowHandler); pageShowHandler=null; }
-  if(visibilityHandler){ document.removeEventListener('visibilitychange',visibilityHandler); visibilityHandler=null; }
-  if(scrollHandler && list && typeof list.removeEventListener==='function'){ list.removeEventListener('scroll',scrollHandler); scrollHandler=null; }
-  if(unreadObserverInstance){ try{ unreadObserverInstance.disconnect(); }catch(e){} unreadObserverInstance=null; }
-  pendingVisibleUnread.clear();
-  trackedUnreadLines.clear();
 }
 
 const observer=new MutationObserver(function(){ if(!document.body.contains(root)){ observer.disconnect(); cleanup(); }});
@@ -1893,8 +1491,7 @@ function mapHistoryItem(item){
     user_display:item.user_display||item.user_name,
     role:item.role,
     at:item.published_at,
-    id:item.id,
-    viewer_unread:!!item.viewer_unread
+    id:item.id
   };
 }
 function renderHistory(items){
@@ -2000,7 +1597,6 @@ function applyServerAck(resp){
     }
     const indicator=line.querySelector('.chat-read-indicator');
     if(indicator) applyIndicatorState(indicator,determineIndicator(payload,payload.role||line.dataset.role||'other'));
-    handleViewerUnread(line,payload);
     updateLatestFromPayload(payload);
     break;
   }
@@ -2062,37 +1658,22 @@ function elxao_chat_render_inbox(){
 <div id="<?php echo esc_attr($container_id); ?>"
      class="elxao-chat-inbox"
      data-rest="<?php echo esc_url($rest_base); ?>"
-     data-nonce="<?php echo esc_attr($rest_nonce); ?>"
-     data-user="<?php echo (int)$uid; ?>">
+     data-nonce="<?php echo esc_attr($rest_nonce); ?>">
   <div class="inbox-shell">
     <div class="room-list" role="navigation" aria-label="Chat rooms">
       <?php if($rooms){ foreach($rooms as $idx=>$room){
-        $label=$room['label'];
+        $label=sprintf('#%d · %s',$room['id'],$room['title']);
         $activity=elxao_chat_format_activity($room['latest']);
         $room_id=elxao_chat_room_id($room['id']);
         $timestamp_attr=$room['timestamp']? (int)$room['timestamp'] : 0;
-        $unread_count=isset($room['unread'])?(int)$room['unread']:0;
-        $role_attr=$room['role']?:'';
-        $aria_label=$label;
-        if($unread_count>0){
-            $aria_label.=' ('.$unread_count.' unread message'.($unread_count===1?'':'s').')';
-        }
-        $badge_text=$unread_count>99?'99+':($unread_count?:'');
       ?>
       <button type="button"
               class="room<?php echo $idx===0?' active':''; ?>"
               data-project="<?php echo (int)$room['id']; ?>"
               data-room="<?php echo esc_attr($room_id); ?>"
               data-latest="<?php echo esc_attr($room['latest']); ?>"
-              data-timestamp="<?php echo esc_attr($timestamp_attr); ?>"
-              data-unread="<?php echo esc_attr(max(0,$unread_count)); ?>"
-              data-role="<?php echo esc_attr($role_attr); ?>"
-              data-label="<?php echo esc_attr($label); ?>"
-              aria-label="<?php echo esc_attr($aria_label); ?>">
-        <span class="top">
-          <span class="label"><?php echo esc_html($label); ?></span>
-          <span class="badge" aria-hidden="true"<?php echo $unread_count>0?'':' hidden'; ?>><?php echo esc_html($badge_text); ?></span>
-        </span>
+              data-timestamp="<?php echo esc_attr($timestamp_attr); ?>">
+        <span class="label"><?php echo esc_html($label); ?></span>
         <span class="meta"><?php echo esc_html($activity?:'—'); ?></span>
       </button>
       <?php }} else { ?>
@@ -2108,15 +1689,11 @@ function elxao_chat_render_inbox(){
 #<?php echo esc_attr($container_id); ?>{display:flex;flex-direction:column;font:14px/1.45 system-ui;color:#f3f4f6}
 #<?php echo esc_attr($container_id); ?> .inbox-shell{display:flex;gap:0;border:1px solid #4b5563;border-radius:12px;overflow:hidden;min-height:460px;background:#111827}
 #<?php echo esc_attr($container_id); ?> .room-list{width:220px;max-width:260px;border-right:1px solid #374151;background:#1f2937;display:flex;flex-direction:column}
-#<?php echo esc_attr($container_id); ?> .room-list .room{all:unset;cursor:pointer;padding:12px 14px;border-bottom:1px solid rgba(255,255,255,0.05);display:flex;flex-direction:column;gap:4px;color:inherit;position:relative}
+#<?php echo esc_attr($container_id); ?> .room-list .room{all:unset;cursor:pointer;padding:12px 14px;border-bottom:1px solid rgba(255,255,255,0.05);display:flex;flex-direction:column;gap:4px;color:inherit}
 #<?php echo esc_attr($container_id); ?> .room-list .room:focus-visible{outline:2px solid rgba(96,165,250,0.9);outline-offset:-2px}
 #<?php echo esc_attr($container_id); ?> .room-list .room:hover{background:rgba(148,163,184,0.12)}
 #<?php echo esc_attr($container_id); ?> .room-list .room.active{background:rgba(96,165,250,0.18)}
-#<?php echo esc_attr($container_id); ?> .room-list .room .top{display:flex;align-items:center;justify-content:space-between;gap:12px}
-#<?php echo esc_attr($container_id); ?> .room-list .room .top .label{font-weight:600;flex:1;min-width:0}
-#<?php echo esc_attr($container_id); ?> .room-list .room .badge{display:none;background:#ef4444;color:#fff;font-weight:600;font-size:12px;line-height:1;border-radius:999px;padding:0 8px;min-width:22px;height:22px;align-items:center;justify-content:center;box-shadow:0 0 0 1px rgba(0,0,0,0.25);transition:transform .2s ease,opacity .2s ease}
-#<?php echo esc_attr($container_id); ?> .room-list .room.has-unread .badge{display:inline-flex}
-#<?php echo esc_attr($container_id); ?> .room-list .room .badge[hidden]{display:none!important}
+#<?php echo esc_attr($container_id); ?> .room-list .label{font-weight:600}
 #<?php echo esc_attr($container_id); ?> .room-list .meta{font-size:12px;color:#9ca3af}
 #<?php echo esc_attr($container_id); ?> .room-list .empty{padding:20px;color:#9ca3af;font-style:italic}
 #<?php echo esc_attr($container_id); ?> .chat-pane{flex:1;min-width:0;background:transparent;display:flex;align-items:center;justify-content:center;padding:20px}
@@ -2135,7 +1712,6 @@ const root=document.getElementById('<?php echo esc_js($container_id); ?>'); if(!
 
 const rest=root.dataset.rest||'';
 const nonce=root.dataset.nonce||'';
-const myId=parseInt(root.dataset.user||'0',10)||0;
 const chat=root.querySelector('.chat-pane');
 const roomList=root.querySelector('.room-list');
 const rooms=Array.from(roomList?roomList.querySelectorAll('.room'):[]);
@@ -2416,62 +1992,9 @@ if(!window.ELXAO_ABLY){
 function registerCleanup(fn){ if(typeof fn==='function') cleanupFns.push(fn); }
 function runCleanup(){ while(cleanupFns.length){ const fn=cleanupFns.pop(); try{ fn(); }catch(e){} } }
 
-function parseUnreadValue(value){
-  const num=parseInt(value,10);
-  return Number.isFinite(num) && num>0 ? num : 0;
-}
-function formatBadgeValue(count){ return count>99?'99+':String(count); }
-function syncRoomUnreadState(room,count){
-  if(!room) return;
-  const safe=count>0?count:0;
-  room.dataset.unread=String(safe);
-  room.classList.toggle('has-unread',safe>0);
-  const badge=room.querySelector('.badge');
-  if(badge){
-    if(safe>0){
-      badge.textContent=formatBadgeValue(safe);
-      badge.hidden=false;
-    } else {
-      badge.textContent='';
-      badge.hidden=true;
-    }
-  }
-  const baseLabel=room.dataset.label||'';
-  if(baseLabel){
-    const accessible=safe>0?(safe===1?' (1 unread message)':' ('+safe+' unread messages)') : '';
-    room.setAttribute('aria-label',baseLabel+accessible);
-  }
-}
-function getRoomUnread(room){
-  if(!room) return 0;
-  return parseUnreadValue(room.dataset.unread||room.getAttribute('data-unread')||'0');
-}
-function setRoomUnread(room,count){ syncRoomUnreadState(room,count); }
-function incrementRoomUnread(room,delta){
-  if(!room) return;
-  const current=getRoomUnread(room);
-  const next=Math.max(0,current+delta);
-  syncRoomUnreadState(room,next);
-}
-function interpretRoleFlag(value){
-  if(value===undefined||value===null) return undefined;
-  if(typeof value==='boolean') return value;
-  if(typeof value==='number') return value>0;
-  if(typeof value==='string'){
-    const normalized=value.trim().toLowerCase();
-    if(!normalized) return undefined;
-    if(normalized==='false' || normalized==='0' || normalized==='no' || normalized==='off') return false;
-    if(normalized==='true' || normalized==='1' || normalized==='yes' || normalized==='on') return true;
-    return true;
-  }
-  return !!value;
-}
-
 rooms.forEach(function(room){
   const pid=room.getAttribute('data-project');
   if(pid) roomMap.set(String(pid),room);
-  const initialUnread=getRoomUnread(room);
-  syncRoomUnreadState(room,initialUnread);
   const latestAttr=room.getAttribute('data-latest');
   const tsAttr=room.getAttribute('data-timestamp');
   const tsNumeric=tsAttr?parseInt(tsAttr,10):0;
@@ -2516,7 +2039,6 @@ function loadRoom(room){
   if(!room||room===active) return;
   if(active) active.classList.remove('active');
   active=room; room.classList.add('active');
-  setRoomUnread(room,0);
   chat.innerHTML='<div class="placeholder">Loading…</div>';
   const pid=room.getAttribute('data-project'); if(!pid) return;
   fetch(rest+'elxao/v1/chat-window?project_id='+encodeURIComponent(pid),{ credentials:'same-origin', headers:headers })
@@ -2552,62 +2074,10 @@ function subscribeInbox(){
     .catch(err=>{ console.warn('ELXAO inbox realtime unavailable',err); });
 }
 
-function messageIsUnreadForRoom(room,payload){
-  if(!room || !payload) return false;
-  const viewerRole=(room.getAttribute('data-role')||'').toString().toLowerCase();
-  if(!viewerRole || viewerRole==='other') return false;
-  const type=(payload.type||'').toString().toLowerCase();
-  if(type==='read_receipt') return false;
-  const sender=payload.user?parseInt(payload.user,10):0;
-  if(sender && myId && sender===myId) return false;
-  const statusSources=[];
-  if(payload.read_status && typeof payload.read_status==='object') statusSources.push(payload.read_status);
-  if(payload.reads && payload.reads.roles && typeof payload.reads.roles==='object') statusSources.push(payload.reads.roles);
-  for(let i=0;i<statusSources.length;i++){
-    const source=statusSources[i];
-    if(Object.prototype.hasOwnProperty.call(source,viewerRole)){
-      const interpreted=interpretRoleFlag(source[viewerRole]);
-      if(interpreted===true) return false;
-      if(interpreted===false) return true;
-    }
-  }
-  const messageRole=(payload.role||'').toString().toLowerCase();
-  if(messageRole===viewerRole) return false;
-  if(active===room) return false;
-  return true;
-}
-
-function handleReadReceiptEvent(room,payload){
-  if(!room || !payload) return;
-  const viewerRole=(room.getAttribute('data-role')||'').toString().toLowerCase();
-  if(!viewerRole || viewerRole==='other') return;
-  let markRead=false;
-  const sender=payload.user?parseInt(payload.user,10):0;
-  if(sender && myId && sender===myId) markRead=true;
-  if(!markRead){
-    const sources=[];
-    if(payload.read_status && typeof payload.read_status==='object') sources.push(payload.read_status);
-    if(payload.reads && payload.reads.roles && typeof payload.reads.roles==='object') sources.push(payload.reads.roles);
-    for(let i=0;i<sources.length;i++){
-      const src=sources[i];
-      if(Object.prototype.hasOwnProperty.call(src,viewerRole)){
-        const interpreted=interpretRoleFlag(src[viewerRole]);
-        if(interpreted===true){ markRead=true; break; }
-      }
-    }
-  }
-  if(markRead) setRoomUnread(room,0);
-}
-
 function onChatEvent(ev){
   const detail=ev&&ev.detail?ev.detail:{}; if(!detail || typeof detail.project==='undefined') return;
   const payload=window.ELXAO_CHAT_NORMALIZE(detail.payload||{},detail.project);
   const projectId=payload.project||parseInt(detail.project,10)||0; if(!projectId) return;
-  const key=String(projectId);
-  const room=roomMap.get(key);
-  const type=(payload.type||'').toString().toLowerCase();
-  if(type==='read_receipt'){ if(room) handleReadReceiptEvent(room,payload); }
-  else if(room && messageIsUnreadForRoom(room,payload)){ incrementRoomUnread(room,1); }
   const bumpAt=payload.at||Date.now(); bumpRoom(projectId,bumpAt);
 }
 
