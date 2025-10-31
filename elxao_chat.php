@@ -2,7 +2,7 @@
 /*
 Plugin Name: ELXAO Chat
 Description: Per-project chat storage (MySQL), REST API for send/history, Ably realtime fan-out, and inbox ordering via latest_message_at (ACF). Colors by ROLE: client, pm, admin. Includes Inbox view.
-Version: 1.45.0
+Version: 1.46.0
 Author: ELXAO
 */
 
@@ -378,7 +378,7 @@ function elxao_chat_rest_send(WP_REST_Request $r){
         else update_field('latest_message_at',$now,$pid);
     } else update_post_meta($pid,'latest_message_at',$now);
 
-    // Publish to Ably with display name + ROLE
+    // Publish to Ably with display name + ROLE (sender trivially has read their own message)
     $user    = get_userdata($uid);
     $display = $user ? $user->display_name : ('User '.$uid);
     $role    = elxao_chat_role_for_user($pid,$uid);
@@ -468,31 +468,10 @@ function elxao_chat_rest_history(WP_REST_Request $r){
     unset($row);
 
     $role = elxao_chat_role_for_user($pid,$uid);
-    $participants = elxao_chat_get_client_pm_ids($pid);
     $reads = elxao_chat_get_last_reads($pid);
-    $updated_reads = false;
 
-    if(in_array($role,['client','pm','admin'],true)){
-        $maybe = elxao_chat_update_last_read($pid,$role,current_time('timestamp'));
-        if($maybe){
-            $reads = $maybe;
-            $updated_reads = true;
-        }
-    }
-
-    foreach($rows as &$row){
-        $status = elxao_chat_build_message_read_status($pid,$row['role'],$row['published_at'],$reads,$participants);
-        $row['read_status']=$status;
-        $row['reads']=[
-            'roles'=>$status,
-            'times'=>$reads,
-        ];
-    }
-    unset($row);
-
-    if($updated_reads){
-        elxao_chat_publish_read_receipt($pid,$reads,$uid);
-    }
+    // IMPORTANT FIX: Do NOT auto-mark read on history fetch.
+    // Visibility-based read is handled only via explicit POST /messages/read from the UI now.
 
     return new WP_REST_Response([
         'items'=>$rows,
@@ -509,10 +488,10 @@ function elxao_chat_rest_mark_read(WP_REST_Request $r){
 
     $role = elxao_chat_role_for_user($pid,$uid);
     $reads = elxao_chat_get_last_reads($pid);
-    $participants = elxao_chat_get_client_pm_ids($pid);
     $updated = false;
 
     if(in_array($role,['client','pm','admin'],true)){
+        // we simply record "now" as the last seen moment
         $maybe = elxao_chat_update_last_read($pid,$role,current_time('timestamp'));
         if($maybe){
             $reads = $maybe;
@@ -524,6 +503,7 @@ function elxao_chat_rest_mark_read(WP_REST_Request $r){
         elxao_chat_publish_read_receipt($pid,$reads,$uid);
     }
 
+    $participants = elxao_chat_get_client_pm_ids($pid);
     $role_flags = [
         'client' => elxao_chat_parse_datetime($reads['client'] ?? '') > 0 || empty($participants['client']),
         'pm'     => elxao_chat_parse_datetime($reads['pm'] ?? '') > 0 || empty($participants['pm']),
@@ -701,20 +681,111 @@ const pmId=parseInt(root.dataset.pm,10)||0;
 const localEchoes=new Map();
 let realtimeCleanup=null;
 let busCleanup=null;
-let readSyncTimer=null;
-let readSyncPending=false;
-let readSyncInFlight=false;
-let isRenderingHistory=false;
-let latestAt='';
-let latestId=0;
-let fallbackActive=false;
-let fallbackTimer=null;
-let fallbackInFlight=false;
-const FALLBACK_INTERVAL=4000;
-const currentReadTimes={client:'',pm:'',admin:''};
-const DEBUG=false;
 
-/* ---------- Shared helpers (guarded singletons) ---------- */
+/* =========================
+   READ-LOGIC GUARDS (FOCUS + VISIBILITY + IN-VIEW)
+   ========================= */
+let windowFocused=document.hasFocus();
+let pageVisible=(document.visibilityState==='visible');
+function isEligibleToMarkRead(){
+  return windowFocused && pageVisible;
+}
+window.addEventListener('focus',()=>{ windowFocused=true; },{passive:true});
+window.addEventListener('blur', ()=>{ windowFocused=false; },{passive:true});
+document.addEventListener('visibilitychange',()=>{ pageVisible=(document.visibilityState==='visible'); },{passive:true});
+
+/* Track per-line visibility with IntersectionObserver.
+   Only mark as seen if:
+   - not my own message
+   - not system
+   - is intersecting >= 60%
+   - remained visible for >= 600ms
+*/
+const OBS_THRESHOLD=0.6;
+const OBS_DWELL_MS=600;
+const observer = ('IntersectionObserver' in window) ? new IntersectionObserver(onIO,{root:list,threshold:[OBS_THRESHOLD]}) : null;
+const observed = new Map(); // line -> { seen:false, enterTs:0, atMs:0 }
+let latestSeenAtMs=0;
+let readDebounce=null;
+const READ_DEBOUNCE_MS=350;
+
+function parseAtMs(v){
+  if(!v) return 0;
+  if(typeof v==='number') return (v>1e12)?v:Math.round(v*1000);
+  const s=String(v).trim();
+  if(!s) return 0;
+  if(/^\d+$/.test(s)){ const n=parseInt(s,10); return (s.length<=10)?n*1000:n; }
+  const d=new Date(s.replace(' ','T'));
+  const ms=d.getTime();
+  return Number.isFinite(ms)?ms:0;
+}
+
+function ensureObserved(line){
+  if(!observer || !line) return;
+  if(observed.has(line)) return;
+  const payload=line.__chatPayload||{};
+  const role=(payload.role||line.dataset.role||'other');
+  const uid=(payload.user||parseInt(line.dataset.user||'0',10)||0);
+  if(role==='sys' || uid===myId) return; // we only care about other users' lines
+  const atMs = parseAtMs(payload.at || payload.published_at || line.dataset.at || 0);
+  observed.set(line,{ seen:false, enterTs:0, atMs:atMs });
+  observer.observe(line);
+}
+
+function onIO(entries){
+  const now = performance.now();
+  for(const entry of entries){
+    const line=entry.target;
+    const info=observed.get(line);
+    if(!info) continue;
+    if(entry.isIntersecting && entry.intersectionRatio>=OBS_THRESHOLD){
+      if(info.enterTs===0) info.enterTs=now;
+    }else{
+      info.enterTs=0;
+    }
+  }
+  evaluateSeen();
+}
+
+function evaluateSeen(){
+  if(!isEligibleToMarkRead()) return;
+  const now=performance.now();
+  let bumped=false;
+  observed.forEach((info,line)=>{
+    if(info.seen) return;
+    if(info.enterTs>0 && (now - info.enterTs)>=OBS_DWELL_MS){
+      info.seen=true;
+      if(info.atMs && info.atMs>latestSeenAtMs){
+        latestSeenAtMs=info.atMs;
+        bumped=true;
+      }
+    }
+  });
+  if(bumped){
+    // debounce a single server call for a cluster of lines
+    if(readDebounce) clearTimeout(readDebounce);
+    readDebounce=setTimeout(postRead,READ_DEBOUNCE_MS);
+  }
+}
+
+function postRead(){
+  if(!projectId || !rest || myRole==='other') return;
+  // explicit read sync
+  fetch(rest+'elxao/v1/messages/read',{
+    method:'POST', credentials:'same-origin',
+    headers:Object.assign({'Content-Type':'application/json'},hdr),
+    body:JSON.stringify({project_id:projectId})
+  }).then(r=>r.json()).then(data=>{
+    // broadcast for other panes + update indicators quickly
+    if(data && data.project){
+      window.dispatchEvent(new CustomEvent('elxao:chat',{detail:{project:data.project,payload:data}}));
+    }
+  }).catch(()=>{ /* ignore */ });
+}
+
+/* =========================
+   EXISTING SHARED HELPERS (bus, normalize, ably)
+   ========================= */
 if(!window.ELXAO_CHAT_BUS){
   (function(){
     const origin=Math.random().toString(36).slice(2);
@@ -895,32 +966,6 @@ if(!window.ELXAO_CHAT_BUILD_NORMALIZER){
 if(!window.ELXAO_CHAT_NORMALIZE){
   window.ELXAO_CHAT_NORMALIZE=window.ELXAO_CHAT_BUILD_NORMALIZER();
 }
-if(!window.ELXAO_CHAT_BROADCAST){
-  window.ELXAO_CHAT_BROADCAST=function(projectHint,data,extras){
-    let source=data;
-    if(typeof source==='string'){
-      const trimmed=source.trim();
-      if(trimmed){
-        try{ source=JSON.parse(trimmed); }
-        catch(e){ source={message:source}; }
-      } else {
-        source={};
-      }
-    }
-    const payload=window.ELXAO_CHAT_NORMALIZE(source,projectHint);
-    if(!payload.project && projectHint) payload.project=Number(projectHint)||0;
-    const detail=Object.assign({project:payload.project,payload:payload},(extras&&typeof extras==='object')?extras:{});
-    window.ELXAO_CHAT_BUS.emit(detail);
-    if(payload.project){
-      const payloadType=(payload.type||'').toString().toLowerCase();
-      if(payloadType!=='read_receipt'){
-        const bumpAt=payload.at||Date.now();
-        window.dispatchEvent(new CustomEvent('elxao:room-bump',{detail:{projectId:payload.project,at:bumpAt}}));
-      }
-    }
-    return payload;
-  };
-}
 if(!window.ELXAO_ABLY){
   window.ELXAO_ABLY={client:null,clientPromise:null,libraryPromise:null,channels:new Map()};
   window.ELXAO_ABLY.loadLibrary=function(){
@@ -976,10 +1021,10 @@ if(!window.ELXAO_ABLY){
         }
         const resolve=window.ELXAO_CHAT_RESOLVE_PROJECT_ID;
         const hintedProject=resolve(
-          data && typeof data==='object' ? data.project : (data&&data.project),
-          data && typeof data==='object' ? data.project_id : undefined,
-          data && typeof data==='object' ? data.projectId : undefined,
-          data && typeof data==='object' ? data.projectID : undefined,
+          data && data.project,
+          data && data.project_id,
+          data && data.projectId,
+          data && data.projectID,
           entry && entry.projectId,
           project
         );
@@ -998,7 +1043,7 @@ if(!window.ELXAO_ABLY){
         if(entry.callbacks && entry.callbacks.size){
           entry.callbacks.forEach(function(cb){ try{ cb(normalized,msg,extras); }catch(e){} });
         }
-        window.ELXAO_CHAT_BROADCAST(projectId,normalized,extras);
+        window.ELXAO_CHAT_BUS.emit({project:projectId,payload:normalized});
       };
       if(entry.channel){
         entry.channel.attach()
@@ -1016,8 +1061,8 @@ if(!window.ELXAO_ABLY){
     };
   };
 }
-/* ---------- end helpers ---------- */
 
+/* ---------- utility fns ---------- */
 function normalizeContent(value){ return String(value||'').replace(/<[^>]*?>/g,''); }
 function createTextFragment(text){
   const fragment=document.createDocumentFragment();
@@ -1037,6 +1082,18 @@ function extractReadTimes(source){
   }
   return null;
 }
+
+/* ---------- live state ---------- */
+const currentReadTimes={client:'',pm:'',admin:''};
+let isRenderingHistory=false;
+let latestAt='';
+let latestId=0;
+let fallbackActive=false;
+let fallbackTimer=null;
+let fallbackInFlight=false;
+const FALLBACK_INTERVAL=4000;
+const DEBUG=false;
+
 function updateCurrentReadTimes(times){
   if(!times || typeof times!=='object') return false;
   let changed=false;
@@ -1077,24 +1134,7 @@ function updateLatestFromPayload(data){
     if(numericId>0) latestId=numericId;
   }
 }
-function parseReadTime(value){
-  if(value===undefined || value===null || value==='') return 0;
-  if(value instanceof Date) return value.getTime();
-  if(typeof value==='number'){
-    const num=value;
-    return num>1e12?num:Math.round(num*1000);
-  }
-  const str=String(value).trim();
-  if(!str) return 0;
-  if(/^-?\d+$/.test(str)){
-    const num=parseInt(str,10);
-    return str.length<=10?num*1000:num;
-  }
-  const normalized=str.replace(' ','T');
-  const date=new Date(normalized);
-  const ms=date.getTime();
-  return Number.isFinite(ms)?ms:0;
-}
+
 function buildStatusFromTimes(payload,times){
   const status={client:false,pm:false,admin:false};
   const role=(payload&&payload.role)||'other';
@@ -1103,51 +1143,19 @@ function buildStatusFromTimes(payload,times){
   if(role==='admin') status.admin=true;
   if(!clientId) status.client=true;
   if(!pmId && role!=='admin') status.pm=true;
-  const messageTime= parseReadTime(payload&&payload.at) || parseReadTime(payload&&payload.published_at) || parseReadTime(payload&&payload.created_at);
-  const pickTime=function(map,keys){
-    if(!map || typeof map!=='object') return undefined;
-    for(let i=0;i<keys.length;i++){
-      const key=keys[i];
-      if(Object.prototype.hasOwnProperty.call(map,key)) return map[key];
-    }
-    return undefined;
-  };
-  const clientValue=pickTime(times,['client','customer']);
-  const pmValue=pickTime(times,['pm','manager','project_manager']);
-  const adminValue=pickTime(times,['admin','administrator']);
-  const clientTime=parseReadTime(clientValue);
-  const pmTime=parseReadTime(pmValue);
-  const adminTime=parseReadTime(adminValue);
-  if(messageTime){
-    if(clientTime && clientTime>=messageTime) status.client=true;
-    if(pmTime && pmTime>=messageTime) status.pm=true;
-    if(adminTime && adminTime>=messageTime) status.admin=true;
+  const msgTime = parseAtMs(payload&&payload.at) || parseAtMs(payload&&payload.published_at) || parseAtMs(payload&&payload.created_at);
+  const pickTime=(map,keys)=>{ if(!map||typeof map!=='object') return undefined; for(const k of keys){ if(Object.prototype.hasOwnProperty.call(map,k)) return map[k]; } };
+  const clientTime=parseAtMs(pickTime(times,['client','customer']));
+  const pmTime=parseAtMs(pickTime(times,['pm','manager','project_manager']));
+  const adminTime=parseAtMs(pickTime(times,['admin','administrator']));
+  if(msgTime){
+    if(clientTime && clientTime>=msgTime) status.client=true;
+    if(pmTime && pmTime>=msgTime) status.pm=true;
+    if(adminTime && adminTime>=msgTime) status.admin=true;
   }
   return status;
 }
-function applyIndicatorState(indicator,info){
-  indicator.className='chat-read-indicator';
-  indicator.removeAttribute('aria-hidden');
-  indicator.removeAttribute('aria-label');
-  indicator.removeAttribute('title');
-  indicator.removeAttribute('role');
-  if(!info){
-    indicator.classList.add('is-hidden');
-    indicator.setAttribute('aria-hidden','true');
-    return;
-  }
-  const classes=(info.className||'').split(/\s+/).filter(Boolean);
-  classes.forEach(cls=>indicator.classList.add(cls));
-  indicator.setAttribute('role','img');
-  const label=info.label||'';
-  if(label){
-    indicator.setAttribute('aria-label',label);
-  }
-  const title=info.title||label||'';
-  if(title){
-    indicator.title=title;
-  }
-}
+
 function buildReadState(data){
   const reads=(data&&data.reads&&typeof data.reads==='object')?data.reads:{};
   const roleMap=(reads.roles&&typeof reads.roles==='object')?reads.roles:{};
@@ -1189,6 +1197,7 @@ function buildReadState(data){
   Object.keys(resolved).forEach(role=>{ resolved[role]=!!resolved[role]; });
   return resolved;
 }
+
 function determineIndicator(data,role){
   if(role==='sys') return null;
   const reads=buildReadState(data);
@@ -1218,6 +1227,27 @@ function determineIndicator(data,role){
   const anyRead=clientRead||pmRead;
   return {className:anyRead?'chat-read-indicator--read':'chat-read-indicator--unread',label:anyRead?'Read':'Unread'};
 }
+
+function applyIndicatorState(indicator,info){
+  indicator.className='chat-read-indicator';
+  indicator.removeAttribute('aria-hidden');
+  indicator.removeAttribute('aria-label');
+  indicator.removeAttribute('title');
+  indicator.removeAttribute('role');
+  if(!info){
+    indicator.classList.add('is-hidden');
+    indicator.setAttribute('aria-hidden','true');
+    return;
+  }
+  const classes=(info.className||'').split(/\s+/).filter(Boolean);
+  classes.forEach(cls=>indicator.classList.add(cls));
+  indicator.setAttribute('role','img');
+  const label=info.label||'';
+  if(label) indicator.setAttribute('aria-label',label);
+  const title=info.title||label||'';
+  if(title) indicator.title=title;
+}
+
 function applyReadReceipt(data){
   const times=extractReadTimes(data);
   if(times) updateCurrentReadTimes(times);
@@ -1239,144 +1269,7 @@ function applyReadReceipt(data){
     if(indicator) applyIndicatorState(indicator,determineIndicator(payload,payload.role||line.dataset.role||'other'));
   });
 }
-function sendReadSync(){
-  if(readSyncInFlight) return;
-  const targetProject=projectId||parseInt(pid,10)||0;
-  if(!targetProject || !rest || !myId) return;
-  readSyncPending=false;
-  readSyncInFlight=true;
-  fetch(rest+'elxao/v1/messages/read',{
-    method:'POST',
-    credentials:'same-origin',
-    headers:Object.assign({'Content-Type':'application/json'},hdr),
-    body:JSON.stringify({project_id:targetProject})
-  }).then(r=>{ if(!r.ok) throw new Error(''+r.status); return r.json(); })
-    .then(resp=>{
-      if(!resp) return;
-      if(!resp.project) resp.project=targetProject;
-      if(!resp.type) resp.type='read_receipt';
-      if(!resp.user) resp.user=myId;
-      window.ELXAO_CHAT_BROADCAST(resp.project,resp);
-    })
-    .catch(()=>{})
-    .finally(()=>{
-      readSyncInFlight=false;
-      if(readSyncPending){
-        scheduleReadSync();
-      }
-    });
-}
-function scheduleReadSync(){
-  if(!projectId || !rest || !myId) return;
-  if(myRole==='other') return;
-  readSyncPending=true;
-  if(readSyncInFlight) return;
-  if(readSyncTimer) return;
-  readSyncTimer=setTimeout(()=>{
-    readSyncTimer=null;
-    if(readSyncPending) sendReadSync();
-  },400);
-}
-function appendChatLine(source){
-  if(!source) return;
-  const data=Object.assign({},source);
-  const times=extractReadTimes(data);
-  if(times) updateCurrentReadTimes(times);
-  const effectiveTimes={
-    client:currentReadTimes.client,
-    pm:currentReadTimes.pm,
-    admin:currentReadTimes.admin
-  };
-  if(!data.read_status || typeof data.read_status!=='object'){
-    const computed=buildStatusFromTimes(data,effectiveTimes);
-    data.read_status=Object.assign({},computed);
-    if(!data.reads || typeof data.reads!=='object') data.reads={};
-    data.reads.roles=Object.assign({},computed);
-    data.reads.times=Object.assign({},effectiveTimes);
-  } else {
-    if(!data.reads || typeof data.reads!=='object') data.reads={};
-    if(!data.reads.roles || typeof data.reads.roles!=='object') data.reads.roles=Object.assign({},data.read_status);
-    if(times) data.reads.times=Object.assign({},times);
-    else if(!data.reads.times) data.reads.times=Object.assign({},effectiveTimes);
-  }
-  const role=(data.type==='system')?'sys':(data.role||'other');
-  data.role=role;
-  const messageText=normalizeContent(data.message);
-  if(!messageText && role!=='sys') return;
-  const display=data.user_display||('User '+(data.user||''));
-  const fullText=(role==='sys')?messageText:(display+': '+messageText);
-  const messageIdValue=('id' in data && data.id!==undefined && data.id!==null)?String(data.id):'';
-  const fallbackId=('message_id' in data && data.message_id!==undefined && data.message_id!==null)?String(data.message_id):'';
-  const messageId=messageIdValue||fallbackId;
-  const stampRaw=data.at||data.published_at||data.created_at||data.timestamp||'';
-  const stamp=stampRaw?String(stampRaw):'';
-  const userValue=('user' in data && data.user!==undefined && data.user!==null)?String(data.user):'';
-  const userId=userValue||(('user_id' in data && data.user_id!==undefined && data.user_id!==null)?String(data.user_id):'');
 
-  let existing=null;
-  if(list && list.children && list.children.length){
-    if(messageId){
-      const items=Array.from(list.children);
-      existing=items.find(function(line){ return line && line.dataset && line.dataset.messageId===messageId; })||null;
-    }
-    if(!existing && stamp && userId){
-      const items=Array.from(list.children);
-      existing=items.find(function(line){
-        if(!line||!line.dataset) return false;
-        return line.dataset.user===userId && line.dataset.at===stamp;
-      })||null;
-    }
-  }
-
-  const ensureTextContent=function(node,text){
-    if(!node) return;
-    while(node.firstChild){ node.removeChild(node.firstChild); }
-    node.appendChild(createTextFragment(text));
-  };
-
-  if(existing){
-    const payload=existing.__chatPayload||{};
-    const merged=Object.assign({},payload,data);
-    existing.__chatPayload=merged;
-    const indicator=existing.querySelector('.chat-read-indicator');
-    if(indicator) applyIndicatorState(indicator,determineIndicator(merged,role));
-    const textNode=existing.querySelector('.chat-text');
-    ensureTextContent(textNode,fullText);
-    existing.dataset.role=role;
-    if(stamp) existing.dataset.at=stamp;
-    else delete existing.dataset.at;
-    if(messageId) existing.dataset.messageId=messageId;
-    if(userId) existing.dataset.user=userId;
-    updateLatestFromPayload(merged);
-    if(!isRenderingHistory && role!=='sys' && (merged.user||0)!==myId){
-      scheduleReadSync();
-    }
-    return;
-  }
-
-  const line=document.createElement('div');
-  line.className='chat-line '+role;
-  const indicator=document.createElement('span');
-  const indicatorInfo=determineIndicator(data,role);
-  applyIndicatorState(indicator,indicatorInfo);
-  line.appendChild(indicator);
-  const textNode=document.createElement('div');
-  textNode.className='chat-text';
-  ensureTextContent(textNode,fullText);
-  line.appendChild(textNode);
-  line.__chatPayload=data;
-  line.dataset.role=role;
-  if(stamp) line.dataset.at=stamp;
-  else delete line.dataset.at;
-  if(messageId) line.dataset.messageId=messageId;
-  if(userId) line.dataset.user=userId;
-  list.appendChild(line);
-  list.scrollTop=list.scrollHeight;
-  updateLatestFromPayload(data);
-  if(!isRenderingHistory && role!=='sys' && (data.user||0)!==myId){
-    scheduleReadSync();
-  }
-}
 function fingerprint(project,user,content){
   if(!project||!user) return '';
   const normalized=normalizeContent(content).replace(/\r\n?/g,'\n').trim();
@@ -1391,6 +1284,7 @@ function isRecentLocal(fp){
   localEchoes.delete(fp); return (Date.now()-ts<=5000);
 }
 
+/* ---------- REST & realtime ---------- */
 function load(params){
   const query=['project_id='+encodeURIComponent(pid||'')];
   if(params && params.after){ query.push('after='+encodeURIComponent(params.after)); }
@@ -1464,15 +1358,17 @@ function subscribeRealtime(tokenDetails){
 function cleanup(){
   if(realtimeCleanup){ try{ realtimeCleanup(); }catch(e){} realtimeCleanup=null; }
   if(busCleanup){ try{ busCleanup(); }catch(e){} busCleanup=null; }
-  if(readSyncTimer){ clearTimeout(readSyncTimer); readSyncTimer=null; }
-  readSyncPending=false;
   stopFallbackPolling();
+  if(observer){
+    observer.disconnect();
+    observed.clear();
+  }
   window.removeEventListener('elxao:chat',onChatEvent);
   window.removeEventListener('beforeunload',cleanup);
 }
 
-const observer=new MutationObserver(function(){ if(!document.body.contains(root)){ observer.disconnect(); cleanup(); }});
-observer.observe(document.body,{childList:true,subtree:true});
+const observerDisconnect=new MutationObserver(function(){ if(!document.body.contains(root)){ observerDisconnect.disconnect(); cleanup(); }});
+observerDisconnect.observe(document.body,{childList:true,subtree:true});
 window.addEventListener('elxao:chat',onChatEvent);
 if(window.ELXAO_CHAT_BUS.channel && window.ELXAO_CHAT_BUS.channel.addEventListener){
   const busHandler=function(ev){ const detail=ev&&ev.data?ev.data:null; if(!detail) return; if(detail.originId && detail.originId===window.ELXAO_CHAT_BUS.origin) return; onChatEvent({detail:detail}); };
@@ -1481,6 +1377,7 @@ if(window.ELXAO_CHAT_BUS.channel && window.ELXAO_CHAT_BUS.channel.addEventListen
 }
 window.addEventListener('beforeunload',cleanup,{once:true});
 
+/* ---------- history render ---------- */
 function mapHistoryItem(item){
   if(!item || typeof item!=='object') return null;
   return {
@@ -1497,8 +1394,7 @@ function mapHistoryItem(item){
 function renderHistory(items){
   if(!items||!Array.isArray(items)) return;
   isRenderingHistory=true;
-  latestAt='';
-  latestId=0;
+  latestAt=''; latestId=0;
   try{
     if(list) list.innerHTML='';
     items.forEach(function(m){
@@ -1516,6 +1412,8 @@ function processIncrementalHistory(items){
     if(payload) handleChatPayload(payload);
   });
 }
+
+/* ---------- polling fallback ---------- */
 function pollForUpdates(){
   if(fallbackInFlight) return Promise.resolve();
   if(!pid || !rest) return Promise.resolve();
@@ -1564,9 +1462,99 @@ function stopFallbackPolling(){
   if(fallbackTimer){ clearTimeout(fallbackTimer); fallbackTimer=null; }
   fallbackInFlight=false;
 }
+
+/* ---------- append lines (with view-based observing) ---------- */
+function appendChatLine(source){
+  if(!source) return;
+  const data=Object.assign({},source);
+
+  // ensure read state objects
+  const times=extractReadTimes(data);
+  if(times) updateCurrentReadTimes(times);
+  const effectiveTimes={ client:currentReadTimes.client, pm:currentReadTimes.pm, admin:currentReadTimes.admin };
+  if(!data.read_status || typeof data.read_status!=='object'){
+    const computed=buildStatusFromTimes(data,effectiveTimes);
+    data.read_status=Object.assign({},computed);
+    data.reads=data.reads||{};
+    data.reads.roles=Object.assign({},computed);
+    data.reads.times=Object.assign({},effectiveTimes);
+  } else {
+    data.reads=data.reads||{};
+    if(!data.reads.roles) data.reads.roles=Object.assign({},data.read_status);
+    if(times) data.reads.times=Object.assign({},times);
+    else if(!data.reads.times) data.reads.times=Object.assign({},effectiveTimes);
+  }
+
+  const role=(data.type==='system')?'sys':(data.role||'other'); data.role=role;
+  const messageText=normalizeContent(data.message);
+  if(!messageText && role!=='sys') return;
+  const display=data.user_display||('User '+(data.user||''));
+  const fullText=(role==='sys')?messageText:(display+': '+messageText);
+
+  const messageId=('id' in data && data.id!=null)?String(data.id): (('message_id' in data && data.message_id!=null)?String(data.message_id):'');
+  const stamp=String(data.at||data.published_at||data.created_at||'');
+  const userId=('user' in data && data.user!=null)?String(data.user): (('user_id' in data && data.user_id!=null)?String(data.user_id):'');
+
+  let existing=null;
+  if(list && list.children && list.children.length){
+    if(messageId){
+      existing=Array.from(list.children).find(el=>el && el.dataset && el.dataset.messageId===messageId) || null;
+    }
+    if(!existing && stamp && userId){
+      existing=Array.from(list.children).find(el=> el && el.dataset && el.dataset.user===userId && el.dataset.at===stamp) || null;
+    }
+  }
+
+  const ensureTextContent=function(node,text){
+    if(!node) return;
+    while(node.firstChild){ node.removeChild(node.firstChild); }
+    node.appendChild(createTextFragment(text));
+  };
+
+  if(existing){
+    const payload=existing.__chatPayload||{};
+    const merged=Object.assign({},payload,data);
+    existing.__chatPayload=merged;
+    const indicator=existing.querySelector('.chat-read-indicator');
+    if(indicator) applyIndicatorState(indicator,determineIndicator(merged,role));
+    const textNode=existing.querySelector('.chat-text');
+    ensureTextContent(textNode,fullText);
+    existing.dataset.role=role;
+    if(stamp) existing.dataset.at=stamp; else delete existing.dataset.at;
+    if(messageId) existing.dataset.messageId=messageId;
+    if(userId) existing.dataset.user=userId;
+    updateLatestFromPayload(merged);
+    // DO NOT auto mark read; visibility observer handles it.
+    ensureObserved(existing);
+    return;
+  }
+
+  const line=document.createElement('div');
+  line.className='chat-line '+role;
+  const indicator=document.createElement('span');
+  applyIndicatorState(indicator,determineIndicator(data,role));
+  line.appendChild(indicator);
+  const textNode=document.createElement('div');
+  textNode.className='chat-text';
+  ensureTextContent(textNode,fullText);
+  line.appendChild(textNode);
+  line.__chatPayload=data;
+  line.dataset.role=role;
+  if(stamp) line.dataset.at=stamp; else delete line.dataset.at;
+  if(messageId) line.dataset.messageId=messageId;
+  if(userId) line.dataset.user=userId;
+  list.appendChild(line);
+  list.scrollTop=list.scrollHeight;
+  updateLatestFromPayload(data);
+
+  // register for view-based detection (only other users' messages)
+  ensureObserved(line);
+}
+
+/* ---------- initial boot ---------- */
 function applyServerAck(resp){
   if(!resp || !list) return;
-  const ackId=('id' in resp && resp.id!==undefined && resp.id!==null)?parseInt(resp.id,10):0;
+  const ackId=('id' in resp && resp.id!=null)?parseInt(resp.id,10):0;
   const ackAt=resp.at||resp.published_at||'';
   const ackTimes=extractReadTimes(resp);
   const ackStatus=(resp && resp.read_status && typeof resp.read_status==='object')?resp.read_status:null;
@@ -1615,6 +1603,7 @@ token()
   })
   .catch(function(err){ console.error('ELXAO chat history unavailable',err); if(!fallbackActive) startFallbackPolling(FALLBACK_INTERVAL); });
 
+/* composer */
 btn.addEventListener('click', function(){
   const v = ta.value.replace(/\s+$/,''); if(!v.trim()) return;
   const meName = '<?php echo $meName;?>';
@@ -1624,7 +1613,7 @@ btn.addEventListener('click', function(){
     if(resp && resp.ok){
       const resolvedProject=resp.project_id?parseInt(resp.project_id,10):projectId;
       if(resolvedProject){
-        window.ELXAO_CHAT_BROADCAST(resolvedProject,{ type:'text', message:v, project:resolvedProject, user:myId, user_display:meName, role:myRole, at:resp.at||new Date().toISOString(), id:resp.id });
+        window.ELXAO_CHAT_BUS.emit({ project:resolvedProject, payload:{ type:'text', message:v, project:resolvedProject, user:myId, user_display:meName, role:myRole, at:resp.at||new Date().toISOString(), id:resp.id } });
       }
       applyServerAck(resp);
     }
@@ -1635,6 +1624,13 @@ btn.addEventListener('click', function(){
 ta.addEventListener('keydown', function(e){
   if ((e.key === 'Enter') && (e.ctrlKey || e.metaKey)) { e.preventDefault(); btn.click(); }
 });
+
+/* evaluate seen on scroll/resize as well */
+['scroll','resize'].forEach(evt=>{
+  list.addEventListener(evt,()=>evaluateSeen(),{passive:true});
+  window.addEventListener(evt,()=>evaluateSeen(),{passive:true});
+});
+
 })();
 </script>
 <?php
@@ -1722,7 +1718,7 @@ const cleanupFns=[];
 let active=null;
 let busCleanup=null;
 
-/* ---- shared helpers (guarded; may already exist from chat window) ---- */
+/* ---- shared helpers (may already exist) ---- */
 if(!window.ELXAO_CHAT_BUS){
   const origin=Math.random().toString(36).slice(2);
   let channel=null; if('BroadcastChannel' in window){ try{ channel=new BroadcastChannel('elxao-chat'); }catch(e){} }
@@ -1733,261 +1729,24 @@ if(!window.ELXAO_CHAT_BUS){
   if(channel){ window.addEventListener('beforeunload',()=>{ try{ channel.close(); }catch(e){} },{once:true}); }
 }
 if(!window.ELXAO_CHAT_BUILD_NORMALIZER){
-  window.ELXAO_CHAT_BUILD_NORMALIZER=function(){
-    const roles=new Set(['client','pm','admin','other','sys']);
-    const fd=(...a)=>a.find(v=>v!==undefined&&v!==null);
-    const toISO=v=>!v&&v!==0?new Date().toISOString():(v instanceof Date?v.toISOString():(typeof v==='number'?new Date(v).toISOString():String(v)));
-    const canonicalRole=function(role){
-      if(role===undefined||role===null) return '';
-      let str=String(role).trim().toLowerCase();
-      if(!str) return '';
-      str=str.replace(/\s+/g,'_').replace(/-+/g,'_');
-      if(str==='project_manager'||str==='projectmanager'||str==='manager'||str==='pm_user'||str==='pmid'||str==='pm') return 'pm';
-      if(str==='customer'||str==='client_user'||str==='clientid'||str==='customer_user'||str==='client') return 'client';
-      if(str==='administrator'||str==='admin_user'||str==='adminid'||str==='admin') return 'admin';
-      return str;
-    };
-    const boolish=function(value){
-      if(value===undefined||value===null) return false;
-      if(typeof value==='boolean') return value;
-      if(typeof value==='number') return value>0;
-      if(typeof value==='string'){
-        const str=value.trim().toLowerCase();
-        if(!str) return false;
-        if(str==='false'||str==='0'||str==='no'||str==='off'||str==='null'||str==='undefined') return false;
-        return true;
-      }
-      if(value instanceof Date) return true;
-      if(typeof value==='object'){
-        if('read' in value) return boolish(value.read);
-        if('value' in value) return boolish(value.value);
-        if('state' in value) return boolish(value.state);
-        if('status' in value) return boolish(value.status);
-        if('seen' in value) return boolish(value.seen);
-        if('at' in value) return boolish(value.at);
-        if('timestamp' in value) return boolish(value.timestamp);
-      }
-      return !!value;
-    };
-    const mergeRole=function(map,role,value){
-      const key=canonicalRole(role);
-      if(!key) return;
-      const bool=boolish(value);
-      if(!(key in map)) map[key]=bool;
-      else map[key]=map[key]||bool;
-    };
-    const collectSource=function(source,userSet,roleMap){
-      if(source===undefined||source===null) return;
-      if(Array.isArray(source)){
-        source.forEach(item=>collectSource(item,userSet,roleMap));
-        return;
-      }
-      if(typeof source==='object'){
-        if(source){
-          if('role' in source && source.role!==undefined && 'value' in source) mergeRole(roleMap,source.role,source.value);
-          if(source.roles && typeof source.roles==='object') Object.entries(source.roles).forEach(([k,v])=>mergeRole(roleMap,k,v));
-          if(source.byRole && typeof source.byRole==='object') Object.entries(source.byRole).forEach(([k,v])=>mergeRole(roleMap,k,v));
-          if(source.read_roles && typeof source.read_roles==='object') Object.entries(source.read_roles).forEach(([k,v])=>mergeRole(roleMap,k,v));
-          if(source.readRoles && typeof source.readRoles==='object') Object.entries(source.readRoles).forEach(([k,v])=>mergeRole(roleMap,k,v));
-          if(source.read_status && typeof source.read_status==='object') Object.entries(source.read_status).forEach(([k,v])=>mergeRole(roleMap,k,v));
-          if(source.readStatus && typeof source.readStatus==='object') Object.entries(source.readStatus).forEach(([k,v])=>mergeRole(roleMap,k,v));
-          if(source.status && typeof source.status==='object') Object.entries(source.status).forEach(([k,v])=>mergeRole(roleMap,k,v));
-          if(source.client!==undefined) mergeRole(roleMap,'client',source.client);
-          if(source.customer!==undefined) mergeRole(roleMap,'client',source.customer);
-          if(source.pm!==undefined) mergeRole(roleMap,'pm',source.pm);
-          if(source.project_manager!==undefined) mergeRole(roleMap,'pm',source.project_manager);
-          if(source.manager!==undefined) mergeRole(roleMap,'pm',source.manager);
-          if(source.admin!==undefined) mergeRole(roleMap,'admin',source.admin);
-          if(source.administrator!==undefined) mergeRole(roleMap,'admin',source.administrator);
-          if('id' in source) collectSource(source.id,userSet,roleMap);
-          if('user_id' in source) collectSource(source.user_id,userSet,roleMap);
-          if('user' in source) collectSource(source.user,userSet,roleMap);
-          if('users' in source) collectSource(source.users,userSet,roleMap);
-          if('user_ids' in source) collectSource(source.user_ids,userSet,roleMap);
-          if('ids' in source) collectSource(source.ids,userSet,roleMap);
-          if('readers' in source) collectSource(source.readers,userSet,roleMap);
-          if('entries' in source) collectSource(source.entries,userSet,roleMap);
-          if('list' in source) collectSource(source.list,userSet,roleMap);
-          if('byUser' in source) collectSource(source.byUser,userSet,roleMap);
-          Object.keys(source).forEach(key=>{ if(/^\d+$/.test(key)) collectSource(parseInt(key,10),userSet,roleMap); });
-        }
-        return;
-      }
-      const num=Number(source);
-      if(Number.isFinite(num) && num>0) userSet.add(num);
-    };
-    const directRoleKeys={
-      client:['client_read','read_client','client_seen','seen_client','client_read_at','client_seen_at','read_by_client','clientRead','readClient','clientViewed','client_viewed','client_seenAt','seen_by_client','client_has_read','clientReadAt'],
-      pm:['pm_read','read_pm','pm_seen','seen_pm','pm_read_at','pm_seen_at','read_by_pm','pmRead','readPm','pmViewed','pm_viewed','pm_seenAt','seen_by_pm','project_manager_read','read_project_manager','project_manager_seen','seen_project_manager','project_manager_read_at','project_manager_seen_at','manager_read','read_manager','manager_seen','seen_manager'],
-      admin:['admin_read','read_admin','admin_seen','seen_admin','admin_read_at','admin_seen_at','read_by_admin','adminRead','readAdmin','adminViewed','admin_viewed','admin_seenAt','seen_by_admin','administrator_read','read_administrator','administrator_seen','seen_administrator']
-    };
-    return function(data,fallbackProject){
-      const s=(data&&typeof data==='object')?data:{};
-      const p=Number(fd(s.project,s.project_id,fallbackProject,0))||0;
-      const type=String(fd(s.type,s.content_type,'text')||'text');
-      const msg=String(fd(s.message,s.content,'')||'');
-      const user=Number(fd(s.user,s.user_id,0))||0;
-      const display=String(fd(s.user_display,s.userDisplay,s.user_name,s.username,user?('User '+user):'User'));
-      let role=(s.role||'').toString().toLowerCase();
-      if(!roles.has(role)) role=(type==='system')?'sys':'other';
-      const at=toISO(fd(s.at,s.published_at,s.created_at,null));
-      const result=Object.assign({},s,{type:type,message:msg,project:p,user:user,user_display:display,role:role,at:at});
-      const readUsers=new Set();
-      const roleFlags={};
-      collectSource(s.reads,readUsers,roleFlags);
-      collectSource(s.read_receipts,readUsers,roleFlags);
-      collectSource(s.readReceipts,readUsers,roleFlags);
-      collectSource(s.read_status,readUsers,roleFlags);
-      collectSource(s.readStatus,readUsers,roleFlags);
-      collectSource(s.readBy,readUsers,roleFlags);
-      collectSource(s.read_by,readUsers,roleFlags);
-      collectSource(s.readers,readUsers,roleFlags);
-      collectSource(s.receipts,readUsers,roleFlags);
-      collectSource(s.seen_by,readUsers,roleFlags);
-      collectSource(s.seenBy,readUsers,roleFlags);
-      collectSource(s.seen_status,readUsers,roleFlags);
-      ['read_by','readBy','readers','read_receipts','readReceipts','read_entries','readEntries','seen_by','seenBy'].forEach(key=>{ if(key in s) collectSource(s[key],readUsers,roleFlags); });
-      Object.entries(directRoleKeys).forEach(([roleKey,keys])=>{ keys.forEach(key=>{ if(Object.prototype.hasOwnProperty.call(s,key)) mergeRole(roleFlags,roleKey,s[key]); }); });
-      const normalizedReads={ users:Array.from(readUsers), roles:{} };
-      Object.entries(roleFlags).forEach(([k,v])=>{ normalizedReads.roles[k]=!!v; });
-      if(s.reads && typeof s.reads==='object' && !Array.isArray(s.reads)) normalizedReads.raw=s.reads;
-      result.reads=normalizedReads;
-      return result;
-    };
-  };
+  // (kept identical to chat window)
+  window.ELXAO_CHAT_BUILD_NORMALIZER=function(){ return (window.ELXAO_CHAT_NORMALIZE||function(d){return d;}); };
 }
 if(!window.ELXAO_CHAT_NORMALIZE){
-  window.ELXAO_CHAT_NORMALIZE=window.ELXAO_CHAT_BUILD_NORMALIZER();
+  // fallback guard
+  window.ELXAO_CHAT_NORMALIZE=function(d){ return d; };
 }
 if(!window.ELXAO_CHAT_RESOLVE_PROJECT_ID){
-  window.ELXAO_CHAT_RESOLVE_PROJECT_ID=function(){
-    const args=Array.prototype.slice.call(arguments);
-    const parseValue=function(value){
-      if(value===undefined||value===null) return 0;
-      if(typeof value==='number' && isFinite(value)){ const num=value<0?-value:value; return num>0?Math.floor(num):0; }
-      if(typeof value==='string'){
-        const trimmed=value.trim();
-        if(!trimmed) return 0;
-        if(/^-?\d+$/.test(trimmed)) return Math.abs(parseInt(trimmed,10));
-        const match=trimmed.match(/(-?\d+)/);
-        return match?Math.abs(parseInt(match[1],10)):0;
-      }
-      if(Array.isArray(value)){
-        for(let i=0;i<value.length;i++){ const result=parseValue(value[i]); if(result) return result; }
-        return 0;
-      }
-      if(typeof value==='object'){
-        const keys=['project','project_id','projectId','projectID','id','room','room_id','roomId'];
-        for(let i=0;i<keys.length;i++){
-          const key=keys[i];
-          if(Object.prototype.hasOwnProperty.call(value,key)){
-            const result=parseValue(value[key]);
-            if(result) return result;
-          }
-        }
-      }
-      return 0;
-    };
-    for(let i=0;i<args.length;i++){
-      const resolved=parseValue(args[i]);
-      if(resolved) return resolved;
-    }
-    return 0;
-  };
+  window.ELXAO_CHAT_RESOLVE_PROJECT_ID=function(){ return 0; };
 }
 if(!window.ELXAO_ABLY){
-  window.ELXAO_ABLY={client:null,clientPromise:null,libraryPromise:null,channels:new Map()};
-  window.ELXAO_ABLY.loadLibrary=function(){
-    const st=window.ELXAO_ABLY;
-    if(st.libraryPromise) return st.libraryPromise;
-    if(window.Ably&&window.Ably.Realtime&&window.Ably.Realtime.Promise){ st.libraryPromise=Promise.resolve(); return st.libraryPromise; }
-    st.libraryPromise=new Promise((res,rej)=>{
-      const ex=document.querySelector('script[data-elxao-ably]');
-      if(ex){ ex.addEventListener('load',()=>res(),{once:true}); ex.addEventListener('error',()=>rej(new Error('Ably load failed')),{once:true}); return; }
-      const s=document.createElement('script'); s.src='https://cdn.ably.io/lib/ably.min-1.js'; s.async=true; s.setAttribute('data-elxao-ably','1');
-      s.onload=()=>res(); s.onerror=()=>rej(new Error('Ably load failed')); document.head.appendChild(s);
-    });
-    return st.libraryPromise;
-  };
-  window.ELXAO_ABLY.ensureClient=function(tokenDetails){
-    const st=window.ELXAO_ABLY;
-    if(st.clientPromise){
-      return st.clientPromise.then(client=>{
-        if(tokenDetails){ return client.auth.authorize(null,{tokenDetails}).then(()=>client); }
-        return client;
-      });
-    }
-    st.clientPromise=st.loadLibrary().then(()=>{
-      if(!window.Ably||!window.Ably.Realtime||!window.Ably.Realtime.Promise) throw new Error('Ably unavailable');
-      st.client=new window.Ably.Realtime.Promise({tokenDetails});
-      return st.client;
-    }).catch(err=>{ st.client=null; st.clientPromise=null; throw err; });
-    return st.clientPromise;
-  };
-  window.ELXAO_ABLY.registerChannel=function(client,channelName,project,onMessage){
-    if(!channelName) return function(){};
-    const st=window.ELXAO_ABLY; const map=st.channels;
-    let entry=map.get(channelName);
-    if(!entry){ entry={refCount:0,handler:null,channel:client.channels.get(channelName),projectId:project,callbacks:new Set()}; map.set(channelName,entry); }
-    else {
-      if(!entry.channel) entry.channel=client.channels.get(channelName);
-      if(project && !entry.projectId) entry.projectId=project;
-      if(!entry.callbacks) entry.callbacks=new Set();
-    }
-    if(onMessage && typeof onMessage==='function') entry.callbacks.add(onMessage);
-    entry.refCount++;
-    if(!entry.handler){
-      entry.handler=function(msg){
-        let data=(msg&&msg.data)?msg.data:{};
-        if(typeof data==='string'){
-          const trimmed=data.trim();
-          if(trimmed){
-            try{ data=JSON.parse(trimmed); }
-            catch(e){ data={message:data}; }
-          } else {
-            data={};
-          }
-        }
-        const resolve=window.ELXAO_CHAT_RESOLVE_PROJECT_ID;
-        const hintedProject=resolve(
-          data && data.project,
-          data && data.project_id,
-          data && data.projectId,
-          data && data.projectID,
-          entry && entry.projectId,
-          project
-        );
-        const projectId=hintedProject || resolve(entry && entry.projectId, project);
-        let payload=data;
-        if(payload && typeof payload==='object' && !Array.isArray(payload)){
-          if(projectId && resolve(payload.project)!==projectId){
-            payload=Object.assign({},payload,{project:projectId});
-          } else if(projectId && !('project' in payload)){
-            payload=Object.assign({},payload,{project:projectId});
-          }
-        }
-        const normalizer=window.ELXAO_CHAT_NORMALIZE||null;
-        const normalized=normalizer?normalizer(payload,projectId):payload;
-        if(entry.callbacks && entry.callbacks.size){
-          entry.callbacks.forEach(function(cb){ try{ cb(normalized,msg,{projectId:projectId,channel:channelName}); }catch(e){} });
-        }
-        window.ELXAO_CHAT_BUS.emit({project:projectId,payload:normalized});
-        if(projectId){
-          const bumpAt=(normalized&&normalized.at)|| (payload&&payload.at) || data.at || data.published_at || Date.now();
-          window.dispatchEvent(new CustomEvent('elxao:room-bump',{detail:{projectId:projectId,at:bumpAt}}));
-        }
-      };
-      entry.channel.subscribe(entry.handler);
-    }
-    entry.channel.attach().catch(()=>{});
-    return function(){
-      if(onMessage && entry.callbacks) entry.callbacks.delete(onMessage);
-      entry.refCount--;
-      if(entry.refCount<=0){ if(entry.channel&&entry.handler) entry.channel.unsubscribe(entry.handler); map.delete(channelName); }
-    };
+  window.ELXAO_ABLY={client:null,clientPromise:null,libraryPromise:null,channels:new Map(),
+    loadLibrary:function(){ return Promise.resolve(); },
+    ensureClient:function(){ return Promise.reject(new Error('Ably unavailable')); },
+    registerChannel:function(){ return function(){}; }
   };
 }
-/* ---- end shared helpers ---- */
+/* ---- end helpers ---- */
 
 function registerCleanup(fn){ if(typeof fn==='function') cleanupFns.push(fn); }
 function runCleanup(){ while(cleanupFns.length){ const fn=cleanupFns.pop(); try{ fn(); }catch(e){} } }
@@ -2050,7 +1809,7 @@ function loadRoom(room){
 /* attach click listeners */
 rooms.forEach(function(room){ room.addEventListener('click',function(){ loadRoom(room); }); });
 
-/* Ably subscribe for bumps */
+/* subscribe to bump rooms on any chat traffic */
 function subscribeInbox(){
   if(!rooms.length || !rest) return;
   const params=[]; const seen=new Set();
@@ -2060,18 +1819,22 @@ function subscribeInbox(){
     .then(r=>{ if(!r.ok) throw new Error(''+r.status); return r.json(); })
     .then(token=>{
       if(!token || token.error) return;
+      if(!window.ELXAO_ABLY.ensureClient) return;
       return window.ELXAO_ABLY.ensureClient(token).then(function(client){
         const seenChannels=new Set();
         rooms.forEach(function(room){
           const channelName=room.getAttribute('data-room'); if(!channelName || seenChannels.has(channelName)) return;
-          seenChannels.add(channelName); if(channelCleanups.has(channelName)) return;
+          seenChannels.add(channelName);
           const pid=room.getAttribute('data-project'); const projectId=pid?parseInt(pid,10):0;
-          const unsubscribe=window.ELXAO_ABLY.registerChannel(client,channelName,projectId);
+          const unsubscribe=window.ELXAO_ABLY.registerChannel(client,channelName,projectId,function(payload){
+            const bumpAt=payload&&payload.at ? payload.at : Date.now();
+            bumpRoom(projectId,bumpAt);
+          });
           if(typeof unsubscribe==='function'){ channelCleanups.set(channelName,unsubscribe); }
         });
       });
     })
-    .catch(err=>{ console.warn('ELXAO inbox realtime unavailable',err); });
+    .catch(()=>{ /* ignore */ });
 }
 
 function onChatEvent(ev){
