@@ -666,6 +666,7 @@ let readSyncPending=false;
 let readSyncInFlight=false;
 let isRenderingHistory=false;
 const currentReadTimes={client:'',pm:'',admin:''};
+const DEBUG=false;
 
 /* ---------- Shared helpers (guarded singletons) ---------- */
 if(!window.ELXAO_CHAT_BUS){
@@ -917,7 +918,16 @@ if(!window.ELXAO_ABLY){
     entry.refCount++;
     if(!entry.handler){
       entry.handler=function(msg){
-        const data=(msg&&msg.data)?msg.data:{};
+        let data=(msg&&msg.data)?msg.data:{};
+        if(typeof data==='string'){
+          const trimmed=data.trim();
+          if(trimmed){
+            try{ data=JSON.parse(trimmed); }
+            catch(e){ data={message:data}; }
+          } else {
+            data={};
+          }
+        }
         const resolve=window.ELXAO_CHAT_RESOLVE_PROJECT_ID;
         const hintedProject=resolve(
           data && typeof data==='object' ? data.project : (data&&data.project),
@@ -942,11 +952,17 @@ if(!window.ELXAO_ABLY){
         if(entry.callbacks && entry.callbacks.size){
           entry.callbacks.forEach(function(cb){ try{ cb(normalized,msg,extras); }catch(e){} });
         }
-        window.ELXAO_CHAT_BROADCAST(projectId,payload,extras);
+        window.ELXAO_CHAT_BROADCAST(projectId,normalized,extras);
       };
-      entry.channel.subscribe(entry.handler);
+      if(entry.channel){
+        entry.channel.attach()
+          .then(()=>entry.channel.subscribe(entry.handler))
+          .catch(()=>{});
+      }
     }
-    entry.channel.attach().catch(()=>{});
+    else if(entry.channel){
+      entry.channel.attach().catch(()=>{});
+    }
     return function(){
       if(onMessage && entry.callbacks) entry.callbacks.delete(onMessage);
       entry.refCount--;
@@ -1269,6 +1285,7 @@ function handleChatPayload(payload){
 }
 
 function handleRealtimePayload(payload){
+  if(DEBUG) console.log('[ELXAO realtime] incoming',payload);
   if(!payload) return;
   const data=window.ELXAO_CHAT_NORMALIZE(payload,projectId);
   if(!data) return;
