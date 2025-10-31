@@ -2,7 +2,7 @@
 /*
 Plugin Name: ELXAO Chat
 Description: Per-project chat storage (MySQL), REST API for send/history, Ably realtime fan-out, and inbox ordering via latest_message_at (ACF). Colors by ROLE: client, pm, admin.
-Version: 1.43.0
+Version: 1.44.0
 Author: ELXAO
 */
 
@@ -103,6 +103,71 @@ function elxao_chat_room_id($pid){
     return $rid?:'project_'.$pid;
 }
 
+function elxao_chat_project_post_type(){
+    return apply_filters('elxao_chat_project_post_type','project');
+}
+
+function elxao_chat_collect_rooms_for_user($uid){
+    if(!$uid) return [];
+
+    $args=[
+        'post_type'=>elxao_chat_project_post_type(),
+        'post_status'=>['publish','private'],
+        'posts_per_page'=>-1,
+        'meta_key'=>'latest_message_at',
+        'orderby'=>'meta_value',
+        'order'=>'DESC',
+        'fields'=>'ids',
+        'no_found_rows'=>true,
+        'update_post_meta_cache'=>false,
+        'update_post_term_cache'=>false,
+    ];
+    $args=apply_filters('elxao_chat_inbox_query_args',$args,$uid);
+
+    $query=new WP_Query($args);
+    $ids=$query->posts;
+    wp_reset_postdata();
+
+    $rooms=[];
+    foreach($ids as $pid){
+        $pid=(int)$pid;
+        if(!elxao_chat_user_can_access_project($pid,$uid)) continue;
+
+        $latest=function_exists('get_field')?get_field('latest_message_at',$pid):get_post_meta($pid,'latest_message_at',true);
+        if($latest instanceof DateTimeInterface){
+            $latest=$latest->format('Y-m-d H:i:s');
+        }
+        if(!$latest){
+            $fallback=get_post_meta($pid,'latest_message_at',true);
+            $latest=$fallback?:'';
+        }
+        if(!$latest){
+            $latest=get_post_modified_time('Y-m-d H:i:s',true,$pid);
+        }
+        $timestamp=$latest?strtotime($latest):0;
+
+        $rooms[]=[
+            'id'=>$pid,
+            'title'=>get_the_title($pid),
+            'latest'=>$latest,
+            'timestamp'=>$timestamp?:0,
+        ];
+    }
+
+    usort($rooms,function($a,$b){
+        return ($b['timestamp']<=>$a['timestamp']);
+    });
+
+    return $rooms;
+}
+
+function elxao_chat_format_activity($datetime){
+    if(!$datetime) return '';
+    $ts=strtotime($datetime);
+    if(!$ts) return '';
+    return date_i18n('M j, H:i',$ts);
+}
+
 /* ===========================================================
    REST API
    =========================================================== */
@@ -117,6 +182,10 @@ add_action('rest_api_init',function(){
     ]);
     register_rest_route('elxao/v1','/chat-token',[
         'methods'=>'GET','callback'=>'elxao_chat_rest_token',
+        'permission_callback'=>fn()=>is_user_logged_in()
+    ]);
+    register_rest_route('elxao/v1','/chat-window',[
+        'methods'=>'GET','callback'=>'elxao_chat_rest_window',
         'permission_callback'=>fn()=>is_user_logged_in()
     ]);
 });
@@ -206,6 +275,16 @@ function elxao_chat_rest_token(WP_REST_Request $r){
     $resp=curl_exec($ch); $code=curl_getinfo($ch,CURLINFO_HTTP_CODE); curl_close($ch);
     if($code<200||$code>=300) return new WP_Error('token_fail','Token error',['status'=>500]);
     return new WP_REST_Response(json_decode($resp,true),200);
+}
+
+function elxao_chat_rest_window(WP_REST_Request $r){
+    $pid=(int)$r['project_id'];
+    $uid=get_current_user_id();
+    if(!elxao_chat_user_can_access_project($pid,$uid))
+        return new WP_Error('forbidden','Not allowed',['status'=>403]);
+
+    $html=elxao_chat_render_window($pid);
+    return new WP_REST_Response(['html'=>$html],200);
 }
 
 /* ===========================================================
@@ -370,13 +449,140 @@ ta.addEventListener('keydown', function(e){
 return ob_get_clean();
 }
 
+function elxao_chat_render_inbox(){
+    if(!is_user_logged_in()) return '<div>Please log in.</div>';
+
+    $uid=get_current_user_id();
+    $rooms=elxao_chat_collect_rooms_for_user($uid);
+    $rest_nonce=wp_create_nonce('wp_rest');
+    $rest_base=rest_url();
+    $container_id='elxao-chat-inbox-'.wp_rand(1000,999999);
+
+    ob_start();
+?>
+<div id="<?php echo esc_attr($container_id); ?>"
+     class="elxao-chat-inbox"
+     data-rest="<?php echo esc_url($rest_base); ?>"
+     data-nonce="<?php echo esc_attr($rest_nonce); ?>">
+  <div class="inbox-shell">
+    <div class="room-list" role="navigation" aria-label="Chat rooms">
+      <?php if($rooms){ foreach($rooms as $idx=>$room){
+        $label=sprintf('#%d · %s',$room['id'],$room['title']);
+        $activity=elxao_chat_format_activity($room['latest']);
+      ?>
+      <button type="button"
+              class="room<?php echo $idx===0?' active':''; ?>"
+              data-project="<?php echo (int)$room['id']; ?>">
+        <span class="label"><?php echo esc_html($label); ?></span>
+        <span class="meta"><?php echo esc_html($activity?:'—'); ?></span>
+      </button>
+      <?php }} else { ?>
+      <div class="empty">No chat rooms available.</div>
+      <?php } ?>
+    </div>
+    <div class="chat-pane">
+      <?php if($rooms){ ?>
+      <div class="placeholder">Select a room to load chat.</div>
+      <?php } else { ?>
+      <div class="placeholder">You do not have access to any chat rooms.</div>
+      <?php } ?>
+    </div>
+  </div>
+</div>
+<style>
+#<?php echo esc_attr($container_id); ?>{display:flex;flex-direction:column;font:14px/1.45 system-ui;color:#f3f4f6}
+#<?php echo esc_attr($container_id); ?> .inbox-shell{display:flex;gap:0;border:1px solid #4b5563;border-radius:12px;overflow:hidden;min-height:460px;background:#111827}
+#<?php echo esc_attr($container_id); ?> .room-list{width:220px;max-width:260px;border-right:1px solid #374151;background:#1f2937;display:flex;flex-direction:column}
+#<?php echo esc_attr($container_id); ?> .room-list .room{all:unset;cursor:pointer;padding:12px 14px;border-bottom:1px solid rgba(255,255,255,0.05);display:flex;flex-direction:column;gap:4px;color:inherit}
+#<?php echo esc_attr($container_id); ?> .room-list .room:focus-visible{outline:2px solid rgba(96,165,250,0.9);outline-offset:-2px}
+#<?php echo esc_attr($container_id); ?> .room-list .room:hover{background:rgba(148,163,184,0.12)}
+#<?php echo esc_attr($container_id); ?> .room-list .room.active{background:rgba(96,165,250,0.18)}
+#<?php echo esc_attr($container_id); ?> .room-list .label{font-weight:600}
+#<?php echo esc_attr($container_id); ?> .room-list .meta{font-size:12px;color:#9ca3af}
+#<?php echo esc_attr($container_id); ?> .room-list .empty{padding:20px;color:#9ca3af;font-style:italic}
+#<?php echo esc_attr($container_id); ?> .chat-pane{flex:1;min-width:0;background:transparent;display:flex;align-items:center;justify-content:center;padding:20px}
+#<?php echo esc_attr($container_id); ?> .chat-pane .placeholder{color:#9ca3af;font-style:italic;text-align:center}
+#<?php echo esc_attr($container_id); ?> .chat-pane .placeholder.error{color:#f87171;font-style:normal}
+@media (max-width: 900px){
+  #<?php echo esc_attr($container_id); ?> .inbox-shell{flex-direction:column}
+  #<?php echo esc_attr($container_id); ?> .room-list{width:100%;max-width:none;display:flex;flex-direction:row;overflow-x:auto}
+  #<?php echo esc_attr($container_id); ?> .room-list .room{flex:1;min-width:200px;border-bottom:none;border-right:1px solid rgba(255,255,255,0.05)}
+  #<?php echo esc_attr($container_id); ?> .chat-pane{min-height:360px}
+}
+</style>
+<script>
+(function(){
+const root=document.getElementById('<?php echo esc_js($container_id); ?>');
+if(!root) return;
+const rest=root.dataset.rest||'';
+const nonce=root.dataset.nonce||'';
+const chat=root.querySelector('.chat-pane');
+const rooms=Array.from(root.querySelectorAll('.room'));
+const headers={'X-WP-Nonce':nonce,'Accept':'application/json'};
+let active=null;
+
+function renderHTML(html){
+  if(!chat) return;
+  chat.innerHTML='';
+  if(!html){
+    chat.innerHTML='<div class="placeholder error">Unable to load chat.</div>';
+    return;
+  }
+  const tmp=document.createElement('div');
+  tmp.innerHTML=html;
+  while(tmp.firstChild){
+    const node=tmp.firstChild;
+    tmp.removeChild(node);
+    if(node.nodeName==='SCRIPT'){
+      const s=document.createElement('script');
+      if(node.src) s.src=node.src;
+      s.textContent=node.textContent;
+      chat.appendChild(s);
+    } else {
+      chat.appendChild(node);
+    }
+  }
+}
+
+function loadRoom(room){
+  if(!room||room===active) return;
+  if(active) active.classList.remove('active');
+  active=room;
+  room.classList.add('active');
+  if(chat) chat.innerHTML='<div class="placeholder">Loading…</div>';
+  const pid=room.getAttribute('data-project');
+  if(!pid) return;
+  fetch(rest+'elxao/v1/chat-window?project_id='+encodeURIComponent(pid),{
+    credentials:'same-origin',
+    headers:headers
+  }).then(function(r){
+    if(!r.ok) throw new Error(''+r.status);
+    return r.json();
+  }).then(function(data){
+    const html=(data&&typeof data==='object'&&'html' in data)?data.html:'';
+    renderHTML(html);
+  }).catch(function(){
+    if(chat) chat.innerHTML='<div class="placeholder error">Unable to load chat.</div>';
+  });
+}
+
+rooms.forEach(function(room){
+  room.addEventListener('click',function(){ loadRoom(room); });
+});
+
+if(rooms.length){
+  loadRoom(rooms[0]);
+}
+})();
+</script>
+<?php
+    return ob_get_clean();
+}
+
 add_shortcode('elxao_chat_card',function($a){
     $a=shortcode_atts(['project_id'=>0],$a,'elxao_chat_card');
     $pid=(int)$a['project_id']; if(!$pid) $pid=(int)get_the_ID();
     return elxao_chat_render_window($pid);
 });
-add_shortcode('elxao_chat_window',function($a){
-    $a=shortcode_atts(['project_id'=>0],$a,'elxao_chat_window');
-    return elxao_chat_render_window((int)$a['project_id']);
-});
+add_shortcode('elxao_chat_inbox','elxao_chat_render_inbox');
 
