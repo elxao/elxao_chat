@@ -20,6 +20,7 @@ if ( ! defined('ELXAO_CHAT_COLOR_READ_UNREAD') )      define('ELXAO_CHAT_COLOR_R
 if ( ! defined('ELXAO_CHAT_COLOR_READ_ALL') )         define('ELXAO_CHAT_COLOR_READ_ALL',         ELXAO_CHAT_COLOR_CLIENT); // fully read indicator
 if ( ! defined('ELXAO_CHAT_COLOR_READ_PM_ONLY') )     define('ELXAO_CHAT_COLOR_READ_PM_ONLY',     '#f472b6'); // admin message read by PM only
 if ( ! defined('ELXAO_CHAT_COLOR_READ_CLIENT_ONLY') ) define('ELXAO_CHAT_COLOR_READ_CLIENT_ONLY', ELXAO_CHAT_COLOR_ADMIN); // admin message read by client only
+if ( ! defined('ELXAO_CHAT_READ_META_KEY') ) define('ELXAO_CHAT_READ_META_KEY','_elxao_chat_last_reads');
 
 /* ===========================================================
    ABLY CONFIG (set in wp-config.php if you want)
@@ -90,6 +91,117 @@ function elxao_chat_role_for_user($pid,$uid){
     if ($ids['client'] && $uid === $ids['client']) return 'client';
     if ($ids['pm'] && $uid === $ids['pm']) return 'pm';
     return 'other';
+}
+
+function elxao_chat_normalize_datetime_value($value){
+    if ($value instanceof DateTimeInterface) return $value->format('Y-m-d H:i:s');
+    if (is_numeric($value)) {
+        $timestamp = (int)$value;
+        if ($timestamp <= 0) return '';
+        return wp_date('Y-m-d H:i:s',$timestamp);
+    }
+    if (is_string($value)) {
+        $str = trim($value);
+        if ($str === '') return '';
+        $timestamp = strtotime($str);
+        if (!$timestamp) return '';
+        return wp_date('Y-m-d H:i:s',$timestamp);
+    }
+    return '';
+}
+
+function elxao_chat_parse_datetime($value){
+    if ($value instanceof DateTimeInterface) return $value->getTimestamp();
+    if (is_numeric($value)) return (int)$value;
+    if (is_string($value)) {
+        $str = trim($value);
+        if ($str === '') return 0;
+        $timestamp = strtotime($str);
+        return $timestamp ? (int)$timestamp : 0;
+    }
+    return 0;
+}
+
+function elxao_chat_get_last_reads($pid){
+    $stored = get_post_meta($pid,ELXAO_CHAT_READ_META_KEY,true);
+    $result = ['client'=>'','pm'=>'','admin'=>''];
+    if (is_array($stored)) {
+        foreach ($result as $role => $_) {
+            if (!empty($stored[$role])) {
+                $normalized = elxao_chat_normalize_datetime_value($stored[$role]);
+                if ($normalized) $result[$role] = $normalized;
+            }
+        }
+    }
+    return $result;
+}
+
+function elxao_chat_update_last_read($pid,$role,$timestamp=null){
+    if (!in_array($role,['client','pm','admin'],true)) return false;
+    $normalized = elxao_chat_normalize_datetime_value(
+        $timestamp === null ? current_time('timestamp') : $timestamp
+    );
+    if (!$normalized) return false;
+
+    $reads = elxao_chat_get_last_reads($pid);
+    $current = $reads[$role] ?? '';
+    $current_ts = $current ? elxao_chat_parse_datetime($current) : 0;
+    $new_ts = elxao_chat_parse_datetime($normalized);
+    if ($current_ts && $new_ts && $current_ts >= $new_ts) return false;
+
+    $reads[$role] = $normalized;
+    update_post_meta($pid,ELXAO_CHAT_READ_META_KEY,$reads);
+    return $reads;
+}
+
+function elxao_chat_build_message_read_status($pid,$message_role,$published_at,?array $reads=null,?array $participants=null){
+    if ($reads === null) $reads = elxao_chat_get_last_reads($pid);
+    if ($participants === null) $participants = elxao_chat_get_client_pm_ids($pid);
+
+    $published_ts = elxao_chat_parse_datetime($published_at);
+    $client_ts    = elxao_chat_parse_datetime($reads['client'] ?? '');
+    $pm_ts        = elxao_chat_parse_datetime($reads['pm'] ?? '');
+    $admin_ts     = elxao_chat_parse_datetime($reads['admin'] ?? '');
+
+    $status = ['client'=>false,'pm'=>false,'admin'=>false];
+    if ($message_role === 'client') $status['client'] = true;
+    if ($message_role === 'pm')     $status['pm']     = true;
+    if ($message_role === 'admin')  $status['admin']  = true;
+
+    if (empty($participants['client'])) $status['client'] = true;
+    if (empty($participants['pm']))     $status['pm']     = true;
+
+    if ($published_ts) {
+        if ($client_ts && $client_ts >= $published_ts) $status['client'] = true;
+        if ($pm_ts && $pm_ts >= $published_ts)         $status['pm']     = true;
+        if ($admin_ts && $admin_ts >= $published_ts)   $status['admin']  = true;
+    }
+
+    return $status;
+}
+
+function elxao_chat_publish_read_receipt($pid,array $reads,$user_id=0){
+    $role_flags = [
+        'client' => elxao_chat_parse_datetime($reads['client'] ?? '') > 0,
+        'pm'     => elxao_chat_parse_datetime($reads['pm'] ?? '') > 0,
+        'admin'  => elxao_chat_parse_datetime($reads['admin'] ?? '') > 0,
+    ];
+
+    elxao_chat_publish_to_ably(elxao_chat_room_id($pid),[
+        'name' => 'read_receipt',
+        'data' => [
+            'type'        => 'read_receipt',
+            'project'     => $pid,
+            'user'        => $user_id,
+            'read_times'  => $reads,
+            'read_status' => $role_flags,
+            'reads'       => [
+                'roles' => $role_flags,
+                'times' => $reads,
+            ],
+            'at'          => current_time('mysql'),
+        ],
+    ]);
 }
 
 /* ===========================================================
@@ -184,6 +296,10 @@ add_action('rest_api_init',function(){
         'methods'=>'GET','callback'=>'elxao_chat_rest_history',
         'permission_callback'=>fn()=>is_user_logged_in()
     ]);
+    register_rest_route('elxao/v1','/messages/read',[
+        'methods'=>'POST','callback'=>'elxao_chat_rest_mark_read',
+        'permission_callback'=>fn()=>is_user_logged_in()
+    ]);
     register_rest_route('elxao/v1','/chat-token',[
         'methods'=>'GET','callback'=>'elxao_chat_rest_token',
         'permission_callback'=>fn()=>is_user_logged_in()
@@ -266,6 +382,11 @@ function elxao_chat_rest_send(WP_REST_Request $r){
     $display = $user ? $user->display_name : ('User '.$uid);
     $role    = elxao_chat_role_for_user($pid,$uid);
 
+    $participants = elxao_chat_get_client_pm_ids($pid);
+    $reads = elxao_chat_update_last_read($pid,$role,$now);
+    if (!$reads) $reads = elxao_chat_get_last_reads($pid);
+    $read_status = elxao_chat_build_message_read_status($pid,$role,$now,$reads,$participants);
+
     elxao_chat_publish_to_ably(elxao_chat_room_id($pid),[
         'name'=>'text',
         'data'=>[
@@ -275,7 +396,13 @@ function elxao_chat_rest_send(WP_REST_Request $r){
             'user'=>$uid,
             'user_display'=>$display,
             'role'=>$role,
-            'at'=>$now
+            'at'=>$now,
+            'read_status'=>$read_status,
+            'read_times'=>$reads,
+            'reads'=>[
+                'roles'=>$read_status,
+                'times'=>$reads,
+            ],
         ]
     ]);
     return new WP_REST_Response(['ok'=>true,'project_id'=>$pid,'at'=>$now],200);
@@ -298,7 +425,84 @@ function elxao_chat_rest_history(WP_REST_Request $r){
         $row['user_id']=(int)$row['user_id'];
         $row['role']=elxao_chat_role_for_user($pid,(int)$row['user_id']); // client | pm | admin | other
     }
-    return new WP_REST_Response(['items'=>$rows],200);
+    unset($row);
+
+    $role = elxao_chat_role_for_user($pid,$uid);
+    $participants = elxao_chat_get_client_pm_ids($pid);
+    $reads = elxao_chat_get_last_reads($pid);
+    $updated_reads = false;
+
+    if(in_array($role,['client','pm','admin'],true)){
+        $maybe = elxao_chat_update_last_read($pid,$role,current_time('timestamp'));
+        if($maybe){
+            $reads = $maybe;
+            $updated_reads = true;
+        }
+    }
+
+    foreach($rows as &$row){
+        $status = elxao_chat_build_message_read_status($pid,$row['role'],$row['published_at'],$reads,$participants);
+        $row['read_status']=$status;
+        $row['reads']=[
+            'roles'=>$status,
+            'times'=>$reads,
+        ];
+    }
+    unset($row);
+
+    if($updated_reads){
+        elxao_chat_publish_read_receipt($pid,$reads,$uid);
+    }
+
+    return new WP_REST_Response([
+        'items'=>$rows,
+        'reads'=>$reads,
+        'role'=>$role,
+    ],200);
+}
+
+function elxao_chat_rest_mark_read(WP_REST_Request $r){
+    $pid=(int)$r['project_id'];
+    $uid=get_current_user_id();
+    if(!elxao_chat_user_can_access_project($pid,$uid))
+        return new WP_Error('forbidden','Not allowed',['status'=>403]);
+
+    $role = elxao_chat_role_for_user($pid,$uid);
+    $reads = elxao_chat_get_last_reads($pid);
+    $participants = elxao_chat_get_client_pm_ids($pid);
+    $updated = false;
+
+    if(in_array($role,['client','pm','admin'],true)){
+        $maybe = elxao_chat_update_last_read($pid,$role,current_time('timestamp'));
+        if($maybe){
+            $reads = $maybe;
+            $updated = true;
+        }
+    }
+
+    if($updated){
+        elxao_chat_publish_read_receipt($pid,$reads,$uid);
+    }
+
+    $role_flags = [
+        'client' => elxao_chat_parse_datetime($reads['client'] ?? '') > 0 || empty($participants['client']),
+        'pm'     => elxao_chat_parse_datetime($reads['pm'] ?? '') > 0 || empty($participants['pm']),
+        'admin'  => elxao_chat_parse_datetime($reads['admin'] ?? '') > 0,
+    ];
+
+    return new WP_REST_Response([
+        'project'=>$pid,
+        'role'=>$role,
+        'reads'=>[
+            'roles'=>$role_flags,
+            'times'=>$reads,
+        ],
+        'read_times'=>$reads,
+        'read_status'=>$role_flags,
+        'updated'=>$updated,
+        'type'=>'read_receipt',
+        'user'=>$uid,
+    ],200);
 }
 
 function elxao_chat_rest_token(WP_REST_Request $r){
@@ -457,6 +661,11 @@ const pmId=parseInt(root.dataset.pm,10)||0;
 const localEchoes=new Map();
 let realtimeCleanup=null;
 let busCleanup=null;
+let readSyncTimer=null;
+let readSyncPending=false;
+let readSyncInFlight=false;
+let isRenderingHistory=false;
+const currentReadTimes={client:'',pm:'',admin:''};
 
 /* ---------- Shared helpers (guarded singletons) ---------- */
 if(!window.ELXAO_CHAT_BUS){
@@ -610,8 +819,11 @@ if(!window.ELXAO_CHAT_BROADCAST){
     const detail=Object.assign({project:payload.project,payload:payload},(extras&&typeof extras==='object')?extras:{});
     window.ELXAO_CHAT_BUS.emit(detail);
     if(payload.project){
-      const bumpAt=payload.at||Date.now();
-      window.dispatchEvent(new CustomEvent('elxao:room-bump',{detail:{projectId:payload.project,at:bumpAt}}));
+      const payloadType=(payload.type||'').toString().toLowerCase();
+      if(payloadType!=='read_receipt'){
+        const bumpAt=payload.at||Date.now();
+        window.dispatchEvent(new CustomEvent('elxao:room-bump',{detail:{projectId:payload.project,at:bumpAt}}));
+      }
     }
     return payload;
   };
@@ -677,6 +889,96 @@ function createTextFragment(text){
     fragment.appendChild(document.createTextNode(part));
   });
   return fragment;
+}
+function extractReadTimes(source){
+  if(!source || typeof source!=='object') return null;
+  if(source.read_times && typeof source.read_times==='object') return source.read_times;
+  if(source.readTimes && typeof source.readTimes==='object') return source.readTimes;
+  if(source.reads && typeof source.reads==='object'){
+    if(source.reads.times && typeof source.reads.times==='object') return source.reads.times;
+    if('client' in source.reads || 'pm' in source.reads || 'admin' in source.reads) return source.reads;
+  }
+  return null;
+}
+function updateCurrentReadTimes(times){
+  if(!times || typeof times!=='object') return;
+  ['client','pm','admin'].forEach(function(role){
+    if(Object.prototype.hasOwnProperty.call(times,role)){
+      const value=times[role];
+      currentReadTimes[role]=(value!==undefined && value!==null)?value:'';
+    }
+  });
+}
+function parseReadTime(value){
+  if(value===undefined || value===null || value==='') return 0;
+  if(value instanceof Date) return value.getTime();
+  if(typeof value==='number'){
+    const num=value;
+    return num>1e12?num:Math.round(num*1000);
+  }
+  const str=String(value).trim();
+  if(!str) return 0;
+  if(/^-?\d+$/.test(str)){
+    const num=parseInt(str,10);
+    return str.length<=10?num*1000:num;
+  }
+  const normalized=str.replace(' ','T');
+  const date=new Date(normalized);
+  const ms=date.getTime();
+  return Number.isFinite(ms)?ms:0;
+}
+function buildStatusFromTimes(payload,times){
+  const status={client:false,pm:false,admin:false};
+  const role=(payload&&payload.role)||'other';
+  if(role==='client') status.client=true;
+  if(role==='pm') status.pm=true;
+  if(role==='admin') status.admin=true;
+  if(!clientId) status.client=true;
+  if(!pmId) status.pm=true;
+  const messageTime= parseReadTime(payload&&payload.at) || parseReadTime(payload&&payload.published_at) || parseReadTime(payload&&payload.created_at);
+  const pickTime=function(map,keys){
+    if(!map || typeof map!=='object') return undefined;
+    for(let i=0;i<keys.length;i++){
+      const key=keys[i];
+      if(Object.prototype.hasOwnProperty.call(map,key)) return map[key];
+    }
+    return undefined;
+  };
+  const clientValue=pickTime(times,['client','customer']);
+  const pmValue=pickTime(times,['pm','manager','project_manager']);
+  const adminValue=pickTime(times,['admin','administrator']);
+  const clientTime=parseReadTime(clientValue);
+  const pmTime=parseReadTime(pmValue);
+  const adminTime=parseReadTime(adminValue);
+  if(messageTime){
+    if(clientTime && clientTime>=messageTime) status.client=true;
+    if(pmTime && pmTime>=messageTime) status.pm=true;
+    if(adminTime && adminTime>=messageTime) status.admin=true;
+  }
+  return status;
+}
+function applyIndicatorState(indicator,info){
+  indicator.className='chat-read-indicator';
+  indicator.removeAttribute('aria-hidden');
+  indicator.removeAttribute('aria-label');
+  indicator.removeAttribute('title');
+  indicator.removeAttribute('role');
+  if(!info){
+    indicator.classList.add('is-hidden');
+    indicator.setAttribute('aria-hidden','true');
+    return;
+  }
+  const classes=(info.className||'').split(/\s+/).filter(Boolean);
+  classes.forEach(cls=>indicator.classList.add(cls));
+  indicator.setAttribute('role','img');
+  const label=info.label||'';
+  if(label){
+    indicator.setAttribute('aria-label',label);
+  }
+  const title=info.title||label||'';
+  if(title){
+    indicator.title=title;
+  }
 }
 function buildReadState(data){
   const reads=(data&&data.reads&&typeof data.reads==='object')?data.reads:{};
@@ -748,34 +1050,114 @@ function determineIndicator(data,role){
   const anyRead=clientRead||pmRead;
   return {className:anyRead?'chat-read-indicator--read':'chat-read-indicator--unread',label:anyRead?'Read':'Unread'};
 }
+function applyReadReceipt(data){
+  const times=extractReadTimes(data);
+  if(times) updateCurrentReadTimes(times);
+  const effectiveTimes={
+    client:currentReadTimes.client,
+    pm:currentReadTimes.pm,
+    admin:currentReadTimes.admin
+  };
+  if(!list) return;
+  Array.from(list.children||[]).forEach(function(line){
+    if(!line || !line.__chatPayload) return;
+    const payload=line.__chatPayload;
+    const status=buildStatusFromTimes(payload,effectiveTimes);
+    payload.read_status=Object.assign({},status);
+    if(!payload.reads || typeof payload.reads!=='object') payload.reads={};
+    payload.reads.roles=Object.assign({},status);
+    payload.reads.times=Object.assign({},effectiveTimes);
+    const indicator=line.querySelector('.chat-read-indicator');
+    if(indicator) applyIndicatorState(indicator,determineIndicator(payload,payload.role||line.dataset.role||'other'));
+  });
+}
+function sendReadSync(){
+  if(readSyncInFlight) return;
+  const targetProject=projectId||parseInt(pid,10)||0;
+  if(!targetProject || !rest || !myId) return;
+  readSyncPending=false;
+  readSyncInFlight=true;
+  fetch(rest+'elxao/v1/messages/read',{
+    method:'POST',
+    credentials:'same-origin',
+    headers:Object.assign({'Content-Type':'application/json'},hdr),
+    body:JSON.stringify({project_id:targetProject})
+  }).then(r=>{ if(!r.ok) throw new Error(''+r.status); return r.json(); })
+    .then(resp=>{
+      if(!resp) return;
+      if(!resp.project) resp.project=targetProject;
+      if(!resp.type) resp.type='read_receipt';
+      if(!resp.user) resp.user=myId;
+      window.ELXAO_CHAT_BROADCAST(resp.project,resp);
+    })
+    .catch(()=>{})
+    .finally(()=>{
+      readSyncInFlight=false;
+      if(readSyncPending){
+        scheduleReadSync();
+      }
+    });
+}
+function scheduleReadSync(){
+  if(!projectId || !rest || !myId) return;
+  if(myRole==='other') return;
+  readSyncPending=true;
+  if(readSyncInFlight) return;
+  if(readSyncTimer) return;
+  readSyncTimer=setTimeout(()=>{
+    readSyncTimer=null;
+    if(readSyncPending) sendReadSync();
+  },400);
+}
 function appendChatLine(data){
+  if(!data) return;
+  const times=extractReadTimes(data);
+  if(times) updateCurrentReadTimes(times);
+  const effectiveTimes={
+    client:currentReadTimes.client,
+    pm:currentReadTimes.pm,
+    admin:currentReadTimes.admin
+  };
+  if(!data.read_status || typeof data.read_status!=='object'){
+    const computed=buildStatusFromTimes(data,effectiveTimes);
+    data.read_status=Object.assign({},computed);
+    if(!data.reads || typeof data.reads!=='object') data.reads={};
+    data.reads.roles=Object.assign({},computed);
+    data.reads.times=Object.assign({},effectiveTimes);
+  } else {
+    if(!data.reads || typeof data.reads!=='object') data.reads={};
+    if(!data.reads.roles || typeof data.reads.roles!=='object') data.reads.roles=Object.assign({},data.read_status);
+    if(times) data.reads.times=Object.assign({},times);
+    else if(!data.reads.times) data.reads.times=Object.assign({},effectiveTimes);
+  }
   const role=(data.type==='system')?'sys':(data.role||'other');
+  data.role=role;
   const messageText=normalizeContent(data.message);
   if(!messageText && role!=='sys') return;
   const display=data.user_display||('User '+(data.user||''));
   const fullText=(role==='sys')?messageText:(display+': '+messageText);
   const line=document.createElement('div');
   line.className='chat-line '+role;
-  const indicatorInfo=determineIndicator(data,role);
   const indicator=document.createElement('span');
-  indicator.className='chat-read-indicator';
-  if(indicatorInfo){
-    indicator.classList.add(indicatorInfo.className);
-    indicator.setAttribute('role','img');
-    const label=indicatorInfo.label||'';
-    indicator.setAttribute('aria-label',label);
-    indicator.title=indicatorInfo.title||label;
-  } else {
-    indicator.classList.add('is-hidden');
-    indicator.setAttribute('aria-hidden','true');
-  }
+  const indicatorInfo=determineIndicator(data,role);
+  applyIndicatorState(indicator,indicatorInfo);
   line.appendChild(indicator);
   const textNode=document.createElement('div');
   textNode.className='chat-text';
   textNode.appendChild(createTextFragment(fullText));
   line.appendChild(textNode);
+  line.__chatPayload=data;
+  line.dataset.role=role;
+  const stamp=data.at||data.published_at||data.created_at||'';
+  if(stamp) line.dataset.at=String(stamp);
+  else delete line.dataset.at;
+  if('id' in data && data.id!==undefined && data.id!==null) line.dataset.messageId=String(data.id);
+  if('user' in data && data.user!==undefined && data.user!==null) line.dataset.user=String(data.user);
   list.appendChild(line);
   list.scrollTop=list.scrollHeight;
+  if(!isRenderingHistory && role!=='sys' && (data.user||0)!==myId){
+    scheduleReadSync();
+  }
 }
 function fingerprint(project,user,content){
   if(!project||!user) return '';
@@ -804,6 +1186,10 @@ function handleChatPayload(payload){
   if(!payload) return;
   const data=window.ELXAO_CHAT_NORMALIZE(payload,projectId);
   if(!data) return;
+  if(data.type==='read_receipt'){
+    applyReadReceipt(data);
+    return;
+  }
   appendChatLine(data);
 }
 
@@ -825,6 +1211,8 @@ function subscribeRealtime(tokenDetails){
 function cleanup(){
   if(realtimeCleanup){ try{ realtimeCleanup(); }catch(e){} realtimeCleanup=null; }
   if(busCleanup){ try{ busCleanup(); }catch(e){} busCleanup=null; }
+  if(readSyncTimer){ clearTimeout(readSyncTimer); readSyncTimer=null; }
+  readSyncPending=false;
   window.removeEventListener('elxao:chat',onChatEvent);
   window.removeEventListener('beforeunload',cleanup);
 }
@@ -841,18 +1229,24 @@ window.addEventListener('beforeunload',cleanup,{once:true});
 
 function renderHistory(items){
   if(!items||!Array.isArray(items)) return;
-  items.forEach(function(m){
-    const payload=Object.assign({},m,{
-      type:m.content_type,
-      message:m.content,
-      project:m.project_id||projectId,
-      user:m.user_id,
-      user_display:m.user_display||m.user_name,
-      role:m.role,
-      at:m.published_at
+  isRenderingHistory=true;
+  try{
+    if(list) list.innerHTML='';
+    items.forEach(function(m){
+      const payload=Object.assign({},m,{
+        type:m.content_type,
+        message:m.content,
+        project:m.project_id||projectId,
+        user:m.user_id,
+        user_display:m.user_display||m.user_name,
+        role:m.role,
+        at:m.published_at
+      });
+      handleChatPayload(payload);
     });
-    handleChatPayload(payload);
-  });
+  } finally {
+    isRenderingHistory=false;
+  }
 }
 
 /* Subscribe first, then load history (avoid race) */
@@ -860,7 +1254,12 @@ token()
   .then(function(tk){ if(!tk||tk.error) throw tk||new Error('token'); return subscribeRealtime(tk); })
   .catch(function(err){ console.warn('ELXAO chat realtime unavailable',err); })
   .then(function(){ return load(); })
-  .then(function(r){ if(r&&r.items) renderHistory(r.items); })
+  .then(function(r){
+    if(r && typeof r==='object'){
+      if(r.reads) updateCurrentReadTimes(r.reads);
+      if(r.items && Array.isArray(r.items)) renderHistory(r.items);
+    }
+  })
   .catch(function(err){ console.error('ELXAO chat history unavailable',err); });
 
 btn.addEventListener('click', function(){
