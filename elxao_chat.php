@@ -681,6 +681,7 @@ const pmId=parseInt(root.dataset.pm,10)||0;
 const localEchoes=new Map();
 let realtimeCleanup=null;
 let busCleanup=null;
+let realtimeReady=false;
 
 /* =========================
    READ-LOGIC GUARDS (FOCUS + VISIBILITY + IN-VIEW)
@@ -762,9 +763,26 @@ function evaluateSeen(){
     }
   });
   if(bumped){
+    applyOptimisticRead(latestSeenAtMs);
     // debounce a single server call for a cluster of lines
     if(readDebounce) clearTimeout(readDebounce);
     readDebounce=setTimeout(postRead,READ_DEBOUNCE_MS);
+  }
+}
+
+function applyOptimisticRead(atMs){
+  if(typeof atMs!=='number' || !isFinite(atMs) || atMs<=0) return;
+  if(myRole==='other') return;
+  if(atMs<=optimisticLatestReadMs) return;
+  optimisticLatestReadMs=atMs;
+  const iso=new Date(atMs).toISOString();
+  const times=Object.assign({},currentReadTimes,{ [myRole]: iso });
+  const changed=updateCurrentReadTimes(times);
+  if(!changed) return;
+  const payload={ type:'read_receipt', project:projectId, read_times:times, reads:{ times:times } };
+  applyReadReceipt(payload);
+  if(window.ELXAO_CHAT_BUS && typeof window.ELXAO_CHAT_BUS.emit==='function'){
+    window.ELXAO_CHAT_BUS.emit({ project:projectId, payload:payload });
   }
 }
 
@@ -1091,6 +1109,7 @@ let latestId=0;
 let fallbackActive=false;
 let fallbackTimer=null;
 let fallbackInFlight=false;
+let optimisticLatestReadMs=0;
 const FALLBACK_INTERVAL=4000;
 const DEBUG=false;
 
@@ -1250,7 +1269,14 @@ function applyIndicatorState(indicator,info){
 
 function applyReadReceipt(data){
   const times=extractReadTimes(data);
-  if(times) updateCurrentReadTimes(times);
+  if(times){
+    if(myRole!=='other'){
+      const raw=times[myRole];
+      const ms=parseAtMs(raw);
+      if(ms && ms>optimisticLatestReadMs) optimisticLatestReadMs=ms;
+    }
+    updateCurrentReadTimes(times);
+  }
   const effectiveTimes={
     client:currentReadTimes.client,
     pm:currentReadTimes.pm,
@@ -1351,12 +1377,16 @@ function subscribeRealtime(tokenDetails){
     if(realtimeCleanup){ try{ realtimeCleanup(); }catch(e){} realtimeCleanup=null; }
     const unsubscribe=window.ELXAO_ABLY.registerChannel(client,room,projectId,handleRealtimePayload);
     realtimeCleanup=unsubscribe;
+    realtimeReady=true;
     stopFallbackPolling();
   });
 }
 
 function cleanup(){
   if(realtimeCleanup){ try{ realtimeCleanup(); }catch(e){} realtimeCleanup=null; }
+  realtimeReady=false;
+  latestSeenAtMs=0;
+  optimisticLatestReadMs=0;
   if(busCleanup){ try{ busCleanup(); }catch(e){} busCleanup=null; }
   stopFallbackPolling();
   if(observer){
@@ -1403,6 +1433,9 @@ function renderHistory(items){
     });
   } finally {
     isRenderingHistory=false;
+  }
+  if(!realtimeReady && !fallbackActive){
+    startFallbackPolling(500);
   }
 }
 function processIncrementalHistory(items){
@@ -1590,11 +1623,11 @@ function applyServerAck(resp){
   }
 }
 
-/* Subscribe first, then load history (avoid race) */
 token()
   .then(function(tk){ if(!isValidRealtimeToken(tk)) throw (tk&&tk.message)?new Error(tk.message):new Error('token'); return subscribeRealtime(tk); })
-  .catch(function(err){ console.warn('ELXAO chat realtime unavailable',err); startFallbackPolling(1000); })
-  .then(function(){ return load(); })
+  .catch(function(err){ console.warn('ELXAO chat realtime unavailable',err); startFallbackPolling(1000); });
+
+load()
   .then(function(r){
     if(r && typeof r==='object'){
       if(r.reads) updateCurrentReadTimes(r.reads);
