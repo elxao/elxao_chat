@@ -482,6 +482,13 @@ function ensureChatNormalizer(){
     return window.ELXAO_CHAT_NORMALIZE;
   }
   const allowedRoles=new Set(['client','pm','admin','other','sys']);
+  function firstDefined(){
+    for(let i=0;i<arguments.length;i++){
+      const value=arguments[i];
+      if(value!==undefined && value!==null) return value;
+    }
+    return undefined;
+  }
   function toISO(value){
     if(!value && value!==0) return new Date().toISOString();
     if(value instanceof Date) return value.toISOString();
@@ -492,16 +499,16 @@ function ensureChatNormalizer(){
   }
   function normalize(data,fallbackProject){
     const source=(data && typeof data==='object')?data:{};
-    const projectRaw=(source.project??source.project_id??fallbackProject??0);
+    const projectRaw=firstDefined(source.project,source.project_id,fallbackProject,0);
     const projectNum=Number(projectRaw);
     const project=Number.isFinite(projectNum)?projectNum:0;
-    const typeRaw=source.type||source.content_type||'text';
+    const typeRaw=firstDefined(source.type,source.content_type,'text');
     const type=String(typeRaw||'text');
-    const messageRaw=source.message??source.content??'';
-    const userRaw=source.user??source.user_id??0;
+    const messageRaw=firstDefined(source.message,source.content,'');
+    const userRaw=firstDefined(source.user,source.user_id,0);
     const userNum=Number(userRaw);
     const user=Number.isFinite(userNum)?userNum:0;
-    const displayRaw=source.user_display||source.userDisplay||source.user_name||source.username||'';
+    const displayRaw=firstDefined(source.user_display,source.userDisplay,source.user_name,source.username,'');
     let display=displayRaw?String(displayRaw):'';
     if(!display){
       display=user?('User '+user):'User';
@@ -512,11 +519,11 @@ function ensureChatNormalizer(){
     if(!role){
       role=(type==='system')?'sys':'other';
     }
-    const atRaw=source.at??source.published_at??source.created_at??null;
+    const atRaw=firstDefined(source.at,source.published_at,source.created_at,null);
     const at=toISO(atRaw);
     return {
       type:type||'text',
-      message:String(messageRaw??''),
+      message:String(firstDefined(messageRaw,'')),
       project:project||0,
       user:user||0,
       user_display:display,
@@ -592,6 +599,13 @@ function ensureChatNormalizer(){
     return window.ELXAO_CHAT_NORMALIZE;
   }
   const allowedRoles=new Set(['client','pm','admin','other','sys']);
+  function firstDefined(){
+    for(let i=0;i<arguments.length;i++){
+      const value=arguments[i];
+      if(value!==undefined && value!==null) return value;
+    }
+    return undefined;
+  }
   function toISO(value){
     if(!value && value!==0) return new Date().toISOString();
     if(value instanceof Date) return value.toISOString();
@@ -602,16 +616,16 @@ function ensureChatNormalizer(){
   }
   function normalize(data,fallbackProject){
     const source=(data && typeof data==='object')?data:{};
-    const projectRaw=(source.project??source.project_id??fallbackProject??0);
+    const projectRaw=firstDefined(source.project,source.project_id,fallbackProject,0);
     const projectNum=Number(projectRaw);
     const project=Number.isFinite(projectNum)?projectNum:0;
-    const typeRaw=source.type||source.content_type||'text';
+    const typeRaw=firstDefined(source.type,source.content_type,'text');
     const type=String(typeRaw||'text');
-    const messageRaw=source.message??source.content??'';
-    const userRaw=source.user??source.user_id??0;
+    const messageRaw=firstDefined(source.message,source.content,'');
+    const userRaw=firstDefined(source.user,source.user_id,0);
     const userNum=Number(userRaw);
     const user=Number.isFinite(userNum)?userNum:0;
-    const displayRaw=source.user_display||source.userDisplay||source.user_name||source.username||'';
+    const displayRaw=firstDefined(source.user_display,source.userDisplay,source.user_name,source.username,'');
     let display=displayRaw?String(displayRaw):'';
     if(!display){
       display=user?('User '+user):'User';
@@ -622,11 +636,11 @@ function ensureChatNormalizer(){
     if(!role){
       role=(type==='system')?'sys':'other';
     }
-    const atRaw=source.at??source.published_at??source.created_at??null;
+    const atRaw=firstDefined(source.at,source.published_at,source.created_at,null);
     const at=toISO(atRaw);
     return {
       type:type||'text',
-      message:String(messageRaw??''),
+      message:String(firstDefined(messageRaw,'')),
       project:project||0,
       user:user||0,
       user_display:display,
