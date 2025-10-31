@@ -1,8 +1,8 @@
 <?php
 /*
 Plugin Name: ELXAO Chat
-Description: Per-project chat storage (MySQL), REST API for send/history, Ably realtime fan-out, and inbox ordering via latest_message_at (ACF). Colors by ROLE: client, pm, admin.
-Version: 1.44.0
+Description: Per-project chat storage (MySQL), REST API for send/history, Ably realtime fan-out, and inbox ordering via latest_message_at (ACF). Colors by ROLE: client, pm, admin. Includes Inbox view.
+Version: 1.45.0
 Author: ELXAO
 */
 
@@ -358,7 +358,7 @@ function elxao_chat_publish_to_ably($chName,$payload){
 }
 
 /* ===========================================================
-   UI SHORTCODES (multiline + send icon) — ROLE COLORS
+   CORE CHAT WINDOW (loop card + inbox right pane) — ROLE COLORS
    =========================================================== */
 function elxao_chat_render_window($pid){
     if(!is_user_logged_in())return'<div>Please log in.</div>';
@@ -439,401 +439,134 @@ const localEchoes=new Map();
 let realtimeCleanup=null;
 let busCleanup=null;
 
-const chatBus=ensureChatBus();
-const normalizePayload=ensureChatNormalizer();
-const broadcastMessage=ensureChatBroadcaster();
-
-function ensureChatBus(){
-  if(window.ELXAO_CHAT_BUS && window.ELXAO_CHAT_BUS.emit){
-    return window.ELXAO_CHAT_BUS;
-  }
-  const origin=Math.random().toString(36).slice(2);
-  let channel=null;
-  if('BroadcastChannel' in window){
-    try{
-      channel=new BroadcastChannel('elxao-chat');
-    }catch(e){
-      channel=null;
-    }
-  }
-  const state={
-    origin:origin,
-    channel:channel,
-    emit:function(detail){
-      if(!detail || typeof detail!=='object') return;
-      const message=Object.assign({},detail,{originId:origin});
-      if(channel){
-        try{ channel.postMessage(message); }catch(e){}
+/* ---------- Shared helpers (guarded singletons) ---------- */
+if(!window.ELXAO_CHAT_BUS){
+  (function(){
+    const origin=Math.random().toString(36).slice(2);
+    let channel=null;
+    if('BroadcastChannel' in window){ try{ channel=new BroadcastChannel('elxao-chat'); }catch(e){} }
+    const state={
+      origin, channel,
+      emit(detail){
+        const msg=Object.assign({},detail,{originId:origin});
+        if(channel){ try{ channel.postMessage(msg); }catch(e){} }
+        window.dispatchEvent(new CustomEvent('elxao:chat',{detail:msg}));
       }
-      window.dispatchEvent(new CustomEvent('elxao:chat',{detail:message}));
-    }
-  };
-  if(channel){
-    window.addEventListener('beforeunload',function(){
-      try{ channel.close(); }catch(e){}
-    },{once:true});
-  }
-  window.ELXAO_CHAT_BUS=state;
-  return state;
-}
-
-function ensureChatNormalizer(){
-  if(window.ELXAO_CHAT_NORMALIZE){
-    return window.ELXAO_CHAT_NORMALIZE;
-  }
-  const allowedRoles=new Set(['client','pm','admin','other','sys']);
-  function firstDefined(){
-    for(let i=0;i<arguments.length;i++){
-      const value=arguments[i];
-      if(value!==undefined && value!==null) return value;
-    }
-    return undefined;
-  }
-  function toISO(value){
-    if(!value && value!==0) return new Date().toISOString();
-    if(value instanceof Date) return value.toISOString();
-    if(typeof value==='number' && Number.isFinite(value)){
-      return new Date(value).toISOString();
-    }
-    return String(value);
-  }
-  function normalize(data,fallbackProject){
-    const source=(data && typeof data==='object')?data:{};
-    const projectRaw=firstDefined(source.project,source.project_id,fallbackProject,0);
-    const projectNum=Number(projectRaw);
-    const project=Number.isFinite(projectNum)?projectNum:0;
-    const typeRaw=firstDefined(source.type,source.content_type,'text');
-    const type=String(typeRaw||'text');
-    const messageRaw=firstDefined(source.message,source.content,'');
-    const userRaw=firstDefined(source.user,source.user_id,0);
-    const userNum=Number(userRaw);
-    const user=Number.isFinite(userNum)?userNum:0;
-    const displayRaw=firstDefined(source.user_display,source.userDisplay,source.user_name,source.username,'');
-    let display=displayRaw?String(displayRaw):'';
-    if(!display){
-      display=user?('User '+user):'User';
-    }
-    let roleRaw=source.role||'';
-    if(typeof roleRaw==='string') roleRaw=roleRaw.toLowerCase();
-    let role=allowedRoles.has(roleRaw)?roleRaw:'';
-    if(!role){
-      role=(type==='system')?'sys':'other';
-    }
-    const atRaw=firstDefined(source.at,source.published_at,source.created_at,null);
-    const at=toISO(atRaw);
-    return {
-      type:type||'text',
-      message:String(firstDefined(messageRaw,'')),
-      project:project||0,
-      user:user||0,
-      user_display:display,
-      role:role,
-      at:at
     };
-  }
-  window.ELXAO_CHAT_NORMALIZE=normalize;
-  return normalize;
+    if(channel){ window.addEventListener('beforeunload',()=>{ try{ channel.close(); }catch(e){} },{once:true}); }
+    window.ELXAO_CHAT_BUS=state;
+  })();
 }
-
-function ensureChatBroadcaster(){
-  if(window.ELXAO_CHAT_BROADCAST){
-    return window.ELXAO_CHAT_BROADCAST;
-  }
-  const normalize=ensureChatNormalizer();
-  function broadcast(projectHint,data,extras){
-    const bus=ensureChatBus();
-    const payload=normalize(data,projectHint);
-    const fallback=Number(projectHint)||0;
-    if(!payload.project && fallback){
-      payload.project=fallback;
-    }
-    const project=payload.project||0;
-    const detail=Object.assign({project:project,payload:payload},(extras&&typeof extras==='object')?extras:{});
-    bus.emit(detail);
-    if(project){
+if(!window.ELXAO_CHAT_NORMALIZE){
+  window.ELXAO_CHAT_NORMALIZE=(function(){
+    const roles=new Set(['client','pm','admin','other','sys']);
+    const fd=(...a)=>a.find(v=>v!==undefined&&v!==null);
+    const toISO=v=>!v&&v!==0?new Date().toISOString():(v instanceof Date?v.toISOString():(typeof v==='number'?new Date(v).toISOString():String(v)));
+    return function(data,fallbackProject){
+      const s=(data&&typeof data==='object')?data:{};
+      const p=Number(fd(s.project,s.project_id,fallbackProject,0))||0;
+      const type=String(fd(s.type,s.content_type,'text')||'text');
+      const msg=String(fd(s.message,s.content,'')||'');
+      const user=Number(fd(s.user,s.user_id,0))||0;
+      const display=String(fd(s.user_display,s.userDisplay,s.user_name,s.username,user?('User '+user):'User'));
+      let role=(s.role||'').toString().toLowerCase();
+      if(!roles.has(role)) role=(type==='system')?'sys':'other';
+      const at=toISO(fd(s.at,s.published_at,s.created_at,null));
+      return {type:type,message:msg,project:p,user:user,user_display:display,role:role,at:at};
+    };
+  })();
+}
+if(!window.ELXAO_CHAT_BROADCAST){
+  window.ELXAO_CHAT_BROADCAST=function(projectHint,data,extras){
+    const payload=window.ELXAO_CHAT_NORMALIZE(data,projectHint);
+    if(!payload.project && projectHint) payload.project=Number(projectHint)||0;
+    const detail=Object.assign({project:payload.project,payload:payload},(extras&&typeof extras==='object')?extras:{});
+    window.ELXAO_CHAT_BUS.emit(detail);
+    if(payload.project){
       const bumpAt=payload.at||Date.now();
-      window.dispatchEvent(new CustomEvent('elxao:room-bump',{detail:{projectId:project,at:bumpAt}}));
+      window.dispatchEvent(new CustomEvent('elxao:room-bump',{detail:{projectId:payload.project,at:bumpAt}}));
     }
     return payload;
-  }
-  window.ELXAO_CHAT_BROADCAST=broadcast;
-  return broadcast;
-}
-
-function ensureChatBus(){
-  if(window.ELXAO_CHAT_BUS && window.ELXAO_CHAT_BUS.emit){
-    return window.ELXAO_CHAT_BUS;
-  }
-  const origin=Math.random().toString(36).slice(2);
-  let channel=null;
-  if('BroadcastChannel' in window){
-    try{
-      channel=new BroadcastChannel('elxao-chat');
-    }catch(e){
-      channel=null;
-    }
-  }
-  const state={
-    origin:origin,
-    channel:channel,
-    emit:function(detail){
-      if(!detail || typeof detail!=='object') return;
-      const message=Object.assign({},detail,{originId:origin});
-      if(channel){
-        try{ channel.postMessage(message); }catch(e){}
-      }
-      window.dispatchEvent(new CustomEvent('elxao:chat',{detail:message}));
-    }
   };
-  if(channel){
-    window.addEventListener('beforeunload',function(){
-      try{ channel.close(); }catch(e){}
-    },{once:true});
-  }
-  window.ELXAO_CHAT_BUS=state;
-  return state;
 }
-
-function ensureChatNormalizer(){
-  if(window.ELXAO_CHAT_NORMALIZE){
-    return window.ELXAO_CHAT_NORMALIZE;
-  }
-  const allowedRoles=new Set(['client','pm','admin','other','sys']);
-  function firstDefined(){
-    for(let i=0;i<arguments.length;i++){
-      const value=arguments[i];
-      if(value!==undefined && value!==null) return value;
-    }
-    return undefined;
-  }
-  function toISO(value){
-    if(!value && value!==0) return new Date().toISOString();
-    if(value instanceof Date) return value.toISOString();
-    if(typeof value==='number' && Number.isFinite(value)){
-      return new Date(value).toISOString();
-    }
-    return String(value);
-  }
-  function normalize(data,fallbackProject){
-    const source=(data && typeof data==='object')?data:{};
-    const projectRaw=firstDefined(source.project,source.project_id,fallbackProject,0);
-    const projectNum=Number(projectRaw);
-    const project=Number.isFinite(projectNum)?projectNum:0;
-    const typeRaw=firstDefined(source.type,source.content_type,'text');
-    const type=String(typeRaw||'text');
-    const messageRaw=firstDefined(source.message,source.content,'');
-    const userRaw=firstDefined(source.user,source.user_id,0);
-    const userNum=Number(userRaw);
-    const user=Number.isFinite(userNum)?userNum:0;
-    const displayRaw=firstDefined(source.user_display,source.userDisplay,source.user_name,source.username,'');
-    let display=displayRaw?String(displayRaw):'';
-    if(!display){
-      display=user?('User '+user):'User';
-    }
-    let roleRaw=source.role||'';
-    if(typeof roleRaw==='string') roleRaw=roleRaw.toLowerCase();
-    let role=allowedRoles.has(roleRaw)?roleRaw:'';
-    if(!role){
-      role=(type==='system')?'sys':'other';
-    }
-    const atRaw=firstDefined(source.at,source.published_at,source.created_at,null);
-    const at=toISO(atRaw);
-    return {
-      type:type||'text',
-      message:String(firstDefined(messageRaw,'')),
-      project:project||0,
-      user:user||0,
-      user_display:display,
-      role:role,
-      at:at
-    };
-  }
-  window.ELXAO_CHAT_NORMALIZE=normalize;
-  return normalize;
-}
-
-function ensureChatBroadcaster(){
-  if(window.ELXAO_CHAT_BROADCAST){
-    return window.ELXAO_CHAT_BROADCAST;
-  }
-  const normalize=ensureChatNormalizer();
-  function broadcast(projectHint,data,extras){
-    const bus=ensureChatBus();
-    const payload=normalize(data,projectHint);
-    const fallback=Number(projectHint)||0;
-    if(!payload.project && fallback){
-      payload.project=fallback;
-    }
-    const project=payload.project||0;
-    const detail=Object.assign({project:project,payload:payload},(extras&&typeof extras==='object')?extras:{});
-    bus.emit(detail);
-    if(project){
-      const bumpAt=payload.at||Date.now();
-      window.dispatchEvent(new CustomEvent('elxao:room-bump',{detail:{projectId:project,at:bumpAt}}));
-    }
-    return payload;
-  }
-  window.ELXAO_CHAT_BROADCAST=broadcast;
-  return broadcast;
-}
-
-function ensureAblyState(){
-  if(!window.ELXAO_ABLY){
-    window.ELXAO_ABLY={client:null,clientPromise:null,libraryPromise:null,channels:new Map()};
-  } else if(!window.ELXAO_ABLY.channels){
-    window.ELXAO_ABLY.channels=new Map();
-  }
-  const state=window.ELXAO_ABLY;
-
-  if(!state.loadLibrary){
-    state.loadLibrary=function(){
-      if(state.libraryPromise) return state.libraryPromise;
-      if(window.Ably&&window.Ably.Realtime&&window.Ably.Realtime.Promise){
-        state.libraryPromise=Promise.resolve();
-        return state.libraryPromise;
-      }
-      state.libraryPromise=new Promise(function(resolve,reject){
-        const existing=document.querySelector('script[data-elxao-ably]');
-        if(existing){
-          existing.addEventListener('load',()=>resolve(),{once:true});
-          existing.addEventListener('error',()=>reject(new Error('Failed to load Ably library')),{once:true});
-          return;
-        }
-        const s=document.createElement('script');
-        s.src='https://cdn.ably.io/lib/ably.min-1.js';
-        s.async=true;
-        s.setAttribute('data-elxao-ably','1');
-        s.onload=()=>resolve();
-        s.onerror=()=>reject(new Error('Failed to load Ably library'));
-        document.head.appendChild(s);
+if(!window.ELXAO_ABLY){
+  window.ELXAO_ABLY={client:null,clientPromise:null,libraryPromise:null,channels:new Map()};
+  window.ELXAO_ABLY.loadLibrary=function(){
+    const st=window.ELXAO_ABLY;
+    if(st.libraryPromise) return st.libraryPromise;
+    if(window.Ably&&window.Ably.Realtime&&window.Ably.Realtime.Promise){ st.libraryPromise=Promise.resolve(); return st.libraryPromise; }
+    st.libraryPromise=new Promise((res,rej)=>{
+      const ex=document.querySelector('script[data-elxao-ably]');
+      if(ex){ ex.addEventListener('load',()=>res(),{once:true}); ex.addEventListener('error',()=>rej(new Error('Ably load failed')),{once:true}); return; }
+      const s=document.createElement('script'); s.src='https://cdn.ably.io/lib/ably.min-1.js'; s.async=true; s.setAttribute('data-elxao-ably','1');
+      s.onload=()=>res(); s.onerror=()=>rej(new Error('Ably load failed')); document.head.appendChild(s);
+    });
+    return st.libraryPromise;
+  };
+  window.ELXAO_ABLY.ensureClient=function(tokenDetails){
+    const st=window.ELXAO_ABLY;
+    if(st.clientPromise){
+      return st.clientPromise.then(client=>{
+        if(tokenDetails){ return client.auth.authorize(null,{tokenDetails}).then(()=>client); }
+        return client;
       });
-      return state.libraryPromise;
-    };
-  }
-
-  if(!state.ensureClient){
-    state.ensureClient=function(tokenDetails){
-      if(state.clientPromise){
-        return state.clientPromise.then(function(client){
-          if(tokenDetails){
-            return client.auth.authorize(null,{tokenDetails:tokenDetails}).then(function(){ return client; });
-          }
-          return client;
-        });
-      }
-      state.clientPromise=state.loadLibrary().then(function(){
-        if(!window.Ably||!window.Ably.Realtime||!window.Ably.Realtime.Promise){
-          throw new Error('Ably unavailable');
-        }
-        state.client=new window.Ably.Realtime.Promise({tokenDetails:tokenDetails});
-        return state.client;
-      }).catch(function(err){
-        state.client=null;
-        state.clientPromise=null;
-        throw err;
-      });
-      return state.clientPromise;
-    };
-  }
-
-  if(!state.registerChannel){
-    state.registerChannel=function(client,channelName,project){
-      if(!channelName) return function(){};
-      const channels=state.channels;
-      let entry=channels.get(channelName);
-      if(!entry){
-        entry={refCount:0,handler:null,channel:client.channels.get(channelName),projectId:project};
-        channels.set(channelName,entry);
-      } else {
-        if(!entry.channel){
-          entry.channel=client.channels.get(channelName);
-        }
-        if(project && !entry.projectId){
-          entry.projectId=project;
-        }
-      }
-      entry.refCount++;
-      if(!entry.handler){
-        entry.handler=function(msg){
-          const data=msg&&msg.data?msg.data:{};
-          const projectId=data.project||entry.projectId||project;
-          const extras={};
-          if(msg && typeof msg.id!=='undefined') extras.id=msg.id;
-          if(msg && typeof msg.name!=='undefined') extras.name=msg.name;
-          broadcastMessage(projectId,data,extras);
-        };
-        entry.channel.subscribe(entry.handler);
-      }
-      entry.channel.attach().catch(function(){});
-      return function(){
-        entry.refCount--;
-        if(entry.refCount<=0){
-          if(entry.channel&&entry.handler){
-            entry.channel.unsubscribe(entry.handler);
-          }
-          channels.delete(channelName);
-        }
+    }
+    st.clientPromise=st.loadLibrary().then(()=>{
+      if(!window.Ably||!window.Ably.Realtime||!window.Ably.Realtime.Promise) throw new Error('Ably unavailable');
+      st.client=new window.Ably.Realtime.Promise({tokenDetails});
+      return st.client;
+    }).catch(err=>{ st.client=null; st.clientPromise=null; throw err; });
+    return st.clientPromise;
+  };
+  window.ELXAO_ABLY.registerChannel=function(client,channelName,project){
+    if(!channelName) return function(){};
+    const st=window.ELXAO_ABLY; const map=st.channels;
+    let entry=map.get(channelName);
+    if(!entry){ entry={refCount:0,handler:null,channel:client.channels.get(channelName),projectId:project}; map.set(channelName,entry); }
+    else { if(!entry.channel) entry.channel=client.channels.get(channelName); if(project && !entry.projectId) entry.projectId=project; }
+    entry.refCount++;
+    if(!entry.handler){
+      entry.handler=function(msg){
+        const data=(msg&&msg.data)?msg.data:{};
+        const projectId=data.project||entry.projectId||project||0;
+        const extras={}; if(msg && 'id' in msg) extras.id=msg.id; if(msg && 'name' in msg) extras.name=msg.name;
+        window.ELXAO_CHAT_BROADCAST(projectId,data,extras);
       };
+      entry.channel.subscribe(entry.handler);
+    }
+    entry.channel.attach().catch(()=>{});
+    return function(){
+      entry.refCount--; if(entry.refCount<=0){ if(entry.channel&&entry.handler) entry.channel.unsubscribe(entry.handler); map.delete(channelName); }
     };
-  }
-
-  return state;
+  };
 }
+/* ---------- end helpers ---------- */
 
-const ablyState=ensureAblyState();
-
-function normalizeContent(value){
-  return String(value||'').replace(/<[^>]*?>/g,'');
-}
-
+function normalizeContent(value){ return String(value||'').replace(/<[^>]*?>/g,''); }
 function addLine(text, cls){
   const d=document.createElement('div'); d.className=cls||'';
   d.textContent='';
-  String(text).split('\n').forEach((p,i)=>{
-    d.appendChild(document.createTextNode(p));
-    if(i) d.insertBefore(document.createElement('br'), d.lastChild);
-  });
+  String(text).split('\n').forEach((p,i)=>{ d.appendChild(document.createTextNode(p)); if(i) d.insertBefore(document.createElement('br'), d.lastChild); });
   list.appendChild(d); list.scrollTop=list.scrollHeight;
 }
-
 function fingerprint(project,user,content){
   if(!project||!user) return '';
   const normalized=normalizeContent(content).replace(/\r\n?/g,'\n').trim();
-  if(!normalized) return '';
-  return project+'|'+user+'|'+normalized;
+  return normalized ? (project+'|'+user+'|'+normalized) : '';
 }
-
 function rememberLocal(fp){
-  if(!fp) return;
-  const now=Date.now();
-  localEchoes.set(fp,now);
-  const cutoff=now-5000;
-  localEchoes.forEach(function(ts,key){ if(ts<cutoff) localEchoes.delete(key); });
+  if(!fp) return; const now=Date.now(); localEchoes.set(fp,now);
+  const cutoff=now-5000; localEchoes.forEach((ts,key)=>{ if(ts<cutoff) localEchoes.delete(key); });
 }
-
 function isRecentLocal(fp){
-  if(!fp||!localEchoes.has(fp)) return false;
-  const ts=localEchoes.get(fp);
-  if(!ts) return false;
-  if(Date.now()-ts<=5000){
-    localEchoes.delete(fp);
-    return true;
-  }
-  localEchoes.delete(fp);
-  return false;
+  if(!fp||!localEchoes.has(fp)) return false; const ts=localEchoes.get(fp);
+  localEchoes.delete(fp); return (Date.now()-ts<=5000);
 }
 
-function load(){
-  return fetch(rest+'elxao/v1/messages?project_id='+pid,{credentials:'same-origin',headers:hdr}).then(r=>r.json());
-}
-
-function token(){
-  return fetch(rest+'elxao/v1/chat-token?project_id='+pid,{credentials:'same-origin',headers:hdr}).then(r=>r.json());
-}
-
+function load(){ return fetch(rest+'elxao/v1/messages?project_id='+pid,{credentials:'same-origin',headers:hdr}).then(r=>r.json()); }
+function token(){ return fetch(rest+'elxao/v1/chat-token?project_id='+pid,{credentials:'same-origin',headers:hdr}).then(r=>r.json()); }
 function send(content){
-  return fetch(rest+'elxao/v1/messages',{
-    method:'POST', credentials:'same-origin',
+  return fetch(rest+'elxao/v1/messages',{ method:'POST', credentials:'same-origin',
     headers:Object.assign({'Content-Type':'application/json'},hdr),
     body:JSON.stringify({project_id:projectId||parseInt(pid,10),content:content})
   }).then(r=>r.json());
@@ -841,137 +574,77 @@ function send(content){
 
 function handleChatPayload(payload){
   if(!payload) return;
-  const data=normalizePayload(payload,projectId);
-  const name=data.user_display||('User '+(data.user||''));
-  const role=(data.type==='system')?'sys':(data.role||'other');
-  const message=normalizeContent(data.message);
-  if(!message && role!=='sys') return;
+  const data=window.ELXAO_CHAT_NORMALIZE(payload,projectId);
+  const name=data.user_display||('User '+(data.user||'')); const role=(data.type==='system')?'sys':(data.role||'other');
+  const message=normalizeContent(data.message); if(!message && role!=='sys') return;
   addLine(name+': '+message, role);
 }
 
 function onChatEvent(ev){
-  const detail=ev&&ev.detail?ev.detail:{};
-  const project=detail.project?parseInt(detail.project,10):0;
+  const detail=ev&&ev.detail?ev.detail:{}; const project=detail.project?parseInt(detail.project,10):0;
   if(project!==projectId) return;
-  const payload=normalizePayload(detail.payload||{},projectId);
-  const fp=fingerprint(projectId,payload.user||0,payload.message||'');
-  if(isRecentLocal(fp)) return;
+  const payload=window.ELXAO_CHAT_NORMALIZE(detail.payload||{},projectId);
+  const fp=fingerprint(projectId,payload.user||0,payload.message||''); if(isRecentLocal(fp)) return;
   handleChatPayload(payload);
 }
 
 function subscribeRealtime(tokenDetails){
-  return ablyState.ensureClient(tokenDetails).then(function(client){
-    if(realtimeCleanup){
-      try{ realtimeCleanup(); }catch(e){}
-      realtimeCleanup=null;
-    }
-    const unsubscribe=ablyState.registerChannel(client,room,projectId);
-    realtimeCleanup=unsubscribe;
+  return window.ELXAO_ABLY.ensureClient(tokenDetails).then(function(client){
+    if(realtimeCleanup){ try{ realtimeCleanup(); }catch(e){} realtimeCleanup=null; }
+    const unsubscribe=window.ELXAO_ABLY.registerChannel(client,room,projectId); realtimeCleanup=unsubscribe;
   });
 }
 
 function cleanup(){
-  if(realtimeCleanup){
-    try{ realtimeCleanup(); }catch(e){}
-    realtimeCleanup=null;
-  }
-  if(busCleanup){
-    try{ busCleanup(); }catch(e){}
-    busCleanup=null;
-  }
+  if(realtimeCleanup){ try{ realtimeCleanup(); }catch(e){} realtimeCleanup=null; }
+  if(busCleanup){ try{ busCleanup(); }catch(e){} busCleanup=null; }
   window.removeEventListener('elxao:chat',onChatEvent);
   window.removeEventListener('beforeunload',cleanup);
 }
 
-const observer=new MutationObserver(function(){
-  if(!document.body.contains(root)){
-    observer.disconnect();
-    cleanup();
-  }
-});
+const observer=new MutationObserver(function(){ if(!document.body.contains(root)){ observer.disconnect(); cleanup(); }});
 observer.observe(document.body,{childList:true,subtree:true});
 window.addEventListener('elxao:chat',onChatEvent);
-if(chatBus.channel && chatBus.channel.addEventListener){
-  const busHandler=function(ev){
-    const detail=ev&&ev.data?ev.data:null;
-    if(!detail) return;
-    if(detail.originId && detail.originId===chatBus.origin) return;
-    onChatEvent({detail:detail});
-  };
-  chatBus.channel.addEventListener('message',busHandler);
-  busCleanup=function(){
-    chatBus.channel.removeEventListener('message',busHandler);
-  };
+if(window.ELXAO_CHAT_BUS.channel && window.ELXAO_CHAT_BUS.channel.addEventListener){
+  const busHandler=function(ev){ const detail=ev&&ev.data?ev.data:null; if(!detail) return; if(detail.originId && detail.originId===window.ELXAO_CHAT_BUS.origin) return; onChatEvent({detail:detail}); };
+  window.ELXAO_CHAT_BUS.channel.addEventListener('message',busHandler);
+  busCleanup=function(){ window.ELXAO_CHAT_BUS.channel.removeEventListener('message',busHandler); };
 }
 window.addEventListener('beforeunload',cleanup,{once:true});
 
 function renderHistory(items){
   if(!items||!Array.isArray(items)) return;
   items.forEach(function(m){
-    const payload=normalizePayload({
-      type:m.content_type,
-      message:m.content,
-      project:m.project_id||projectId,
-      user:m.user_id,
-      user_display:m.user_display||m.user_name,
-      role:m.role,
-      at:m.published_at
-    },projectId);
+    const payload=window.ELXAO_CHAT_NORMALIZE({ type:m.content_type, message:m.content, project:m.project_id||projectId, user:m.user_id, user_display:m.user_display||m.user_name, role:m.role, at:m.published_at },projectId);
     handleChatPayload(payload);
   });
 }
 
+/* Subscribe first, then load history (avoid race) */
 token()
-  .then(function(tk){
-    if(!tk||tk.error) throw tk||new Error('token');
-    return subscribeRealtime(tk);
-  })
-  .catch(function(err){
-    console.warn('ELXAO chat realtime unavailable',err);
-  })
-  .then(function(){
-    return load();
-  })
-  .then(function(r){
-    if(r&&r.items) renderHistory(r.items);
-  })
-  .catch(function(err){
-    console.error('ELXAO chat history unavailable',err);
-  });
+  .then(function(tk){ if(!tk||tk.error) throw tk||new Error('token'); return subscribeRealtime(tk); })
+  .catch(function(err){ console.warn('ELXAO chat realtime unavailable',err); })
+  .then(function(){ return load(); })
+  .then(function(r){ if(r&&r.items) renderHistory(r.items); })
+  .catch(function(err){ console.error('ELXAO chat history unavailable',err); });
 
 btn.addEventListener('click', function(){
-  const v = ta.value.replace(/\s+$/,'');
-  if(!v.trim()) return;
-  const meName = '<?php echo $meName;?>';
-  addLine(meName+': '+v, myRole);
-  rememberLocal(fingerprint(projectId,myId,v));
-  ta.value=''; btn.disabled=true;
-  send(v)
-    .then(function(resp){
-      if(resp && resp.ok){
-        const detailProject=resp.project_id?parseInt(resp.project_id,10):projectId;
-        const resolvedProject=detailProject||projectId;
-        if(resolvedProject){
-          broadcastMessage(resolvedProject,{
-            type:'text',
-            message:v,
-            project:resolvedProject,
-            user:myId,
-            user_display:meName,
-            role:myRole,
-            at:resp.at||new Date().toISOString()
-          });
-        }
+  const v = ta.value.replace(/\s+$/,''); if(!v.trim()) return;
+  const meName = '<?php echo $meName;?>'; addLine(meName+': '+v, myRole);
+  rememberLocal(fingerprint(projectId,myId,v)); ta.value=''; btn.disabled=true;
+  send(v).then(function(resp){
+    if(resp && resp.ok){
+      const resolvedProject=resp.project_id?parseInt(resp.project_id,10):projectId;
+      if(resolvedProject){
+        window.ELXAO_CHAT_BROADCAST(resolvedProject,{ type:'text', message:v, project:resolvedProject, user:myId, user_display:meName, role:myRole, at:resp.at||new Date().toISOString()});
       }
-    })
-    .catch(function(err){ console.error('Failed to send chat message',err); })
+    }
+  }).catch(function(err){ console.error('Failed to send chat message',err); })
     .finally(()=>{ btn.disabled=false; ta.focus(); });
 });
 
 ta.addEventListener('keydown', function(e){
-  if ((e.key === 'Enter') && (e.ctrlKey || e.metaKey)) {
-    e.preventDefault(); btn.click();
-  }
+  if ((e.key === 'Enter') && (e.ctrlKey || e.metaKey)) { e.preventDefault(); btn.click(); }
 });
 })();
 </script>
@@ -979,6 +652,9 @@ ta.addEventListener('keydown', function(e){
 return ob_get_clean();
 }
 
+/* ===========================================================
+   INBOX SHORTCODE (WhatsApp-style: rooms left, chat right)
+   =========================================================== */
 function elxao_chat_render_inbox(){
     if(!is_user_logged_in()) return '<div>Please log in.</div>';
 
@@ -1016,11 +692,7 @@ function elxao_chat_render_inbox(){
       <?php } ?>
     </div>
     <div class="chat-pane">
-      <?php if($rooms){ ?>
-      <div class="placeholder">Select a room to load chat.</div>
-      <?php } else { ?>
-      <div class="placeholder">You do not have access to any chat rooms.</div>
-      <?php } ?>
+      <div class="placeholder"><?php echo $rooms ? 'Select a room to load chat.' : 'You do not have access to any chat rooms.'; ?></div>
     </div>
   </div>
 </div>
@@ -1046,9 +718,9 @@ function elxao_chat_render_inbox(){
 }
 </style>
 <script>
-(function(){
-const root=document.getElementById('<?php echo esc_js($container_id); ?>');
-if(!root) return;
+document.addEventListener('DOMContentLoaded', function(){
+const root=document.getElementById('<?php echo esc_js($container_id); ?>'); if(!root) return;
+
 const rest=root.dataset.rest||'';
 const nonce=root.dataset.nonce||'';
 const chat=root.querySelector('.chat-pane');
@@ -1061,125 +733,88 @@ const cleanupFns=[];
 let active=null;
 let busCleanup=null;
 
-const chatBus=ensureChatBus();
-const normalizePayload=ensureChatNormalizer();
-const broadcastMessage=ensureChatBroadcaster();
-
-function ensureAblyState(){
-  if(!window.ELXAO_ABLY){
-    window.ELXAO_ABLY={client:null,clientPromise:null,libraryPromise:null,channels:new Map()};
-  } else if(!window.ELXAO_ABLY.channels){
-    window.ELXAO_ABLY.channels=new Map();
-  }
-  const state=window.ELXAO_ABLY;
-
-  if(!state.loadLibrary){
-    state.loadLibrary=function(){
-      if(state.libraryPromise) return state.libraryPromise;
-      if(window.Ably&&window.Ably.Realtime&&window.Ably.Realtime.Promise){
-        state.libraryPromise=Promise.resolve();
-        return state.libraryPromise;
-      }
-      state.libraryPromise=new Promise(function(resolve,reject){
-        const existing=document.querySelector('script[data-elxao-ably]');
-        if(existing){
-          existing.addEventListener('load',()=>resolve(),{once:true});
-          existing.addEventListener('error',()=>reject(new Error('Failed to load Ably library')),{once:true});
-          return;
-        }
-        const s=document.createElement('script');
-        s.src='https://cdn.ably.io/lib/ably.min-1.js';
-        s.async=true;
-        s.setAttribute('data-elxao-ably','1');
-        s.onload=()=>resolve();
-        s.onerror=()=>reject(new Error('Failed to load Ably library'));
-        document.head.appendChild(s);
+/* ---- shared helpers (guarded; may already exist from chat window) ---- */
+if(!window.ELXAO_CHAT_BUS){
+  const origin=Math.random().toString(36).slice(2);
+  let channel=null; if('BroadcastChannel' in window){ try{ channel=new BroadcastChannel('elxao-chat'); }catch(e){} }
+  window.ELXAO_CHAT_BUS={
+    origin, channel,
+    emit(detail){ const msg=Object.assign({},detail,{originId:origin}); if(channel){ try{ channel.postMessage(msg); }catch(e){} } window.dispatchEvent(new CustomEvent('elxao:chat',{detail:msg})); }
+  };
+  if(channel){ window.addEventListener('beforeunload',()=>{ try{ channel.close(); }catch(e){} },{once:true}); }
+}
+if(!window.ELXAO_CHAT_NORMALIZE){
+  const roles=new Set(['client','pm','admin','other','sys']);
+  const fd=(...a)=>a.find(v=>v!==undefined&&v!==null);
+  const toISO=v=>!v&&v!==0?new Date().toISOString():(v instanceof Date?v.toISOString():(typeof v==='number'?new Date(v).toISOString():String(v)));
+  window.ELXAO_CHAT_NORMALIZE=function(data,fallbackProject){
+    const s=(data&&typeof data==='object')?data:{};
+    const p=Number(fd(s.project,s.project_id,fallbackProject,0))||0;
+    const type=String(fd(s.type,s.content_type,'text')||'text');
+    const msg=String(fd(s.message,s.content,'')||'');
+    const user=Number(fd(s.user,s.user_id,0))||0;
+    const display=String(fd(s.user_display,s.userDisplay,s.user_name,s.username,user?('User '+user):'User'));
+    let role=(s.role||'').toString().toLowerCase(); if(!roles.has(role)) role=(type==='system')?'sys':'other';
+    const at=toISO(fd(s.at,s.published_at,s.created_at,null));
+    return {type:type,message:msg,project:p,user:user,user_display:display,role:role,at:at};
+  };
+}
+if(!window.ELXAO_ABLY){
+  window.ELXAO_ABLY={client:null,clientPromise:null,libraryPromise:null,channels:new Map()};
+  window.ELXAO_ABLY.loadLibrary=function(){
+    const st=window.ELXAO_ABLY;
+    if(st.libraryPromise) return st.libraryPromise;
+    if(window.Ably&&window.Ably.Realtime&&window.Ably.Realtime.Promise){ st.libraryPromise=Promise.resolve(); return st.libraryPromise; }
+    st.libraryPromise=new Promise((res,rej)=>{
+      const ex=document.querySelector('script[data-elxao-ably]');
+      if(ex){ ex.addEventListener('load',()=>res(),{once:true}); ex.addEventListener('error',()=>rej(new Error('Ably load failed')),{once:true}); return; }
+      const s=document.createElement('script'); s.src='https://cdn.ably.io/lib/ably.min-1.js'; s.async=true; s.setAttribute('data-elxao-ably','1');
+      s.onload=()=>res(); s.onerror=()=>rej(new Error('Ably load failed')); document.head.appendChild(s);
+    });
+    return st.libraryPromise;
+  };
+  window.ELXAO_ABLY.ensureClient=function(tokenDetails){
+    const st=window.ELXAO_ABLY;
+    if(st.clientPromise){
+      return st.clientPromise.then(client=>{
+        if(tokenDetails){ return client.auth.authorize(null,{tokenDetails}).then(()=>client); }
+        return client;
       });
-      return state.libraryPromise;
-    };
-  }
-
-  if(!state.ensureClient){
-    state.ensureClient=function(tokenDetails){
-      if(state.clientPromise){
-        return state.clientPromise.then(function(client){
-          if(tokenDetails){
-            return client.auth.authorize(null,{tokenDetails:tokenDetails}).then(function(){ return client; });
-          }
-          return client;
-        });
-      }
-      state.clientPromise=state.loadLibrary().then(function(){
-        if(!window.Ably||!window.Ably.Realtime||!window.Ably.Realtime.Promise){
-          throw new Error('Ably unavailable');
-        }
-        state.client=new window.Ably.Realtime.Promise({tokenDetails:tokenDetails});
-        return state.client;
-      }).catch(function(err){
-        state.client=null;
-        state.clientPromise=null;
-        throw err;
-      });
-      return state.clientPromise;
-    };
-  }
-
-  if(!state.registerChannel){
-    state.registerChannel=function(client,channelName,project){
-      if(!channelName) return function(){};
-      const channels=state.channels;
-      let entry=channels.get(channelName);
-      if(!entry){
-        entry={refCount:0,handler:null,channel:client.channels.get(channelName),projectId:project};
-        channels.set(channelName,entry);
-      } else {
-        if(!entry.channel){
-          entry.channel=client.channels.get(channelName);
-        }
-        if(project && !entry.projectId){
-          entry.projectId=project;
-        }
-      }
-      entry.refCount++;
-      if(!entry.handler){
-        entry.handler=function(msg){
-          const data=msg&&msg.data?msg.data:{};
-          const projectId=data.project||entry.projectId||project;
-          const extras={};
-          if(msg && typeof msg.id!=='undefined') extras.id=msg.id;
-          if(msg && typeof msg.name!=='undefined') extras.name=msg.name;
-          broadcastMessage(projectId,data,extras);
-        };
-        entry.channel.subscribe(entry.handler);
-      }
-      entry.channel.attach().catch(function(){});
-      return function(){
-        entry.refCount--;
-        if(entry.refCount<=0){
-          if(entry.channel&&entry.handler){
-            entry.channel.unsubscribe(entry.handler);
-          }
-          channels.delete(channelName);
+    }
+    st.clientPromise=st.loadLibrary().then(()=>{
+      if(!window.Ably||!window.Ably.Realtime||!window.Ably.Realtime.Promise) throw new Error('Ably unavailable');
+      st.client=new window.Ably.Realtime.Promise({tokenDetails});
+      return st.client;
+    }).catch(err=>{ st.client=null; st.clientPromise=null; throw err; });
+    return st.clientPromise;
+  };
+  window.ELXAO_ABLY.registerChannel=function(client,channelName,project){
+    if(!channelName) return function(){};
+    const st=window.ELXAO_ABLY; const map=st.channels;
+    let entry=map.get(channelName);
+    if(!entry){ entry={refCount:0,handler:null,channel:client.channels.get(channelName),projectId:project}; map.set(channelName,entry); }
+    else { if(!entry.channel) entry.channel=client.channels.get(channelName); if(project && !entry.projectId) entry.projectId=project; }
+    entry.refCount++;
+    if(!entry.handler){
+      entry.handler=function(msg){
+        const data=(msg&&msg.data)?msg.data:{};
+        const projectId=data.project||entry.projectId||project||0;
+        window.ELXAO_CHAT_BUS.emit({project:projectId,payload:window.ELXAO_CHAT_NORMALIZE(data,projectId)});
+        if(projectId){
+          const bumpAt=data.at||data.published_at||Date.now();
+          window.dispatchEvent(new CustomEvent('elxao:room-bump',{detail:{projectId:projectId,at:bumpAt}}));
         }
       };
-    };
-  }
-
-  return state;
+      entry.channel.subscribe(entry.handler);
+    }
+    entry.channel.attach().catch(()=>{});
+    return function(){ entry.refCount--; if(entry.refCount<=0){ if(entry.channel&&entry.handler) entry.channel.unsubscribe(entry.handler); map.delete(channelName); } };
+  };
 }
+/* ---- end shared helpers ---- */
 
-const ablyState=ensureAblyState();
-
-function registerCleanup(fn){
-  if(typeof fn==='function') cleanupFns.push(fn);
-}
-
-function runCleanup(){
-  while(cleanupFns.length){
-    const fn=cleanupFns.pop();
-    try{ fn(); }catch(e){}
-  }
-}
+function registerCleanup(fn){ if(typeof fn==='function') cleanupFns.push(fn); }
+function runCleanup(){ while(cleanupFns.length){ const fn=cleanupFns.pop(); try{ fn(); }catch(e){} } }
 
 rooms.forEach(function(room){
   const pid=room.getAttribute('data-project');
@@ -1187,232 +822,120 @@ rooms.forEach(function(room){
   const latestAttr=room.getAttribute('data-latest');
   const tsAttr=room.getAttribute('data-timestamp');
   const tsNumeric=tsAttr?parseInt(tsAttr,10):0;
-  if(latestAttr){
-    setRoomActivity(room,latestAttr);
-  } else if(tsNumeric>0){
-    setRoomActivity(room,tsAttr);
-  } else {
-    room.dataset.timestamp=room.dataset.timestamp||'0';
-    room.dataset.latest=room.dataset.latest||'';
-  }
+  if(latestAttr){ setRoomActivity(room,latestAttr); }
+  else if(tsNumeric>0){ setRoomActivity(room,tsAttr); }
+  else { room.dataset.timestamp=room.dataset.timestamp||'0'; room.dataset.latest=room.dataset.latest||''; }
 });
 
 function parseTimestamp(value){
   if(value instanceof Date) return value;
   if(typeof value==='number' && isFinite(value)) return new Date(value);
-  const str=String(value||'').trim();
-  if(!str) return null;
-  if(/^-?\d+$/.test(str)){
-    const num=parseInt(str,10);
-    if(str.length<=10) return new Date(num*1000);
-    return new Date(num);
-  }
-  const normalized=str.replace(' ','T');
-  const date=new Date(normalized);
+  const str=String(value||'').trim(); if(!str) return null;
+  if(/^-?\d+$/.test(str)){ const num=parseInt(str,10); return new Date(str.length<=10?num*1000:num); }
+  const normalized=str.replace(' ','T'); const date=new Date(normalized);
   return isNaN(date.getTime())?null:date;
 }
-
 function pad(v){ return v<10?'0'+v:''+v; }
-
-function formatTimestamp(date){
-  if(!(date instanceof Date) || isNaN(date.getTime())) return '—';
-  const months=['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
-  return months[date.getMonth()]+' '+date.getDate()+', '+pad(date.getHours())+':'+pad(date.getMinutes());
-}
-
-function updateMetaText(room,date){
-  if(!room) return;
-  const meta=room.querySelector('.meta');
-  if(meta && date instanceof Date && !isNaN(date.getTime())){
-    meta.textContent=formatTimestamp(date);
-  } else if(meta && !meta.textContent){
-    meta.textContent='—';
-  }
-}
-
-function setRoomActivity(room,source){
-  const date=parseTimestamp(source);
-  if(!date) return;
-  room.dataset.timestamp=String(date.getTime());
-  room.dataset.latest=date.toISOString();
-  updateMetaText(room,date);
-}
-
+function formatTimestamp(date){ if(!(date instanceof Date) || isNaN(date.getTime())) return '—';
+  const months=['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec']; return months[date.getMonth()]+' '+date.getDate()+', '+pad(date.getHours())+':'+pad(date.getMinutes()); }
+function updateMetaText(room,date){ const meta=room.querySelector('.meta'); if(meta && date instanceof Date && !isNaN(date.getTime())) meta.textContent=formatTimestamp(date); else if(meta && !meta.textContent) meta.textContent='—'; }
+function setRoomActivity(room,source){ const date=parseTimestamp(source); if(!date) return; room.dataset.timestamp=String(date.getTime()); room.dataset.latest=date.toISOString(); updateMetaText(room,date); }
 function bumpRoom(projectId,activity){
-  if(!projectId) return;
-  const key=String(projectId);
-  const room=roomMap.get(key);
-  if(!room) return;
+  if(!projectId) return; const key=String(projectId); const room=roomMap.get(key); if(!room) return;
   const date=(activity instanceof Date)?activity:(parseTimestamp(activity)||new Date());
-  const newTime=date.getTime();
-  const currentTime=parseInt(room.dataset.timestamp||'0',10);
-  if(currentTime && newTime && newTime<currentTime) return;
-  setRoomActivity(room,date);
-  const parent=room.parentElement;
-  if(parent && parent.firstElementChild!==room){
-    parent.insertBefore(room,parent.firstElementChild);
-  }
+  const newTime=date.getTime(); const currentTime=parseInt(room.dataset.timestamp||'0',10);
+  if(currentTime && newTime && newTime<currentTime) return; setRoomActivity(room,date);
+  const parent=room.parentElement; if(parent && parent.firstElementChild!==room){ parent.insertBefore(room,parent.firstElementChild); }
 }
 
 function renderHTML(html){
-  if(!chat) return;
   chat.innerHTML='';
-  if(!html){
-    chat.innerHTML='<div class="placeholder error">Unable to load chat.</div>';
-    return;
-  }
-  const tmp=document.createElement('div');
-  tmp.innerHTML=html;
+  if(!html){ chat.innerHTML='<div class="placeholder error">Unable to load chat.</div>'; return; }
+  const tmp=document.createElement('div'); tmp.innerHTML=html;
   while(tmp.firstChild){
-    const node=tmp.firstChild;
-    tmp.removeChild(node);
-    if(node.nodeName==='SCRIPT'){
-      const s=document.createElement('script');
-      if(node.src) s.src=node.src;
-      s.textContent=node.textContent;
-      chat.appendChild(s);
-    } else {
-      chat.appendChild(node);
-    }
+    const node=tmp.firstChild; tmp.removeChild(node);
+    if(node.nodeName==='SCRIPT'){ const s=document.createElement('script'); s.textContent=node.textContent; chat.appendChild(s); }
+    else { chat.appendChild(node); }
   }
 }
 
 function loadRoom(room){
   if(!room||room===active) return;
   if(active) active.classList.remove('active');
-  active=room;
-  room.classList.add('active');
-  if(chat) chat.innerHTML='<div class="placeholder">Loading…</div>';
-  const pid=room.getAttribute('data-project');
-  if(!pid) return;
-  fetch(rest+'elxao/v1/chat-window?project_id='+encodeURIComponent(pid),{
-    credentials:'same-origin',
-    headers:headers
-  }).then(function(r){
-    if(!r.ok) throw new Error(''+r.status);
-    return r.json();
-  }).then(function(data){
-    const html=(data&&typeof data==='object'&&'html' in data)?data.html:'';
-    renderHTML(html);
-  }).catch(function(){
-    if(chat) chat.innerHTML='<div class="placeholder error">Unable to load chat.</div>';
-  });
+  active=room; room.classList.add('active');
+  chat.innerHTML='<div class="placeholder">Loading…</div>';
+  const pid=room.getAttribute('data-project'); if(!pid) return;
+  fetch(rest+'elxao/v1/chat-window?project_id='+encodeURIComponent(pid),{ credentials:'same-origin', headers:headers })
+  .then(r=>{ if(!r.ok) throw new Error(''+r.status); return r.json(); })
+  .then(data=>{ renderHTML((data&&typeof data==='object'&&'html' in data)?data.html:''); })
+  .catch(()=>{ chat.innerHTML='<div class="placeholder error">Unable to load chat.</div>'; });
 }
 
-rooms.forEach(function(room){
-  room.addEventListener('click',function(){ loadRoom(room); });
-});
+/* attach click listeners */
+rooms.forEach(function(room){ room.addEventListener('click',function(){ loadRoom(room); }); });
 
+/* Ably subscribe for bumps */
 function subscribeInbox(){
   if(!rooms.length || !rest) return;
-  const params=[];
-  const seenProjects=new Set();
-  rooms.forEach(function(room){
-    const pid=room.getAttribute('data-project');
-    if(!pid || seenProjects.has(pid)) return;
-    seenProjects.add(pid);
-    params.push('project_ids[]='+encodeURIComponent(pid));
-  });
+  const params=[]; const seen=new Set();
+  rooms.forEach(function(room){ const pid=room.getAttribute('data-project'); if(!pid || seen.has(pid)) return; seen.add(pid); params.push('project_ids[]='+encodeURIComponent(pid)); });
   if(!params.length) return;
-  fetch(rest+'elxao/v1/inbox-token?'+params.join('&'),{
-    credentials:'same-origin',
-    headers:headers
-  }).then(function(r){
-    if(!r.ok) throw new Error(''+r.status);
-    return r.json();
-  }).then(function(token){
-    if(!token || token.error) return;
-    return ablyState.ensureClient(token).then(function(client){
-      const seenChannels=new Set();
-      rooms.forEach(function(room){
-        const channelName=room.getAttribute('data-room');
-        if(!channelName || seenChannels.has(channelName)) return;
-        seenChannels.add(channelName);
-        if(channelCleanups.has(channelName)) return;
-        const pid=room.getAttribute('data-project');
-        const projectId=pid?parseInt(pid,10):0;
-        const unsubscribe=ablyState.registerChannel(client,channelName,projectId);
-        if(typeof unsubscribe==='function'){
-          channelCleanups.set(channelName,unsubscribe);
-        }
+  fetch(rest+'elxao/v1/inbox-token?'+params.join('&'),{ credentials:'same-origin', headers:headers })
+    .then(r=>{ if(!r.ok) throw new Error(''+r.status); return r.json(); })
+    .then(token=>{
+      if(!token || token.error) return;
+      return window.ELXAO_ABLY.ensureClient(token).then(function(client){
+        const seenChannels=new Set();
+        rooms.forEach(function(room){
+          const channelName=room.getAttribute('data-room'); if(!channelName || seenChannels.has(channelName)) return;
+          seenChannels.add(channelName); if(channelCleanups.has(channelName)) return;
+          const pid=room.getAttribute('data-project'); const projectId=pid?parseInt(pid,10):0;
+          const unsubscribe=window.ELXAO_ABLY.registerChannel(client,channelName,projectId);
+          if(typeof unsubscribe==='function'){ channelCleanups.set(channelName,unsubscribe); }
+        });
       });
-    });
-  }).catch(function(err){
-    console.warn('ELXAO inbox realtime unavailable',err);
-  });
+    })
+    .catch(err=>{ console.warn('ELXAO inbox realtime unavailable',err); });
 }
 
 function onChatEvent(ev){
-  const detail=ev&&ev.detail?ev.detail:{};
-  if(!detail || typeof detail.project==='undefined') return;
-  const payload=normalizePayload(detail.payload||{},detail.project);
-  const projectId=payload.project||parseInt(detail.project,10)||0;
-  if(!projectId) return;
-  const bumpAt=payload.at||Date.now();
-  bumpRoom(projectId,bumpAt);
+  const detail=ev&&ev.detail?ev.detail:{}; if(!detail || typeof detail.project==='undefined') return;
+  const payload=window.ELXAO_CHAT_NORMALIZE(detail.payload||{},detail.project);
+  const projectId=payload.project||parseInt(detail.project,10)||0; if(!projectId) return;
+  const bumpAt=payload.at||Date.now(); bumpRoom(projectId,bumpAt);
 }
 
 window.addEventListener('elxao:chat',onChatEvent);
 registerCleanup(function(){ window.removeEventListener('elxao:chat',onChatEvent); });
 
-if(chatBus.channel && chatBus.channel.addEventListener){
-  const busHandler=function(ev){
-    const detail=ev&&ev.data?ev.data:null;
-    if(!detail) return;
-    if(detail.originId && detail.originId===chatBus.origin) return;
-    onChatEvent({detail:detail});
-  };
-  chatBus.channel.addEventListener('message',busHandler);
-  registerCleanup(function(){
-    if(busCleanup){
-      try{ busCleanup(); }catch(e){}
-      busCleanup=null;
-    }
-  });
-  busCleanup=function(){
-    chatBus.channel.removeEventListener('message',busHandler);
-  };
+if(window.ELXAO_CHAT_BUS.channel && window.ELXAO_CHAT_BUS.channel.addEventListener){
+  const busHandler=function(ev){ const detail=ev&&ev.data?ev.data:null; if(!detail) return; if(detail.originId && detail.originId===window.ELXAO_CHAT_BUS.origin) return; onChatEvent({detail:detail}); };
+  window.ELXAO_CHAT_BUS.channel.addEventListener('message',busHandler);
+  busCleanup=function(){ window.ELXAO_CHAT_BUS.channel.removeEventListener('message',busHandler); };
+  registerCleanup(function(){ if(busCleanup){ try{ busCleanup(); }catch(e){} busCleanup=null; }});
 }
 
-registerCleanup(function(){
-  channelCleanups.forEach(function(unsub){ try{ unsub(); }catch(e){} });
-  channelCleanups.clear();
-});
+registerCleanup(function(){ channelCleanups.forEach(function(unsub){ try{ unsub(); }catch(e){} }); channelCleanups.clear(); });
 
-const observer=new MutationObserver(function(){
-  if(!document.body.contains(root)){
-    observer.disconnect();
-    runCleanup();
-  }
-});
+const observer=new MutationObserver(function(){ if(!document.body.contains(root)){ observer.disconnect(); runCleanup(); } });
 observer.observe(document.body,{childList:true,subtree:true});
 registerCleanup(function(){ observer.disconnect(); });
 window.addEventListener('beforeunload',runCleanup,{once:true});
 
-function handleRoomBump(ev){
-  const detail=ev&&ev.detail?ev.detail:{};
-  if(detail && detail.projectId){
-    bumpRoom(detail.projectId,detail.at||Date.now());
-  }
-}
-
-window.addEventListener('elxao:room-bump',handleRoomBump);
-registerCleanup(function(){ window.removeEventListener('elxao:room-bump',handleRoomBump); });
-
-if(rooms.length){
-  loadRoom(rooms[0]);
-  subscribeInbox();
-}
-})();
+/* Auto-load first room AFTER paint */
+if(rooms.length){ requestAnimationFrame(()=>loadRoom(rooms[0])); subscribeInbox(); }
+});
 </script>
 <?php
     return ob_get_clean();
 }
 
+/* ===========================================================
+   SHORTCODES
+   =========================================================== */
 add_shortcode('elxao_chat_card',function($a){
     $a=shortcode_atts(['project_id'=>0],$a,'elxao_chat_card');
     $pid=(int)$a['project_id']; if(!$pid) $pid=(int)get_the_ID();
     return elxao_chat_render_window($pid);
 });
 add_shortcode('elxao_chat_inbox','elxao_chat_render_inbox');
-
