@@ -20,6 +20,7 @@ if ( ! defined('ELXAO_CHAT_COLOR_READ_UNREAD') )      define('ELXAO_CHAT_COLOR_R
 if ( ! defined('ELXAO_CHAT_COLOR_READ_ALL') )         define('ELXAO_CHAT_COLOR_READ_ALL',         ELXAO_CHAT_COLOR_CLIENT); // fully read indicator
 if ( ! defined('ELXAO_CHAT_COLOR_READ_PM_ONLY') )     define('ELXAO_CHAT_COLOR_READ_PM_ONLY',     '#f472b6'); // admin message read by PM only
 if ( ! defined('ELXAO_CHAT_COLOR_READ_CLIENT_ONLY') ) define('ELXAO_CHAT_COLOR_READ_CLIENT_ONLY', ELXAO_CHAT_COLOR_ADMIN); // admin message read by client only
+if ( ! defined('ELXAO_CHAT_COLOR_UNREAD_BG') )        define('ELXAO_CHAT_COLOR_UNREAD_BG',        'rgba(107,114,128,0.16)'); // unread highlight background
 if ( ! defined('ELXAO_CHAT_READ_META_KEY') ) define('ELXAO_CHAT_READ_META_KEY','_elxao_chat_last_reads');
 
 /* ===========================================================
@@ -604,7 +605,7 @@ function elxao_chat_render_window($pid){
 
     // CSS variables from hard-coded constants
     $style_vars = sprintf(
-        '--chat-color:%s; --chat-client:%s; --chat-pm:%s; --chat-admin:%s; --chat-sys:%s; --chat-read-unread:%s; --chat-read-read:%s; --chat-read-client:%s; --chat-read-pm:%s;',
+        '--chat-color:%s; --chat-client:%s; --chat-pm:%s; --chat-admin:%s; --chat-sys:%s; --chat-read-unread:%s; --chat-read-read:%s; --chat-read-client:%s; --chat-read-pm:%s; --chat-unread-bg:%s;',
         esc_attr(ELXAO_CHAT_COLOR_BASE),
         esc_attr(ELXAO_CHAT_COLOR_CLIENT),
         esc_attr(ELXAO_CHAT_COLOR_PM),
@@ -613,7 +614,8 @@ function elxao_chat_render_window($pid){
         esc_attr(ELXAO_CHAT_COLOR_READ_UNREAD),
         esc_attr(ELXAO_CHAT_COLOR_READ_ALL),
         esc_attr(ELXAO_CHAT_COLOR_READ_CLIENT_ONLY),
-        esc_attr(ELXAO_CHAT_COLOR_READ_PM_ONLY)
+        esc_attr(ELXAO_CHAT_COLOR_READ_PM_ONLY),
+        esc_attr(ELXAO_CHAT_COLOR_UNREAD_BG)
     );
 
 ob_start();?>
@@ -650,8 +652,9 @@ ob_start();?>
 #elxao-chat-<?php echo $pid;?> .client { color:var(--chat-client) }
 #elxao-chat-<?php echo $pid;?> .pm     { color:var(--chat-pm) }
 #elxao-chat-<?php echo $pid;?> .admin  { color:var(--chat-admin) }
-#elxao-chat-<?php echo $pid;?> .chat-line{display:flex;gap:8px;align-items:flex-start;margin-bottom:8px}
+#elxao-chat-<?php echo $pid;?> .chat-line{display:flex;gap:8px;align-items:flex-start;margin-bottom:8px;padding:6px 10px;border-radius:10px;transition:background-color .25s ease}
 #elxao-chat-<?php echo $pid;?> .chat-line:last-child{margin-bottom:0}
+#elxao-chat-<?php echo $pid;?> .chat-line.is-unread{background:var(--chat-unread-bg)}
 #elxao-chat-<?php echo $pid;?> .chat-line .chat-text{flex:1;color:inherit;word-break:break-word;white-space:pre-wrap}
 #elxao-chat-<?php echo $pid;?> .chat-read-indicator{width:10px;height:10px;border-radius:999px;background:var(--chat-read-unread);margin-top:6px;flex:0 0 10px;box-shadow:0 0 0 1px rgba(0,0,0,0.35)}
 #elxao-chat-<?php echo $pid;?> .chat-read-indicator.chat-read-indicator--unread{background:var(--chat-read-unread)}
@@ -1247,6 +1250,33 @@ function determineIndicator(data,role){
   return {className:anyRead?'chat-read-indicator--read':'chat-read-indicator--unread',label:anyRead?'Read':'Unread'};
 }
 
+function resolveViewerReadStatus(payload){
+  if(!payload || typeof payload!=='object') return true;
+  if(myRole==='other') return true;
+  const status=(payload.read_status && typeof payload.read_status==='object')?payload.read_status:null;
+  if(status && Object.prototype.hasOwnProperty.call(status,myRole)) return !!status[myRole];
+  const timesSource=(payload.reads && payload.reads.times && typeof payload.reads.times==='object')?payload.reads.times:currentReadTimes;
+  const computed=buildStatusFromTimes(payload,timesSource);
+  if(Object.prototype.hasOwnProperty.call(computed,myRole)) return !!computed[myRole];
+  return true;
+}
+
+function isUnreadForViewer(payload){
+  if(myRole==='other') return false;
+  if(!payload || typeof payload!=='object') return false;
+  if((payload.role||'other')==='sys') return false;
+  const author=('user' in payload && payload.user!=null)?parseInt(payload.user,10): (('user_id' in payload && payload.user_id!=null)?parseInt(payload.user_id,10):0);
+  if(author && author===myId) return false;
+  return !resolveViewerReadStatus(payload);
+}
+
+function updateUnreadStateForLine(line){
+  if(!line) return;
+  const payload=line.__chatPayload||{};
+  if(isUnreadForViewer(payload)) line.classList.add('is-unread');
+  else line.classList.remove('is-unread');
+}
+
 function applyIndicatorState(indicator,info){
   indicator.className='chat-read-indicator';
   indicator.removeAttribute('aria-hidden');
@@ -1293,6 +1323,7 @@ function applyReadReceipt(data){
     payload.reads.times=Object.assign({},effectiveTimes);
     const indicator=line.querySelector('.chat-read-indicator');
     if(indicator) applyIndicatorState(indicator,determineIndicator(payload,payload.role||line.dataset.role||'other'));
+    updateUnreadStateForLine(line);
   });
 }
 
@@ -1557,6 +1588,7 @@ function appendChatLine(source){
     if(messageId) existing.dataset.messageId=messageId;
     if(userId) existing.dataset.user=userId;
     updateLatestFromPayload(merged);
+    updateUnreadStateForLine(existing);
     // DO NOT auto mark read; visibility observer handles it.
     ensureObserved(existing);
     return;
@@ -1577,6 +1609,7 @@ function appendChatLine(source){
   if(messageId) line.dataset.messageId=messageId;
   if(userId) line.dataset.user=userId;
   list.appendChild(line);
+  updateUnreadStateForLine(line);
   list.scrollTop=list.scrollHeight;
   updateLatestFromPayload(data);
 
@@ -1618,6 +1651,7 @@ function applyServerAck(resp){
     }
     const indicator=line.querySelector('.chat-read-indicator');
     if(indicator) applyIndicatorState(indicator,determineIndicator(payload,payload.role||line.dataset.role||'other'));
+    updateUnreadStateForLine(line);
     updateLatestFromPayload(payload);
     break;
   }
