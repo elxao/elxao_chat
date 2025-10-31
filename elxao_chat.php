@@ -16,6 +16,7 @@ if ( ! defined('ELXAO_CHAT_COLOR_CLIENT') )  define('ELXAO_CHAT_COLOR_CLIENT', '
 if ( ! defined('ELXAO_CHAT_COLOR_PM') )      define('ELXAO_CHAT_COLOR_PM',     '#e5e7eb'); // PM messages
 if ( ! defined('ELXAO_CHAT_COLOR_ADMIN') )   define('ELXAO_CHAT_COLOR_ADMIN',  '#60a5fa'); // admin messages
 if ( ! defined('ELXAO_CHAT_COLOR_SYS') )     define('ELXAO_CHAT_COLOR_SYS',    '#94a3b8'); // system lines
+if ( ! defined('ELXAO_CHAT_COLOR_UNREAD_HIGHLIGHT') ) define('ELXAO_CHAT_COLOR_UNREAD_HIGHLIGHT', 'rgba(254,243,199,0.8)');
 if ( ! defined('ELXAO_CHAT_COLOR_READ_UNREAD') )      define('ELXAO_CHAT_COLOR_READ_UNREAD',      '#6b7280'); // unread indicator
 if ( ! defined('ELXAO_CHAT_COLOR_READ_ALL') )         define('ELXAO_CHAT_COLOR_READ_ALL',         ELXAO_CHAT_COLOR_CLIENT); // fully read indicator
 if ( ! defined('ELXAO_CHAT_COLOR_READ_PM_ONLY') )     define('ELXAO_CHAT_COLOR_READ_PM_ONLY',     '#f472b6'); // admin message read by PM only
@@ -494,36 +495,21 @@ function elxao_chat_rest_history(WP_REST_Request $r){
     $role = elxao_chat_role_for_user($pid,$uid);
     $participants = elxao_chat_get_client_pm_ids($pid);
     $reads = elxao_chat_get_last_reads($pid);
-    $reads_before = $reads;
-    $updated_reads = false;
-
-    if(in_array($role,['client','pm','admin'],true)){
-        $maybe = elxao_chat_update_last_read($pid,$role,current_time('timestamp'));
-        if($maybe){
-            $reads = $maybe;
-            $updated_reads = true;
-        }
-    }
 
     foreach($rows as &$row){
-        $pre_status = elxao_chat_build_message_read_status($pid,$row['role'],$row['published_at'],$reads_before,$participants);
         $status = elxao_chat_build_message_read_status($pid,$row['role'],$row['published_at'],$reads,$participants);
         $row['read_status']=$status;
         $row['reads']=[
             'roles'=>$status,
             'times'=>$reads,
         ];
-        if(in_array($role,['client','pm','admin'],true) && isset($pre_status[$role])){
-            $row['viewer_unread'] = !$pre_status[$role];
+        if(in_array($role,['client','pm','admin'],true) && isset($status[$role])){
+            $row['viewer_unread'] = !$status[$role];
         } else {
             $row['viewer_unread'] = false;
         }
     }
     unset($row);
-
-    if($updated_reads){
-        elxao_chat_publish_read_receipt($pid,$reads,$uid);
-    }
 
     return new WP_REST_Response([
         'items'=>$rows,
@@ -655,12 +641,13 @@ function elxao_chat_render_window($pid){
 
     // CSS variables from hard-coded constants
     $style_vars = sprintf(
-        '--chat-color:%s; --chat-client:%s; --chat-pm:%s; --chat-admin:%s; --chat-sys:%s; --chat-read-unread:%s; --chat-read-read:%s; --chat-read-client:%s; --chat-read-pm:%s;',
+        '--chat-color:%s; --chat-client:%s; --chat-pm:%s; --chat-admin:%s; --chat-sys:%s; --chat-unread-highlight:%s; --chat-read-unread:%s; --chat-read-read:%s; --chat-read-client:%s; --chat-read-pm:%s;',
         esc_attr(ELXAO_CHAT_COLOR_BASE),
         esc_attr(ELXAO_CHAT_COLOR_CLIENT),
         esc_attr(ELXAO_CHAT_COLOR_PM),
         esc_attr(ELXAO_CHAT_COLOR_ADMIN),
         esc_attr(ELXAO_CHAT_COLOR_SYS),
+        esc_attr(ELXAO_CHAT_COLOR_UNREAD_HIGHLIGHT),
         esc_attr(ELXAO_CHAT_COLOR_READ_UNREAD),
         esc_attr(ELXAO_CHAT_COLOR_READ_ALL),
         esc_attr(ELXAO_CHAT_COLOR_READ_CLIENT_ONLY),
@@ -701,10 +688,11 @@ ob_start();?>
 #elxao-chat-<?php echo $pid;?> .client { color:var(--chat-client) }
 #elxao-chat-<?php echo $pid;?> .pm     { color:var(--chat-pm) }
 #elxao-chat-<?php echo $pid;?> .admin  { color:var(--chat-admin) }
-#elxao-chat-<?php echo $pid;?> .chat-line{position:relative;display:flex;gap:8px;align-items:flex-start;margin-bottom:8px;padding:6px 8px;border-radius:10px;transition:background-color .3s ease,box-shadow .3s ease}
+#elxao-chat-<?php echo $pid;?> .chat-line{position:relative;display:flex;gap:8px;align-items:flex-start;margin-bottom:8px;padding:6px 8px;border-radius:10px;overflow:hidden;transition:background-color .3s ease,box-shadow .3s ease}
 #elxao-chat-<?php echo $pid;?> .chat-line:last-child{margin-bottom:0}
-#elxao-chat-<?php echo $pid;?> .chat-line::before{content:"";position:absolute;inset:0;border-radius:10px;background:rgba(248,113,113,0.18);opacity:0;transition:opacity .35s ease}
+#elxao-chat-<?php echo $pid;?> .chat-line::before{content:"";position:absolute;inset:0;border-radius:10px;background:var(--chat-unread-highlight);opacity:0;pointer-events:none}
 #elxao-chat-<?php echo $pid;?> .chat-line.is-unread::before{opacity:1}
+#elxao-chat-<?php echo $pid;?> .chat-line.was-unread::before{animation:chatUnreadFade .45s ease forwards}
 #elxao-chat-<?php echo $pid;?> .chat-line .chat-text{flex:1;color:inherit;word-break:break-word;white-space:pre-wrap;position:relative;z-index:1}
 #elxao-chat-<?php echo $pid;?> .chat-read-indicator{width:10px;height:10px;border-radius:999px;background:var(--chat-read-unread);margin-top:6px;flex:0 0 10px;box-shadow:0 0 0 1px rgba(0,0,0,0.35);position:relative;z-index:1}
 #elxao-chat-<?php echo $pid;?> .chat-read-indicator.chat-read-indicator--unread{background:var(--chat-read-unread)}
@@ -717,6 +705,7 @@ ob_start();?>
 #elxao-chat-<?php echo $pid;?> .send{display:inline-flex;align-items:center;justify-content:center;border:1px solid #6b7280;border-radius:10px;padding:0 10px;background:transparent;cursor:pointer;min-width:44px;color:inherit}
 #elxao-chat-<?php echo $pid;?> .send:hover{background:rgba(255,255,255,.08);border-color:#9ca3af}
 #elxao-chat-<?php echo $pid;?> .send:disabled{opacity:.5;cursor:not-allowed}
+@keyframes chatUnreadFade{from{opacity:1}to{opacity:0}}
 </style>
 <script>
 (function(){
@@ -727,6 +716,7 @@ const btn=root.querySelector('.send');
 const pid=root.dataset.project,room=root.dataset.room,rest=root.dataset.rest,nonce=root.dataset.nonce;
 const myId=parseInt(root.dataset.myid,10)||0;
 const myRole=(root.dataset.myrole||'other');
+const viewerRoleKey=(myRole==='client'||myRole==='pm'||myRole==='admin')?myRole:'';
 const hdr={'X-WP-Nonce':nonce};
 const projectId=parseInt(pid,10)||0;
 const clientId=parseInt(root.dataset.client,10)||0;
@@ -746,6 +736,19 @@ let fallbackInFlight=false;
 const FALLBACK_INTERVAL=4000;
 const currentReadTimes={client:'',pm:'',admin:''};
 const DEBUG=false;
+const projectKey=projectId||parseInt(pid,10)||0;
+let pendingUnreadCount=0;
+let lastNotifiedUnread=null;
+const unreadObserver=(typeof IntersectionObserver==='function' && list)? new IntersectionObserver(function(entries){
+  entries.forEach(function(entry){
+    const line=entry&&entry.target?entry.target:null;
+    if(!line || !line.__isUnread) return;
+    const ratio=(typeof entry.intersectionRatio==='number')?entry.intersectionRatio:0;
+    if(entry.isIntersecting && ratio>=0.6){
+      markLineAsRead(line,'view');
+    }
+  });
+},{root:list,threshold:[0.6,0.75,0.95],rootMargin:'0px 0px -5% 0px'}):null;
 
 /* ---------- Shared helpers (guarded singletons) ---------- */
 if(!window.ELXAO_CHAT_BUS){
@@ -1257,30 +1260,87 @@ function messageIsUnreadForViewer(payload){
   if(role===myRole) return false;
   return true;
 }
+function notifyUnreadCount(force){
+  if(!projectKey) return;
+  if(!force && lastNotifiedUnread===pendingUnreadCount) return;
+  lastNotifiedUnread=pendingUnreadCount;
+  window.dispatchEvent(new CustomEvent('elxao:room-unread-change',{detail:{projectId:projectKey,count:pendingUnreadCount}}));
+}
+function triggerUnreadFade(line){
+  if(!line) return;
+  line.classList.add('was-unread');
+  line.addEventListener('animationend',function handler(){
+    line.classList.remove('was-unread');
+  },{once:true});
+}
+function setLineUnread(line,shouldBeUnread){
+  if(!line) return false;
+  if(shouldBeUnread){
+    if(line.__isUnread) return false;
+    line.__isUnread=true;
+    line.classList.add('is-unread');
+    if(line.__unreadTimer){ clearTimeout(line.__unreadTimer); line.__unreadTimer=null; }
+    const payload=line.__chatPayload;
+    if(payload){
+      payload.viewer_unread=true;
+      if(viewerRoleKey && payload.read_status && typeof payload.read_status==='object') payload.read_status[viewerRoleKey]=false;
+      if(viewerRoleKey && payload.reads && payload.reads.roles && typeof payload.reads.roles==='object') payload.reads.roles[viewerRoleKey]=false;
+    }
+    if(unreadObserver){
+      unreadObserver.observe(line);
+    } else {
+      line.__unreadTimer=setTimeout(function(){ line.__unreadTimer=null; markLineAsRead(line,'fallback'); },1200);
+    }
+    pendingUnreadCount+=1;
+    notifyUnreadCount();
+    return true;
+  }
+  if(line.__unreadTimer){ clearTimeout(line.__unreadTimer); line.__unreadTimer=null; }
+  if(!line.__isUnread){
+    line.classList.remove('is-unread');
+    const payload=line.__chatPayload;
+    if(payload) payload.viewer_unread=false;
+    return false;
+  }
+  line.__isUnread=false;
+  line.classList.remove('is-unread');
+  if(unreadObserver){
+    unreadObserver.unobserve(line);
+  }
+  const payload=line.__chatPayload;
+  if(payload){
+    payload.viewer_unread=false;
+    if(viewerRoleKey && payload.read_status && typeof payload.read_status==='object') payload.read_status[viewerRoleKey]=true;
+    if(viewerRoleKey && payload.reads && payload.reads.roles && typeof payload.reads.roles==='object') payload.reads.roles[viewerRoleKey]=true;
+  }
+  triggerUnreadFade(line);
+  pendingUnreadCount=Math.max(0,pendingUnreadCount-1);
+  notifyUnreadCount();
+  return true;
+}
+function markLineAsRead(line,reason){
+  if(!line) return;
+  const changed=setLineUnread(line,false);
+  if(!changed) return;
+  if(reason==='view' || reason==='fallback'){
+    scheduleReadSync();
+  }
+}
+function resetUnreadTracking(){
+  if(unreadObserver){ unreadObserver.disconnect(); }
+  pendingUnreadCount=0;
+  lastNotifiedUnread=null;
+  notifyUnreadCount(true);
+}
 function handleViewerUnread(line,payload){
   if(!line) return;
-  if(line.__viewerUnreadTimer){
-    clearTimeout(line.__viewerUnreadTimer);
-    line.__viewerUnreadTimer=null;
-  }
   if(!payload||typeof payload!=='object'){
-    line.classList.remove('is-unread');
+    setLineUnread(line,false);
     return;
   }
   const unread=messageIsUnreadForViewer(payload);
   if(!unread && payload.viewer_unread) payload.viewer_unread=false;
-  if(unread){
-    line.classList.add('is-unread');
-  } else {
-    line.classList.remove('is-unread');
-  }
-  if(payload.viewer_unread){
-    line.__viewerUnreadTimer=setTimeout(function(){
-      line.__viewerUnreadTimer=null;
-      payload.viewer_unread=false;
-      handleViewerUnread(line,payload);
-    },1200);
-  }
+  setLineUnread(line,unread);
 }
 function determineIndicator(data,role){
   if(role==='sys') return null;
@@ -1443,14 +1503,13 @@ function appendChatLine(source){
     if(userId) existing.dataset.user=userId;
     handleViewerUnread(existing,merged);
     updateLatestFromPayload(merged);
-    if(!isRenderingHistory && role!=='sys' && (merged.user||0)!==myId){
-      scheduleReadSync();
-    }
     return;
   }
 
   const line=document.createElement('div');
   line.className='chat-line '+role;
+  line.__isUnread=false;
+  line.__unreadTimer=null;
   const indicator=document.createElement('span');
   const indicatorInfo=determineIndicator(data,role);
   applyIndicatorState(indicator,indicatorInfo);
@@ -1469,9 +1528,6 @@ function appendChatLine(source){
   list.appendChild(line);
   list.scrollTop=list.scrollHeight;
   updateLatestFromPayload(data);
-  if(!isRenderingHistory && role!=='sys' && (data.user||0)!==myId){
-    scheduleReadSync();
-  }
 }
 function fingerprint(project,user,content){
   if(!project||!user) return '';
@@ -1597,6 +1653,7 @@ function renderHistory(items){
   latestAt='';
   latestId=0;
   try{
+    resetUnreadTracking();
     if(list) list.innerHTML='';
     items.forEach(function(m){
       const payload=mapHistoryItem(m);
@@ -1604,6 +1661,7 @@ function renderHistory(items){
     });
   } finally {
     isRenderingHistory=false;
+    notifyUnreadCount(true);
   }
 }
 function processIncrementalHistory(items){
@@ -2210,7 +2268,6 @@ function loadRoom(room){
   if(!room||room===active) return;
   if(active) active.classList.remove('active');
   active=room; room.classList.add('active');
-  setRoomUnread(room,0);
   chat.innerHTML='<div class="placeholder">Loading…</div>';
   const pid=room.getAttribute('data-project'); if(!pid) return;
   fetch(rest+'elxao/v1/chat-window?project_id='+encodeURIComponent(pid),{ credentials:'same-origin', headers:headers })
@@ -2305,8 +2362,20 @@ function onChatEvent(ev){
   const bumpAt=payload.at||Date.now(); bumpRoom(projectId,bumpAt);
 }
 
+function onRoomUnreadChange(ev){
+  const detail=ev&&ev.detail?ev.detail:null; if(!detail) return;
+  const projectId=('projectId' in detail)?parseInt(detail.projectId,10):0; if(!projectId) return;
+  const room=roomMap.get(String(projectId)); if(!room) return;
+  const raw=detail.count;
+  const parsed=typeof raw==='number'?raw:parseInt(raw,10);
+  const safe=Number.isFinite(parsed)?Math.max(0,parsed):0;
+  syncRoomUnreadState(room,safe);
+}
+
 window.addEventListener('elxao:chat',onChatEvent);
+window.addEventListener('elxao:room-unread-change',onRoomUnreadChange);
 registerCleanup(function(){ window.removeEventListener('elxao:chat',onChatEvent); });
+registerCleanup(function(){ window.removeEventListener('elxao:room-unread-change',onRoomUnreadChange); });
 
 if(window.ELXAO_CHAT_BUS.channel && window.ELXAO_CHAT_BUS.channel.addEventListener){
   const busHandler=function(ev){ const detail=ev&&ev.data?ev.data:null; if(!detail) return; if(detail.originId && detail.originId===window.ELXAO_CHAT_BUS.origin) return; onChatEvent({detail:detail}); };
