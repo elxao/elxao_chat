@@ -850,8 +850,8 @@ ob_start();?>
 #elxao-chat-<?php echo $pid;?> .chat-read-indicator.chat-read-indicator--client{background:var(--chat-read-client)}
 #elxao-chat-<?php echo $pid;?> .chat-read-indicator.chat-read-indicator--pm{background:var(--chat-read-pm)}
 #elxao-chat-<?php echo $pid;?> .composer{border-top:1px solid rgba(15,23,42,0.08);padding:18px 20px;background:rgba(255,255,255,0.78);backdrop-filter:saturate(180%) blur(22px)}
-#elxao-chat-<?php echo $pid;?> .composer-input{position:relative;display:flex;align-items:center;width:100%;background:#ffffff;border:1px solid #d0d7e5;border-radius:999px;padding:10px 18px;box-shadow:inset 0 1px 3px rgba(15,23,42,0.08);transition:border-color .2s ease,box-shadow .2s ease}
-#elxao-chat-<?php echo $pid;?> textarea{flex:1;resize:none;background:transparent;border:none;padding:0 64px 0 0;color:var(--chat-color);font:inherit;line-height:1.5;min-height:24px}
+#elxao-chat-<?php echo $pid;?> .composer-input{position:relative;display:flex;align-items:center;width:100%;background:#ffffff;border:1px solid #d0d7e5;border-radius:999px;padding:0 18px;min-height:46px;box-shadow:inset 0 1px 3px rgba(15,23,42,0.08);transition:border-color .2s ease,box-shadow .2s ease}
+#elxao-chat-<?php echo $pid;?> textarea{flex:1;resize:none;background:transparent;border:none;padding:12px 64px 12px 0;color:var(--chat-color);font:inherit;line-height:1.5;min-height:46px}
 #elxao-chat-<?php echo $pid;?> textarea:focus{outline:none}
 #elxao-chat-<?php echo $pid;?> .composer-input:focus-within{border-color:#0ea5e9;box-shadow:0 0 0 4px rgba(14,165,233,0.15)}
 #elxao-chat-<?php echo $pid;?> .send{position:absolute;right:10px;display:inline-flex;align-items:center;justify-content:center;width:46px;height:46px;border-radius:50%;border:none;background:linear-gradient(135deg,#0ea5e9 0%,#2563eb 100%);cursor:pointer;color:#ffffff;transition:transform .2s ease,box-shadow .2s ease,filter .2s ease}
