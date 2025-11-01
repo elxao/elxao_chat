@@ -485,6 +485,7 @@ function elxao_chat_rest_send(WP_REST_Request $r){
     ],200);
 }
 
+
 function elxao_chat_rest_history(WP_REST_Request $r){
     global $wpdb; $t=$wpdb->prefix.'elxao_chat_messages';
     $pid=(int)$r['project_id']; $uid=get_current_user_id();
@@ -497,33 +498,82 @@ function elxao_chat_rest_history(WP_REST_Request $r){
     $after_id  = (int)$r->get_param('after_id');
     $after     = elxao_chat_normalize_datetime_value($after_raw);
 
+    $before_raw = $r->get_param('before');
+    $before_id  = (int)$r->get_param('before_id');
+    $before     = elxao_chat_normalize_datetime_value($before_raw);
+
+    $order_param = strtoupper(trim((string)$r->get_param('order')));
+    $desc_requested = ($order_param === 'DESC');
+
     $where_clauses = ['project_id=%d'];
     $params = [$pid];
 
-    if ($after) {
-        if ($after_id > 0) {
-            $where_clauses[] = '(published_at > %s OR (published_at = %s AND id > %d))';
-            $params[] = $after;
-            $params[] = $after;
+    $use_after = ($after || $after_id);
+    $use_before = (!$use_after) && ($before || $before_id);
+    $use_desc = false;
+
+    if ($use_after) {
+        if ($after) {
+            if ($after_id > 0) {
+                $where_clauses[] = '(published_at > %s OR (published_at = %s AND id > %d))';
+                $params[] = $after;
+                $params[] = $after;
+                $params[] = $after_id;
+            } else {
+                $where_clauses[] = 'published_at > %s';
+                $params[] = $after;
+            }
+        } elseif ($after_id > 0) {
+            $where_clauses[] = 'id > %d';
             $params[] = $after_id;
-        } else {
-            $where_clauses[] = 'published_at > %s';
-            $params[] = $after;
         }
-    } elseif ($after_id > 0) {
-        $where_clauses[] = 'id > %d';
-        $params[] = $after_id;
+    } elseif ($use_before) {
+        if ($before) {
+            if ($before_id > 0) {
+                $where_clauses[] = '(published_at < %s OR (published_at = %s AND id < %d))';
+                $params[] = $before;
+                $params[] = $before;
+                $params[] = $before_id;
+            } else {
+                $where_clauses[] = 'published_at < %s';
+                $params[] = $before;
+            }
+        } elseif ($before_id > 0) {
+            $where_clauses[] = 'id < %d';
+            $params[] = $before_id;
+        }
+        $use_desc = true;
+    } elseif ($desc_requested) {
+        $use_desc = true;
+    }
+
+    if ($use_after) {
+        $use_desc = false;
     }
 
     $where_sql = implode(' AND ',$where_clauses);
-    $params[] = $limit;
+    $fetch_limit = $limit + ($use_desc ? 1 : 0);
+    $params[] = $fetch_limit;
 
+    $order_direction = $use_desc ? 'DESC' : 'ASC';
     $sql = "SELECT id,project_id,user_id,content,content_type,published_at
-            FROM $t WHERE $where_sql ORDER BY published_at ASC,id ASC LIMIT %d";
+           FROM $t WHERE $where_sql ORDER BY published_at $order_direction,id $order_direction LIMIT %d";
 
     $rows = $wpdb->get_results($wpdb->prepare($sql,...$params),ARRAY_A);
 
+    $has_more_before = false;
+    if ($use_desc && count($rows) > $limit) {
+        $has_more_before = true;
+        $rows = array_slice($rows,0,$limit);
+    }
+
+    if ($use_desc) {
+        $rows = array_values(array_reverse($rows));
+    }
+
     foreach($rows as &$row){
+        $row['id'] = (int)$row['id'];
+        $row['project_id'] = (int)$row['project_id'];
         $u=get_userdata($row['user_id']);
         $row['user_display']=$u?$u->display_name:'System';
         $row['user_id']=(int)$row['user_id'];
@@ -534,6 +584,34 @@ function elxao_chat_rest_history(WP_REST_Request $r){
     $role = elxao_chat_role_for_user($pid,$uid);
     $reads = elxao_chat_get_last_reads($pid);
 
+    $oldest_info = null;
+    $newest_info = null;
+    if (!empty($rows)) {
+        $first = $rows[0];
+        $last  = $rows[count($rows)-1];
+        $oldest_info = [
+            'id' => (int)$first['id'],
+            'at' => $first['published_at'],
+        ];
+        $newest_info = [
+            'id' => (int)$last['id'],
+            'at' => $last['published_at'],
+        ];
+    }
+
+    $paging = [
+        'order' => $use_desc ? 'desc' : 'asc',
+    ];
+    if ($use_desc) {
+        $paging['has_more_before'] = $has_more_before;
+    }
+    if ($oldest_info) {
+        $paging['oldest'] = $oldest_info;
+    }
+    if ($newest_info) {
+        $paging['newest'] = $newest_info;
+    }
+
     // IMPORTANT FIX: Do NOT auto-mark read on history fetch.
     // Visibility-based read is handled only via explicit POST /messages/read from the UI now.
 
@@ -541,8 +619,10 @@ function elxao_chat_rest_history(WP_REST_Request $r){
         'items'=>$rows,
         'reads'=>$reads,
         'role'=>$role,
+        'paging'=>$paging,
     ],200);
 }
+
 
 function elxao_chat_rest_mark_read(WP_REST_Request $r){
     $pid=(int)$r['project_id'];
@@ -1190,12 +1270,20 @@ const currentReadTimes={client:'',pm:'',admin:''};
 let isRenderingHistory=false;
 let latestAt='';
 let latestId=0;
+let oldestAt='';
+let oldestId=0;
+let historyReady=false;
+let historyStartReached=false;
+let loadingOlder=false;
 let fallbackActive=false;
 let fallbackTimer=null;
 let fallbackInFlight=false;
 let optimisticLatestReadMs=0;
 const FALLBACK_INTERVAL=4000;
 const DEBUG=false;
+const HISTORY_PAGE_SIZE=10;
+const HISTORY_INITIAL_LIMIT=HISTORY_PAGE_SIZE;
+const HISTORY_SCROLL_OFFSET=48;
 
 function updateCurrentReadTimes(times){
   if(!times || typeof times!=='object') return false;
@@ -1235,6 +1323,39 @@ function updateLatestFromPayload(data){
   if(shouldUpdate(latestAt,latestId,stamp,numericId)){
     if(stamp) latestAt=stamp;
     if(numericId>0) latestId=numericId;
+  }
+}
+
+function updateOldestFromPayload(data){
+  if(!data || typeof data!=='object') return;
+  const stampRaw=data.at||data.published_at||data.created_at||data.timestamp||'';
+  const stamp=stampRaw?String(stampRaw):'';
+  const idValue=('id' in data)?data.id:('message_id' in data?data.message_id:null);
+  const numericId=(idValue!==undefined&&idValue!==null)?parseInt(idValue,10):0;
+  const shouldUpdate=function(currentStamp,currentId,newStamp,newId){
+    if(!currentStamp && !currentId) return true;
+    if(newStamp && !currentStamp) return true;
+    if(newStamp && currentStamp){
+      if(newStamp<currentStamp) return true;
+      if(newStamp===currentStamp && newId>0 && (!currentId || newId<currentId)) return true;
+      return false;
+    }
+    if(!newStamp){
+      if(!currentStamp && newId>0){
+        if(!currentId || newId<currentId) return true;
+      }
+    }
+    return false;
+  };
+  if(shouldUpdate(oldestAt,oldestId,stamp,numericId)){
+    if(stamp) oldestAt=stamp;
+    if(numericId>0) {
+      oldestId=numericId;
+    } else if(!stamp) {
+      oldestId=0;
+    } else if(!numericId) {
+      oldestId=0;
+    }
   }
 }
 
@@ -1427,7 +1548,10 @@ function load(params){
   const query=['project_id='+encodeURIComponent(pid||'')];
   if(params && params.after){ query.push('after='+encodeURIComponent(params.after)); }
   if(params && params.after_id){ query.push('after_id='+encodeURIComponent(params.after_id)); }
+  if(params && params.before){ query.push('before='+encodeURIComponent(params.before)); }
+  if(params && params.before_id){ query.push('before_id='+encodeURIComponent(params.before_id)); }
   if(params && params.limit){ query.push('limit='+encodeURIComponent(params.limit)); }
+  if(params && params.order){ query.push('order='+encodeURIComponent(params.order)); }
   const url=rest+'elxao/v1/messages?'+query.join('&');
   return fetch(url,{credentials:'same-origin',headers:hdr}).then(r=>r.json());
 }
@@ -1439,7 +1563,7 @@ function send(content){
   }).then(r=>r.json());
 }
 
-function handleChatPayload(payload){
+function handleChatPayload(payload,options){
   if(!payload) return;
   const data=window.ELXAO_CHAT_NORMALIZE(payload,projectId);
   if(!data) return;
@@ -1447,7 +1571,7 @@ function handleChatPayload(payload){
     applyReadReceipt(data);
     return;
   }
-  appendChatLine(data);
+  appendChatLine(data,options);
 }
 
 function handleRealtimePayload(payload){
@@ -1499,6 +1623,13 @@ function cleanup(){
   realtimeReady=false;
   latestSeenAtMs=0;
   optimisticLatestReadMs=0;
+  latestAt='';
+  latestId=0;
+  oldestAt='';
+  oldestId=0;
+  historyReady=false;
+  historyStartReached=false;
+  loadingOlder=false;
   if(busCleanup){ try{ busCleanup(); }catch(e){} busCleanup=null; }
   stopFallbackPolling();
   if(observer){
@@ -1533,21 +1664,49 @@ function mapHistoryItem(item){
     id:item.id
   };
 }
-function renderHistory(items){
-  if(!items||!Array.isArray(items)) return;
+function renderHistory(items,meta){
+  const source=Array.isArray(items)?items:[];
   isRenderingHistory=true;
   latestAt=''; latestId=0;
+  oldestAt=''; oldestId=0;
+  historyReady=false;
+  loadingOlder=false;
   try{
     if(list) list.innerHTML='';
-    items.forEach(function(m){
+    source.forEach(function(m){
       const payload=mapHistoryItem(m);
-      if(payload) handleChatPayload(payload);
+      if(payload) handleChatPayload(payload,{preserveScroll:true});
     });
   } finally {
     isRenderingHistory=false;
   }
+  historyReady=true;
+  const metaInfo=meta&&typeof meta==='object'?meta:{};
+  const limit=(typeof metaInfo.limit==='number' && metaInfo.limit>0)?metaInfo.limit:HISTORY_INITIAL_LIMIT;
+  const hasMoreBefore=(typeof metaInfo.hasMoreBefore==='boolean')?metaInfo.hasMoreBefore:null;
+  if(hasMoreBefore===false || source.length===0){
+    historyStartReached=true;
+  } else if(hasMoreBefore===true){
+    historyStartReached=false;
+  } else if(source.length<limit){
+    historyStartReached=true;
+  } else {
+    historyStartReached=false;
+  }
+  if(list){
+    list.scrollTop=list.scrollHeight;
+  }
+  evaluateSeen();
   if(!realtimeReady && !fallbackActive){
     startFallbackPolling(500);
+  }
+}
+
+function prependHistory(items){
+  if(!items || !Array.isArray(items) || !items.length) return;
+  for(let i=items.length-1;i>=0;i--){
+    const payload=mapHistoryItem(items[i]);
+    if(payload) handleChatPayload(payload,{prepend:true,preserveScroll:true});
   }
 }
 function processIncrementalHistory(items){
@@ -1556,6 +1715,52 @@ function processIncrementalHistory(items){
     const payload=mapHistoryItem(m);
     if(payload) handleChatPayload(payload);
   });
+}
+
+function fetchOlderMessages(){
+  if(loadingOlder) return Promise.resolve();
+  if(historyStartReached) return Promise.resolve();
+  if(isRenderingHistory) return Promise.resolve();
+  if(!historyReady) return Promise.resolve();
+  if(!list) return Promise.resolve();
+  if(!oldestAt && !oldestId) return Promise.resolve();
+  const params={ limit:HISTORY_PAGE_SIZE, order:'desc' };
+  const beforeValue=oldestAt?String(oldestAt).trim():'';
+  if(beforeValue) params.before=beforeValue;
+  if(oldestId) params.before_id=oldestId;
+  loadingOlder=true;
+  return load(params)
+    .then(function(r){
+      if(r && typeof r==='object'){
+        if(r.reads) updateCurrentReadTimes(r.reads);
+        const chunk=(r.items && Array.isArray(r.items))?r.items:[];
+        if(chunk.length) prependHistory(chunk);
+        const paging=(r.paging && typeof r.paging==='object')?r.paging:{};
+        let hasMoreBefore=null;
+        if(typeof paging.has_more_before==='boolean') hasMoreBefore=paging.has_more_before;
+        if(hasMoreBefore===false || chunk.length===0){
+          historyStartReached=true;
+        } else if(hasMoreBefore===true){
+          historyStartReached=false;
+        } else if(chunk.length<HISTORY_PAGE_SIZE){
+          historyStartReached=true;
+        }
+        if(chunk.length) evaluateSeen();
+      }
+    })
+    .catch(function(){})
+    .finally(function(){ loadingOlder=false; });
+}
+
+function handleHistoryScroll(){
+  if(!list) return;
+  if(isRenderingHistory) return;
+  if(!historyReady) return;
+  if(loadingOlder || historyStartReached) return;
+  if(list.scrollHeight<=list.clientHeight+1) return;
+  if(list.scrollTop<=HISTORY_SCROLL_OFFSET){
+    fetchOlderMessages();
+  }
 }
 
 /* ---------- polling fallback ---------- */
@@ -1609,8 +1814,11 @@ function stopFallbackPolling(){
 }
 
 /* ---------- append lines (with view-based observing) ---------- */
-function appendChatLine(source){
-  if(!source) return;
+function appendChatLine(source,options){
+  if(!source || !list) return;
+  const opts=options||{};
+  const prepend=!!opts.prepend;
+  const preserveScroll=!!opts.preserveScroll;
   const data=Object.assign({},source);
 
   // ensure read state objects
@@ -1669,6 +1877,7 @@ function appendChatLine(source){
     if(messageId) existing.dataset.messageId=messageId;
     if(userId) existing.dataset.user=userId;
     updateLatestFromPayload(merged);
+    updateOldestFromPayload(merged);
     updateUnreadStateForLine(existing);
     // DO NOT auto mark read; visibility observer handles it.
     ensureObserved(existing);
@@ -1689,10 +1898,27 @@ function appendChatLine(source){
   if(stamp) line.dataset.at=stamp; else delete line.dataset.at;
   if(messageId) line.dataset.messageId=messageId;
   if(userId) line.dataset.user=userId;
-  list.appendChild(line);
+  let previousScrollTop=0;
+  let previousScrollHeight=0;
+  if(prepend && list){
+    previousScrollTop=list.scrollTop;
+    previousScrollHeight=list.scrollHeight;
+  }
+  if(prepend && list && list.firstChild){
+    list.insertBefore(line,list.firstChild);
+  } else {
+    list.appendChild(line);
+  }
   updateUnreadStateForLine(line);
-  list.scrollTop=list.scrollHeight;
+  if(prepend && list){
+    const newHeight=list.scrollHeight;
+    const delta=newHeight-previousScrollHeight;
+    list.scrollTop=previousScrollTop+delta;
+  } else if(!preserveScroll) {
+    list.scrollTop=list.scrollHeight;
+  }
   updateLatestFromPayload(data);
+  updateOldestFromPayload(data);
 
   // register for view-based detection (only other users' messages)
   ensureObserved(line);
@@ -1734,6 +1960,7 @@ function applyServerAck(resp){
     if(indicator) applyIndicatorState(indicator,determineIndicator(payload,payload.role||line.dataset.role||'other'));
     updateUnreadStateForLine(line);
     updateLatestFromPayload(payload);
+    updateOldestFromPayload(payload);
     break;
   }
 }
@@ -1742,11 +1969,14 @@ token()
   .then(function(tk){ if(!isValidRealtimeToken(tk)) throw (tk&&tk.message)?new Error(tk.message):new Error('token'); return subscribeRealtime(tk); })
   .catch(function(err){ console.warn('ELXAO chat realtime unavailable',err); startFallbackPolling(1000); });
 
-load()
+load({limit:HISTORY_INITIAL_LIMIT,order:'desc'})
   .then(function(r){
     if(r && typeof r==='object'){
       if(r.reads) updateCurrentReadTimes(r.reads);
-      if(r.items && Array.isArray(r.items)) renderHistory(r.items);
+      const items=(r.items && Array.isArray(r.items))?r.items:[];
+      const paging=(r.paging && typeof r.paging==='object')?r.paging:{};
+      const hasMoreBefore=(typeof paging.has_more_before==='boolean')?paging.has_more_before:null;
+      renderHistory(items,{limit:HISTORY_INITIAL_LIMIT,hasMoreBefore:hasMoreBefore});
     }
   })
   .catch(function(err){ console.error('ELXAO chat history unavailable',err); if(!fallbackActive) startFallbackPolling(FALLBACK_INTERVAL); });
@@ -1774,10 +2004,15 @@ ta.addEventListener('keydown', function(e){
 });
 
 /* evaluate seen on scroll/resize as well */
-['scroll','resize'].forEach(evt=>{
-  list.addEventListener(evt,()=>evaluateSeen(),{passive:true});
-  window.addEventListener(evt,()=>evaluateSeen(),{passive:true});
-});
+if(list){
+  list.addEventListener('scroll',function(){
+    evaluateSeen();
+    handleHistoryScroll();
+  },{passive:true});
+}
+const onWindowEvaluate=()=>evaluateSeen();
+window.addEventListener('scroll',onWindowEvaluate,{passive:true});
+window.addEventListener('resize',onWindowEvaluate,{passive:true});
 
 })();
 </script>
