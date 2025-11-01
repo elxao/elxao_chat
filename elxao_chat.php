@@ -816,7 +816,10 @@ ob_start();?>
 #elxao-chat-<?php echo $pid;?> .chat-line{display:flex;gap:8px;align-items:flex-start;margin-bottom:8px;padding:6px 10px;border-radius:10px;transition:background-color .25s ease}
 #elxao-chat-<?php echo $pid;?> .chat-line:last-child{margin-bottom:0}
 #elxao-chat-<?php echo $pid;?> .chat-line.is-unread{background:var(--chat-unread-bg)}
-#elxao-chat-<?php echo $pid;?> .chat-line .chat-text{flex:1;color:inherit;word-break:break-word;white-space:pre-wrap}
+#elxao-chat-<?php echo $pid;?> .chat-line .chat-text{flex:1;color:inherit;display:flex;flex-direction:column;gap:4px}
+#elxao-chat-<?php echo $pid;?> .chat-line .chat-message{word-break:break-word;white-space:pre-wrap}
+#elxao-chat-<?php echo $pid;?> .chat-line .chat-timestamp{font-size:12px;opacity:.65;color:inherit}
+#elxao-chat-<?php echo $pid;?> .chat-line .chat-timestamp.is-empty{display:none}
 #elxao-chat-<?php echo $pid;?> .chat-read-indicator{width:10px;height:10px;border-radius:999px;background:var(--chat-read-unread);margin-top:6px;flex:0 0 10px;box-shadow:0 0 0 1px rgba(0,0,0,0.35)}
 #elxao-chat-<?php echo $pid;?> .chat-read-indicator.chat-read-indicator--unread{background:var(--chat-read-unread)}
 #elxao-chat-<?php echo $pid;?> .chat-read-indicator.is-hidden{opacity:0;visibility:hidden}
@@ -884,6 +887,29 @@ function parseAtMs(v){
   const ms=d.getTime();
   return Number.isFinite(ms)?ms:0;
 }
+
+const formatLineTimestamp=(function(){
+  let formatter=null;
+  return function(value){
+    const ms=parseAtMs(value);
+    if(!ms) return '';
+    const date=new Date(ms);
+    if(!(date instanceof Date) || isNaN(date.getTime())) return '';
+    try{
+      if(!formatter && typeof Intl!=='undefined' && typeof Intl.DateTimeFormat==='function'){
+        formatter=new Intl.DateTimeFormat(undefined,{
+          year:'numeric',
+          month:'short',
+          day:'numeric',
+          hour:'numeric',
+          minute:'2-digit'
+        });
+      }
+      if(formatter) return formatter.format(date);
+    }catch(e){}
+    return date.toLocaleString();
+  };
+})();
 
 function ensureObserved(line){
   if(!observer || !line) return;
@@ -1864,6 +1890,14 @@ function appendChatLine(source,options){
     node.appendChild(createTextFragment(text));
   };
 
+  const ensureTimestampContent=function(node,value){
+    if(!node) return;
+    const formatted=formatLineTimestamp(value);
+    node.textContent=formatted;
+    if(formatted){ node.classList.remove('is-empty'); }
+    else { node.classList.add('is-empty'); }
+  };
+
   if(existing){
     const payload=existing.__chatPayload||{};
     const merged=Object.assign({},payload,data);
@@ -1871,7 +1905,21 @@ function appendChatLine(source,options){
     const indicator=existing.querySelector('.chat-read-indicator');
     if(indicator) applyIndicatorState(indicator,determineIndicator(merged,role));
     const textNode=existing.querySelector('.chat-text');
-    ensureTextContent(textNode,fullText);
+    let messageNode=textNode?textNode.querySelector('.chat-message'):null;
+    if(!messageNode && textNode){
+      messageNode=document.createElement('div');
+      messageNode.className='chat-message';
+      while(textNode.firstChild){ messageNode.appendChild(textNode.firstChild); }
+      textNode.appendChild(messageNode);
+    }
+    ensureTextContent(messageNode||textNode,fullText);
+    let timestampNode=textNode?textNode.querySelector('.chat-timestamp'):null;
+    if(!timestampNode && textNode){
+      timestampNode=document.createElement('div');
+      timestampNode.className='chat-timestamp';
+      textNode.appendChild(timestampNode);
+    }
+    ensureTimestampContent(timestampNode,stamp);
     existing.dataset.role=role;
     if(stamp) existing.dataset.at=stamp; else delete existing.dataset.at;
     if(messageId) existing.dataset.messageId=messageId;
@@ -1891,7 +1939,14 @@ function appendChatLine(source,options){
   line.appendChild(indicator);
   const textNode=document.createElement('div');
   textNode.className='chat-text';
-  ensureTextContent(textNode,fullText);
+  const messageNode=document.createElement('div');
+  messageNode.className='chat-message';
+  ensureTextContent(messageNode,fullText);
+  const timestampNode=document.createElement('div');
+  timestampNode.className='chat-timestamp';
+  ensureTimestampContent(timestampNode,stamp);
+  textNode.appendChild(messageNode);
+  textNode.appendChild(timestampNode);
   line.appendChild(textNode);
   line.__chatPayload=data;
   line.dataset.role=role;
@@ -1945,6 +2000,8 @@ function applyServerAck(resp){
     if(ackAt){
       payload.at=ackAt;
       line.dataset.at=String(ackAt);
+      const tsNode=line.querySelector('.chat-timestamp');
+      ensureTimestampContent(tsNode,ackAt);
     }
     if(ackTimes){
       payload.reads=payload.reads||{};
