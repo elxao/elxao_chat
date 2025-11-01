@@ -341,7 +341,13 @@ function elxao_chat_format_activity($datetime){
     if(!$datetime) return '';
     $ts=strtotime($datetime);
     if(!$ts) return '';
-    return date_i18n('M j, H:i',$ts);
+    $date_format=_x('M j, Y','Activity date format','elxao-chat');
+    $time_format=_x('g:i A','Activity time format','elxao-chat');
+    $date=wp_date($date_format,$ts);
+    $time=wp_date($time_format,$ts);
+    if($date==='') return '';
+    if($time==='') return $date;
+    return sprintf('%s, %s',$date,$time);
 }
 
 /* ===========================================================
@@ -838,6 +844,29 @@ const root=document.getElementById('elxao-chat-<?php echo $pid;?>'); if(!root) r
 const list=root.querySelector('.list');
 const ta=root.querySelector('textarea');
 const btn=root.querySelector('.send');
+
+if(!window.ELXAO_CHAT_FORMAT_DATE){
+  window.ELXAO_CHAT_FORMAT_DATE=(function(){
+    let formatter=null;
+    return function(date,emptyValue){
+      const fallback=(typeof emptyValue==='string')?emptyValue:'';
+      if(!(date instanceof Date) || isNaN(date.getTime())) return fallback;
+      try{
+        if(!formatter && typeof Intl!=='undefined' && typeof Intl.DateTimeFormat==='function'){
+          formatter=new Intl.DateTimeFormat(undefined,{
+            year:'numeric',
+            month:'short',
+            day:'numeric',
+            hour:'numeric',
+            minute:'2-digit'
+          });
+        }
+        if(formatter) return formatter.format(date);
+      }catch(e){}
+      return date.toLocaleString();
+    };
+  })();
+}
 const pid=root.dataset.project,room=root.dataset.room,rest=root.dataset.rest,nonce=root.dataset.nonce;
 const myId=parseInt(root.dataset.myid,10)||0;
 const myRole=(root.dataset.myrole||'other');
@@ -889,24 +918,12 @@ function parseAtMs(v){
 }
 
 const formatLineTimestamp=(function(){
-  let formatter=null;
   return function(value){
     const ms=parseAtMs(value);
     if(!ms) return '';
     const date=new Date(ms);
     if(!(date instanceof Date) || isNaN(date.getTime())) return '';
-    try{
-      if(!formatter && typeof Intl!=='undefined' && typeof Intl.DateTimeFormat==='function'){
-        formatter=new Intl.DateTimeFormat(undefined,{
-          year:'numeric',
-          month:'short',
-          day:'numeric',
-          hour:'numeric',
-          minute:'2-digit'
-        });
-      }
-      if(formatter) return formatter.format(date);
-    }catch(e){}
+    if(window.ELXAO_CHAT_FORMAT_DATE) return window.ELXAO_CHAT_FORMAT_DATE(date,'');
     return date.toLocaleString();
   };
 })();
@@ -2180,6 +2197,28 @@ const FALLBACK_INTERVAL=45000;
 let fallbackTimer=null;
 
 /* ---- shared helpers (may already exist) ---- */
+if(!window.ELXAO_CHAT_FORMAT_DATE){
+  window.ELXAO_CHAT_FORMAT_DATE=(function(){
+    let formatter=null;
+    return function(date,emptyValue){
+      const fallback=(typeof emptyValue==='string')?emptyValue:'';
+      if(!(date instanceof Date) || isNaN(date.getTime())) return fallback;
+      try{
+        if(!formatter && typeof Intl!=='undefined' && typeof Intl.DateTimeFormat==='function'){
+          formatter=new Intl.DateTimeFormat(undefined,{
+            year:'numeric',
+            month:'short',
+            day:'numeric',
+            hour:'numeric',
+            minute:'2-digit'
+          });
+        }
+        if(formatter) return formatter.format(date);
+      }catch(e){}
+      return date.toLocaleString();
+    };
+  })();
+}
 if(!window.ELXAO_CHAT_BUS){
   const origin=Math.random().toString(36).slice(2);
   let channel=null; if('BroadcastChannel' in window){ try{ channel=new BroadcastChannel('elxao-chat'); }catch(e){} }
@@ -2450,9 +2489,11 @@ function parseTimestamp(value){
   const normalized=str.replace(' ','T'); const date=new Date(normalized);
   return isNaN(date.getTime())?null:date;
 }
-function pad(v){ return v<10?'0'+v:''+v; }
-function formatTimestamp(date){ if(!(date instanceof Date) || isNaN(date.getTime())) return '—';
-  const months=['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec']; return months[date.getMonth()]+' '+date.getDate()+', '+pad(date.getHours())+':'+pad(date.getMinutes()); }
+function formatTimestamp(date){
+  if(!(date instanceof Date) || isNaN(date.getTime())) return '—';
+  if(window.ELXAO_CHAT_FORMAT_DATE) return window.ELXAO_CHAT_FORMAT_DATE(date,'—');
+  return date.toLocaleString();
+}
 function updateMetaText(room,date){ const meta=room.querySelector('.meta'); if(meta && date instanceof Date && !isNaN(date.getTime())) meta.textContent=formatTimestamp(date); else if(meta && !meta.textContent) meta.textContent='—'; }
 function setRoomActivity(room,source){ const date=parseTimestamp(source); if(!date) return; room.dataset.timestamp=String(date.getTime()); room.dataset.latest=date.toISOString(); updateMetaText(room,date); }
 function bumpRoom(projectId,activity){
