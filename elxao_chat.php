@@ -779,6 +779,7 @@ function elxao_chat_render_window($pid){
     $myRole = elxao_chat_role_for_user($pid,$meId);
 
     wp_enqueue_script('elxao-chat-typing-indicator');
+    $typing_script_url = esc_url(plugin_dir_url(__FILE__).'typing-indicator.js');
 
     // CSS variables from hard-coded constants
     $style_vars = sprintf(
@@ -873,6 +874,21 @@ ob_start();?>
 <script>
 (function(){
 const root=document.getElementById('elxao-chat-<?php echo $pid;?>'); if(!root) return;
+(function(){
+  if(document.querySelector('script[data-elxao-chat-typing]')) return;
+  const s=document.createElement('script');
+  s.src='<?php echo $typing_script_url; ?>';
+  s.async=false;
+  s.setAttribute('data-elxao-chat-typing','1');
+  (document.head||document.documentElement).appendChild(s);
+})();
+window.ELXAO_CHAT_PENDING_TYPING=window.ELXAO_CHAT_PENDING_TYPING||[];
+if(window.ELXAO_CHAT_PENDING_TYPING.indexOf(root)===-1){
+  window.ELXAO_CHAT_PENDING_TYPING.push(root);
+}
+if(typeof window.ELXAO_CHAT_INIT_TYPING==='function'){
+  window.ELXAO_CHAT_INIT_TYPING(root);
+}
 const list=root.querySelector('.list');
 const ta=root.querySelector('textarea');
 const btn=root.querySelector('.send');
