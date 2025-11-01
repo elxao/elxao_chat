@@ -29,6 +29,13 @@ if ( ! defined('ELXAO_CHAT_READ_META_KEY') ) define('ELXAO_CHAT_READ_META_KEY','
    =========================================================== */
 if ( ! defined('ELXAO_ABLY_KEY') ) define('ELXAO_ABLY_KEY','');
 
+add_action('wp_enqueue_scripts','elxao_chat_register_frontend_assets');
+function elxao_chat_register_frontend_assets(){
+    $script_path = plugin_dir_url(__FILE__).'typing-indicator.js';
+    $version = defined('ELXAO_PLUGIN_VERSION') ? ELXAO_PLUGIN_VERSION : '1.0';
+    wp_register_script('elxao-chat-typing-indicator',$script_path,[],$version,true);
+}
+
 /* ===========================================================
    DB TABLE
    =========================================================== */
@@ -765,10 +772,13 @@ function elxao_chat_render_window($pid){
     $rest_base  = rest_url();
     $me         = wp_get_current_user();
     $meName     = esc_js($me->display_name);
+    $meAttrName = esc_attr($me->display_name);
     $meId       = (int)$me->ID;
 
     $ids = elxao_chat_get_client_pm_ids($pid);
     $myRole = elxao_chat_role_for_user($pid,$meId);
+
+    wp_enqueue_script('elxao-chat-typing-indicator');
 
     // CSS variables from hard-coded constants
     $style_vars = sprintf(
@@ -794,6 +804,7 @@ ob_start();?>
      data-nonce="<?php echo esc_attr($rest_nonce);?>"
      data-myid="<?php echo (int)$meId; ?>"
      data-myrole="<?php echo esc_attr($myRole); ?>"
+     data-myname="<?php echo $meAttrName; ?>"
      data-client="<?php echo (int)$ids['client'];?>"
      data-pm="<?php echo (int)$ids['pm'];?>"
      style="<?php echo $style_vars; ?>">
