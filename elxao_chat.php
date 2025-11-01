@@ -123,192 +123,36 @@ function elxao_chat_parse_datetime($value){
     return 0;
 }
 
-function elxao_chat_normalize_read_entry($value){
-    $time = '';
-    $id   = 0;
-
-    if (is_array($value)) {
-        if (isset($value['time'])) {
-            $time = elxao_chat_normalize_datetime_value($value['time']);
-        } elseif (isset($value['datetime'])) {
-            $time = elxao_chat_normalize_datetime_value($value['datetime']);
-        } elseif (isset($value['at'])) {
-            $time = elxao_chat_normalize_datetime_value($value['at']);
-        }
-
-        if (isset($value['id'])) {
-            $id = (int)$value['id'];
-        } elseif (isset($value['message_id'])) {
-            $id = (int)$value['message_id'];
-        }
-    } else {
-        $time = elxao_chat_normalize_datetime_value($value);
-    }
-
-    if ($time === null) $time = '';
-    if (!is_string($time)) $time = (string)$time;
-
-    return [
-        'time' => $time,
-        'id'   => $id > 0 ? $id : 0,
-    ];
-}
-
-function elxao_chat_get_last_read_records($pid){
+function elxao_chat_get_last_reads($pid){
     $stored = get_post_meta($pid,ELXAO_CHAT_READ_META_KEY,true);
-    $result = [
-        'client' => ['time'=>'','id'=>0],
-        'pm'     => ['time'=>'','id'=>0],
-        'admin'  => ['time'=>'','id'=>0],
-    ];
-
+    $result = ['client'=>'','pm'=>'','admin'=>''];
     if (is_array($stored)) {
         foreach ($result as $role => $_) {
-            if (array_key_exists($role,$stored)) {
-                $result[$role] = elxao_chat_normalize_read_entry($stored[$role]);
+            if (!empty($stored[$role])) {
+                $normalized = elxao_chat_normalize_datetime_value($stored[$role]);
+                if ($normalized) $result[$role] = $normalized;
             }
         }
     }
-
     return $result;
 }
 
-function elxao_chat_build_read_times(array $records){
-    return [
-        'client' => $records['client']['time'] ?? '',
-        'pm'     => $records['pm']['time'] ?? '',
-        'admin'  => $records['admin']['time'] ?? '',
-    ];
-}
-
-function elxao_chat_resolve_read_record(array $source,$role){
-    $defaults = ['time'=>'','id'=>0];
-    if (!in_array($role,['client','pm','admin'],true)) return $defaults;
-
-    if (array_key_exists($role,$source)) {
-        return elxao_chat_normalize_read_entry($source[$role]);
-    }
-
-    if (isset($source['records']) && is_array($source['records'])) {
-        return elxao_chat_resolve_read_record($source['records'],$role);
-    }
-
-    if (isset($source['times']) && is_array($source['times'])) {
-        return elxao_chat_resolve_read_record($source['times'],$role);
-    }
-
-    if (isset($source['read_times']) && is_array($source['read_times'])) {
-        return elxao_chat_resolve_read_record($source['read_times'],$role);
-    }
-
-    if (isset($source['reads']) && is_array($source['reads'])) {
-        return elxao_chat_resolve_read_record($source['reads'],$role);
-    }
-
-    return $defaults;
-}
-
-function elxao_chat_get_last_reads($pid){
-    return elxao_chat_build_read_times(elxao_chat_get_last_read_records($pid));
-}
-
-function elxao_chat_count_unread_for_role($pid,$role,?array $reads=null,$viewer_id=0){
-    if (!$pid || !in_array($role,['client','pm','admin'],true)) return 0;
-
-    if ($reads === null) {
-        $reads = elxao_chat_get_last_read_records($pid);
-    }
-
-    $record = is_array($reads) ? elxao_chat_resolve_read_record($reads,$role) : ['time'=>'','id'=>0];
-    $cutoff = $record['time'] ?? '';
-    $cutoff_id = $record['id'] ?? 0;
-
-    global $wpdb;
-    $table = $wpdb->prefix.'elxao_chat_messages';
-
-    $where = ['project_id=%d'];
-    $params = [$pid];
-
-    if ($viewer_id) {
-        $where[] = 'user_id != %d';
-        $params[] = $viewer_id;
-    }
-
-    if ($cutoff) {
-        if ($cutoff_id > 0) {
-            $where[] = '(published_at > %s OR (published_at = %s AND id > %d))';
-            $params[] = $cutoff;
-            $params[] = $cutoff;
-            $params[] = $cutoff_id;
-        } else {
-            $where[] = 'published_at > %s';
-            $params[] = $cutoff;
-        }
-    }
-
-    $sql = 'SELECT COUNT(*) FROM '.$table.' WHERE '.implode(' AND ',$where);
-
-    return (int)$wpdb->get_var($wpdb->prepare($sql,...$params));
-}
-
-function elxao_chat_update_last_read($pid,$role,$timestamp=null,$message_id=null){
+function elxao_chat_update_last_read($pid,$role,$timestamp=null){
     if (!in_array($role,['client','pm','admin'],true)) return false;
+    $normalized = elxao_chat_normalize_datetime_value(
+        $timestamp === null ? current_time('timestamp') : $timestamp
+    );
+    if (!$normalized) return false;
 
-    $marker_time = '';
-    $marker_id   = null;
+    $reads = elxao_chat_get_last_reads($pid);
+    $current = $reads[$role] ?? '';
+    $current_ts = $current ? elxao_chat_parse_datetime($current) : 0;
+    $new_ts = elxao_chat_parse_datetime($normalized);
+    if ($current_ts && $new_ts && $current_ts >= $new_ts) return false;
 
-    if (is_array($timestamp)) {
-        if (array_key_exists('id',$timestamp) && $message_id === null) {
-            $message_id = (int)$timestamp['id'];
-        } elseif (array_key_exists('message_id',$timestamp) && $message_id === null) {
-            $message_id = (int)$timestamp['message_id'];
-        }
-
-        if (array_key_exists('time',$timestamp)) {
-            $marker_time = elxao_chat_normalize_datetime_value($timestamp['time']);
-        } elseif (array_key_exists('datetime',$timestamp)) {
-            $marker_time = elxao_chat_normalize_datetime_value($timestamp['datetime']);
-        } elseif (array_key_exists('at',$timestamp)) {
-            $marker_time = elxao_chat_normalize_datetime_value($timestamp['at']);
-        }
-    } else {
-        $marker_time = elxao_chat_normalize_datetime_value(
-            $timestamp === null ? current_time('timestamp') : $timestamp
-        );
-    }
-
-    if (!$marker_time) return false;
-
-    if ($message_id === null) {
-        $message_id = 0;
-    }
-
-    $marker_id = (int)$message_id;
-    if ($marker_id < 0) $marker_id = 0;
-
-    $records = elxao_chat_get_last_read_records($pid);
-    $current = $records[$role] ?? ['time'=>'','id'=>0];
-    $current_ts = $current['time'] ? elxao_chat_parse_datetime($current['time']) : 0;
-    $current_id = isset($current['id']) ? (int)$current['id'] : 0;
-
-    $new_ts = elxao_chat_parse_datetime($marker_time);
-    if ($current_ts && $new_ts) {
-        if ($new_ts < $current_ts) {
-            return false;
-        }
-        if ($new_ts === $current_ts && $marker_id <= $current_id) {
-            return false;
-        }
-    }
-
-    $records[$role] = [
-        'time' => $marker_time,
-        'id'   => $marker_id,
-    ];
-
-    update_post_meta($pid,ELXAO_CHAT_READ_META_KEY,$records);
-
-    return $records;
+    $reads[$role] = $normalized;
+    update_post_meta($pid,ELXAO_CHAT_READ_META_KEY,$reads);
+    return $reads;
 }
 
 function elxao_chat_build_message_read_status($pid,$message_role,$published_at,?array $reads=null,?array $participants=null){
@@ -338,16 +182,10 @@ function elxao_chat_build_message_read_status($pid,$message_role,$published_at,?
 }
 
 function elxao_chat_publish_read_receipt($pid,array $reads,$user_id=0){
-    $records = [
-        'client' => elxao_chat_resolve_read_record($reads,'client'),
-        'pm'     => elxao_chat_resolve_read_record($reads,'pm'),
-        'admin'  => elxao_chat_resolve_read_record($reads,'admin'),
-    ];
-    $times = elxao_chat_build_read_times($records);
     $role_flags = [
-        'client' => elxao_chat_parse_datetime($times['client'] ?? '') > 0,
-        'pm'     => elxao_chat_parse_datetime($times['pm'] ?? '') > 0,
-        'admin'  => elxao_chat_parse_datetime($times['admin'] ?? '') > 0,
+        'client' => elxao_chat_parse_datetime($reads['client'] ?? '') > 0,
+        'pm'     => elxao_chat_parse_datetime($reads['pm'] ?? '') > 0,
+        'admin'  => elxao_chat_parse_datetime($reads['admin'] ?? '') > 0,
     ];
 
     elxao_chat_publish_to_ably(elxao_chat_room_id($pid),[
@@ -356,13 +194,11 @@ function elxao_chat_publish_read_receipt($pid,array $reads,$user_id=0){
             'type'        => 'read_receipt',
             'project'     => $pid,
             'user'        => $user_id,
-            'read_times'  => $times,
-            'read_records'=> $records,
+            'read_times'  => $reads,
             'read_status' => $role_flags,
             'reads'       => [
                 'roles' => $role_flags,
-                'times' => $times,
-                'records' => $records,
+                'times' => $reads,
             ],
             'at'          => current_time('mysql'),
         ],
@@ -427,32 +263,11 @@ function elxao_chat_collect_rooms_for_user($uid){
         }
         $timestamp=$latest?strtotime($latest):0;
 
-        $read_records = elxao_chat_get_last_read_records($pid);
-        $reads = elxao_chat_build_read_times($read_records);
-        $role  = elxao_chat_role_for_user($pid,$uid);
-        $last_read = '';
-        $last_read_id = 0;
-        if(in_array($role,['client','pm','admin'],true)){
-            $record = $read_records[$role] ?? ['time'=>'','id'=>0];
-            if(!empty($record['time'])){
-                $normalized = elxao_chat_normalize_datetime_value($record['time']);
-                if($normalized) $last_read = $normalized;
-            }
-            if(!empty($record['id'])){
-                $last_read_id = (int)$record['id'];
-            }
-        }
-        $unread = elxao_chat_count_unread_for_role($pid,$role,$read_records,$uid);
-
         $rooms[]=[
             'id'=>$pid,
             'title'=>get_the_title($pid),
             'latest'=>$latest,
             'timestamp'=>$timestamp?:0,
-            'role'=>$role,
-            'read_at'=>$last_read,
-            'read_id'=>$last_read_id,
-            'unread'=>$unread,
         ];
     }
 
@@ -570,9 +385,8 @@ function elxao_chat_rest_send(WP_REST_Request $r){
     $role    = elxao_chat_role_for_user($pid,$uid);
 
     $participants = elxao_chat_get_client_pm_ids($pid);
-    $read_records = elxao_chat_update_last_read($pid,$role,['time'=>$now,'id'=>$message_id]);
-    if (!$read_records) $read_records = elxao_chat_get_last_read_records($pid);
-    $reads = elxao_chat_build_read_times($read_records);
+    $reads = elxao_chat_update_last_read($pid,$role,$now);
+    if (!$reads) $reads = elxao_chat_get_last_reads($pid);
     $read_status = elxao_chat_build_message_read_status($pid,$role,$now,$reads,$participants);
 
     elxao_chat_publish_to_ably(elxao_chat_room_id($pid),[
@@ -588,11 +402,9 @@ function elxao_chat_rest_send(WP_REST_Request $r){
             'at'=>$now,
             'read_status'=>$read_status,
             'read_times'=>$reads,
-            'read_records'=>$read_records,
             'reads'=>[
                 'roles'=>$read_status,
                 'times'=>$reads,
-                'records'=>$read_records,
             ],
         ]
     ]);
@@ -603,11 +415,9 @@ function elxao_chat_rest_send(WP_REST_Request $r){
         'at'          => $now,
         'read_status' => $read_status,
         'read_times'  => $reads,
-        'read_records'=> $read_records,
         'reads'       => [
             'roles' => $read_status,
             'times' => $reads,
-            'records' => $read_records,
         ],
     ],200);
 }
@@ -659,8 +469,7 @@ function elxao_chat_rest_history(WP_REST_Request $r){
     unset($row);
 
     $role = elxao_chat_role_for_user($pid,$uid);
-    $read_records = elxao_chat_get_last_read_records($pid);
-    $reads = elxao_chat_build_read_times($read_records);
+    $reads = elxao_chat_get_last_reads($pid);
 
     // IMPORTANT FIX: Do NOT auto-mark read on history fetch.
     // Visibility-based read is handled only via explicit POST /messages/read from the UI now.
@@ -668,7 +477,6 @@ function elxao_chat_rest_history(WP_REST_Request $r){
     return new WP_REST_Response([
         'items'=>$rows,
         'reads'=>$reads,
-        'read_records'=>$read_records,
         'role'=>$role,
     ],200);
 }
@@ -680,24 +488,23 @@ function elxao_chat_rest_mark_read(WP_REST_Request $r){
         return new WP_Error('forbidden','Not allowed',['status'=>403]);
 
     $role = elxao_chat_role_for_user($pid,$uid);
-    $read_records = elxao_chat_get_last_read_records($pid);
+    $reads = elxao_chat_get_last_reads($pid);
     $updated = false;
 
     if(in_array($role,['client','pm','admin'],true)){
         // we simply record "now" as the last seen moment
-        $maybe = elxao_chat_update_last_read($pid,$role,['time'=>current_time('mysql')]);
+        $maybe = elxao_chat_update_last_read($pid,$role,current_time('timestamp'));
         if($maybe){
-            $read_records = $maybe;
+            $reads = $maybe;
             $updated = true;
         }
     }
 
     if($updated){
-        elxao_chat_publish_read_receipt($pid,$read_records,$uid);
+        elxao_chat_publish_read_receipt($pid,$reads,$uid);
     }
 
     $participants = elxao_chat_get_client_pm_ids($pid);
-    $reads = elxao_chat_build_read_times($read_records);
     $role_flags = [
         'client' => elxao_chat_parse_datetime($reads['client'] ?? '') > 0 || empty($participants['client']),
         'pm'     => elxao_chat_parse_datetime($reads['pm'] ?? '') > 0 || empty($participants['pm']),
@@ -710,10 +517,8 @@ function elxao_chat_rest_mark_read(WP_REST_Request $r){
         'reads'=>[
             'roles'=>$role_flags,
             'times'=>$reads,
-            'records'=>$read_records,
         ],
         'read_times'=>$reads,
-        'read_records'=>$read_records,
         'read_status'=>$role_flags,
         'updated'=>$updated,
         'type'=>'read_receipt',
@@ -974,21 +779,10 @@ function applyOptimisticRead(atMs){
   if(atMs<=optimisticLatestReadMs) return;
   optimisticLatestReadMs=atMs;
   const iso=new Date(atMs).toISOString();
-  const markerId=determineLatestVisibleMessageId();
-  if(markerId && markerId>currentReadIds[myRole]) currentReadIds[myRole]=markerId;
   const times=Object.assign({},currentReadTimes,{ [myRole]: iso });
-  const records=buildCurrentReadRecords();
-  if(records[myRole]){
-    records[myRole]={ time:iso, id:markerId||records[myRole].id||0 };
-  }
-  const changed=updateCurrentReadTimes({times:times,records:records});
+  const changed=updateCurrentReadTimes(times);
   if(!changed) return;
-  const roleFlags={
-    client:parseAtMs(times.client)>0,
-    pm:parseAtMs(times.pm)>0,
-    admin:parseAtMs(times.admin)>0
-  };
-  const payload={ type:'read_receipt', project:projectId, read_times:times, read_records:records, read_status:roleFlags, reads:{ times:times, records:records, roles:roleFlags } };
+  const payload={ type:'read_receipt', project:projectId, read_times:times, reads:{ times:times } };
   applyReadReceipt(payload);
   if(window.ELXAO_CHAT_BUS && typeof window.ELXAO_CHAT_BUS.emit==='function'){
     window.ELXAO_CHAT_BUS.emit({ project:projectId, payload:payload });
@@ -1312,7 +1106,6 @@ function extractReadTimes(source){
 
 /* ---------- live state ---------- */
 const currentReadTimes={client:'',pm:'',admin:''};
-const currentReadIds={client:0,pm:0,admin:0};
 let isRenderingHistory=false;
 let latestAt='';
 let latestId=0;
@@ -1323,32 +1116,12 @@ let optimisticLatestReadMs=0;
 const FALLBACK_INTERVAL=4000;
 const DEBUG=false;
 
-function updateCurrentReadTimes(source){
-  if(!source || typeof source!=='object') return false;
+function updateCurrentReadTimes(times){
+  if(!times || typeof times!=='object') return false;
   let changed=false;
-  const times=(source.times && typeof source.times==='object')?source.times:source;
-  const recordSource=(source.records && typeof source.records==='object')?source.records:
-    (source.read_records && typeof source.read_records==='object'?source.read_records:null);
-  const pickRecord=function(role){
-    if(!recordSource) return null;
-    const variants=[role,role.toLowerCase(),role.toUpperCase(),role.charAt(0).toUpperCase()+role.slice(1)];
-    for(let i=0;i<variants.length;i++){
-      const key=variants[i];
-      if(Object.prototype.hasOwnProperty.call(recordSource,key)) return recordSource[key];
-    }
-    return null;
-  };
   ['client','pm','admin'].forEach(function(role){
-    let value;
     if(Object.prototype.hasOwnProperty.call(times,role)){
-      value=(times[role]!==undefined && times[role]!==null)?times[role]:'';
-    } else {
-      const recordEntry=pickRecord(role);
-      if(recordEntry && typeof recordEntry==='object'){
-        value=recordEntry.time||recordEntry.datetime||recordEntry.at||'';
-      }
-    }
-    if(value!==undefined){
+      const value=(times[role]!==undefined && times[role]!==null)?times[role]:'';
       const existing=currentReadTimes[role];
       const normalize=function(v){
         if(v===undefined||v===null||v==='') return '';
@@ -1361,39 +1134,8 @@ function updateCurrentReadTimes(source){
         changed=true;
       }
     }
-    const markerId=recordSource?resolveRoleId(recordSource,role):0;
-    if(markerId && markerId>currentReadIds[role]){
-      currentReadIds[role]=markerId;
-      changed=true;
-    }
   });
   return changed;
-}
-
-function buildCurrentReadRecords(){
-  return {
-    client:{ time:currentReadTimes.client||'', id:currentReadIds.client||0 },
-    pm:{ time:currentReadTimes.pm||'', id:currentReadIds.pm||0 },
-    admin:{ time:currentReadTimes.admin||'', id:currentReadIds.admin||0 }
-  };
-}
-
-function determineLatestVisibleMessageId(){
-  let maxId=currentReadIds[myRole]||0;
-  if(!list || !list.children) return maxId;
-  Array.from(list.children).forEach(function(line){
-    if(!line || !line.__chatPayload) return;
-    const payload=line.__chatPayload;
-    const role=(payload.role||line.dataset.role||'other');
-    if(role==='sys') return;
-    const authorRaw=(payload.user!=null)?payload.user:(payload.user_id!=null?payload.user_id:0);
-    const authorId=parseInt(authorRaw,10)||0;
-    if(authorId && authorId===myId) return;
-    const idRaw=('id' in payload)?payload.id:(payload.message_id||payload.messageId||payload.messageID);
-    const numericId=parseInt(idRaw,10)||0;
-    if(numericId>maxId) maxId=numericId;
-  });
-  return maxId;
 }
 function updateLatestFromPayload(data){
   if(!data || typeof data!=='object') return;
@@ -1557,19 +1299,13 @@ function applyIndicatorState(indicator,info){
 
 function applyReadReceipt(data){
   const times=extractReadTimes(data);
-  const records=extractReadRecordsPayload(data);
-  if(times || records){
+  if(times){
     if(myRole!=='other'){
-      let raw='';
-      if(times && Object.prototype.hasOwnProperty.call(times,myRole)) raw=times[myRole];
-      if((!raw||!raw.length) && records && typeof records==='object'){
-        const entry=records[myRole]||records[myRole.toLowerCase()];
-        if(entry && typeof entry==='object') raw=entry.time||entry.datetime||entry.at||'';
-      }
+      const raw=times[myRole];
       const ms=parseAtMs(raw);
       if(ms && ms>optimisticLatestReadMs) optimisticLatestReadMs=ms;
     }
-    updateCurrentReadTimes({times:times||{},records:records||null});
+    updateCurrentReadTimes(times);
   }
   const effectiveTimes={
     client:currentReadTimes.client,
@@ -1798,8 +1534,7 @@ function appendChatLine(source){
 
   // ensure read state objects
   const times=extractReadTimes(data);
-  const records=extractReadRecordsPayload(data);
-  if(times || records) updateCurrentReadTimes({times:times||{},records:records||null});
+  if(times) updateCurrentReadTimes(times);
   const effectiveTimes={ client:currentReadTimes.client, pm:currentReadTimes.pm, admin:currentReadTimes.admin };
   if(!data.read_status || typeof data.read_status!=='object'){
     const computed=buildStatusFromTimes(data,effectiveTimes);
@@ -1807,14 +1542,11 @@ function appendChatLine(source){
     data.reads=data.reads||{};
     data.reads.roles=Object.assign({},computed);
     data.reads.times=Object.assign({},effectiveTimes);
-    data.reads.records=Object.assign({},buildCurrentReadRecords());
   } else {
     data.reads=data.reads||{};
     if(!data.reads.roles) data.reads.roles=Object.assign({},data.read_status);
     if(times) data.reads.times=Object.assign({},times);
     else if(!data.reads.times) data.reads.times=Object.assign({},effectiveTimes);
-    if(records) data.reads.records=Object.assign({},records);
-    else if(!data.reads.records) data.reads.records=Object.assign({},buildCurrentReadRecords());
   }
 
   const role=(data.type==='system')?'sys':(data.role||'other'); data.role=role;
@@ -1891,7 +1623,6 @@ function applyServerAck(resp){
   const ackId=('id' in resp && resp.id!=null)?parseInt(resp.id,10):0;
   const ackAt=resp.at||resp.published_at||'';
   const ackTimes=extractReadTimes(resp);
-  const ackRecords=extractReadRecordsPayload(resp);
   const ackStatus=(resp && resp.read_status && typeof resp.read_status==='object')?resp.read_status:null;
   const lines=list.children?Array.from(list.children):[];
   for(let i=lines.length-1;i>=0;i--){
@@ -1908,11 +1639,10 @@ function applyServerAck(resp){
       payload.at=ackAt;
       line.dataset.at=String(ackAt);
     }
-    if(ackTimes || ackRecords){
+    if(ackTimes){
       payload.reads=payload.reads||{};
-      if(ackTimes) payload.reads.times=Object.assign({},ackTimes);
-      if(ackRecords) payload.reads.records=Object.assign({},ackRecords);
-      updateCurrentReadTimes({times:ackTimes||{},records:ackRecords||null});
+      payload.reads.times=Object.assign({},ackTimes);
+      updateCurrentReadTimes(ackTimes);
     }
     if(ackStatus){
       payload.read_status=Object.assign({},ackStatus);
@@ -1991,8 +1721,7 @@ function elxao_chat_render_inbox(){
 <div id="<?php echo esc_attr($container_id); ?>"
      class="elxao-chat-inbox"
      data-rest="<?php echo esc_url($rest_base); ?>"
-     data-nonce="<?php echo esc_attr($rest_nonce); ?>"
-     data-me="<?php echo (int)$uid; ?>">
+     data-nonce="<?php echo esc_attr($rest_nonce); ?>">
   <div class="inbox-shell">
     <div class="room-list" role="navigation" aria-label="Chat rooms">
       <?php if($rooms){ foreach($rooms as $idx=>$room){
@@ -2000,27 +1729,14 @@ function elxao_chat_render_inbox(){
         $activity=elxao_chat_format_activity($room['latest']);
         $room_id=elxao_chat_room_id($room['id']);
         $timestamp_attr=$room['timestamp']? (int)$room['timestamp'] : 0;
-        $role_attr=!empty($room['role'])? $room['role'] : 'other';
-        $unread_count=isset($room['unread'])? max(0,(int)$room['unread']) : 0;
-        $badge_display=$unread_count>99?'99+':(string)$unread_count;
-        $badge_label=$unread_count>99?'99 or more unread messages':($unread_count===0?'No unread messages':($unread_count===1?'1 unread message':sprintf('%d unread messages',$unread_count)));
-        $last_read_attr=!empty($room['read_at'])? $room['read_at'] : '';
-        $last_read_id_attr=isset($room['read_id'])? (int)$room['read_id'] : 0;
       ?>
       <button type="button"
               class="room<?php echo $idx===0?' active':''; ?>"
               data-project="<?php echo (int)$room['id']; ?>"
               data-room="<?php echo esc_attr($room_id); ?>"
               data-latest="<?php echo esc_attr($room['latest']); ?>"
-              data-timestamp="<?php echo esc_attr($timestamp_attr); ?>"
-              data-role="<?php echo esc_attr($role_attr); ?>"
-              data-unread="<?php echo esc_attr($unread_count); ?>"
-              data-last-read="<?php echo esc_attr($last_read_attr); ?>"
-              data-last-read-id="<?php echo esc_attr($last_read_id_attr); ?>">
-        <span class="label">
-          <span class="label-text"><?php echo esc_html($label); ?></span>
-          <span class="badge" role="status" aria-live="polite" aria-label="<?php echo esc_attr($badge_label); ?>"<?php echo $unread_count? '' : ' hidden'; ?>><?php echo esc_html($badge_display); ?></span>
-        </span>
+              data-timestamp="<?php echo esc_attr($timestamp_attr); ?>">
+        <span class="label"><?php echo esc_html($label); ?></span>
         <span class="meta"><?php echo esc_html($activity?:'—'); ?></span>
       </button>
       <?php }} else { ?>
@@ -2040,10 +1756,7 @@ function elxao_chat_render_inbox(){
 #<?php echo esc_attr($container_id); ?> .room-list .room:focus-visible{outline:2px solid rgba(96,165,250,0.9);outline-offset:-2px}
 #<?php echo esc_attr($container_id); ?> .room-list .room:hover{background:rgba(148,163,184,0.12)}
 #<?php echo esc_attr($container_id); ?> .room-list .room.active{background:rgba(96,165,250,0.18)}
-#<?php echo esc_attr($container_id); ?> .room-list .label{display:flex;align-items:center;justify-content:space-between;gap:8px;font-weight:600}
-#<?php echo esc_attr($container_id); ?> .room-list .label-text{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-#<?php echo esc_attr($container_id); ?> .room-list .badge{display:inline-flex;align-items:center;justify-content:center;background:#ef4444;color:#fff;font-size:11px;font-weight:700;min-width:22px;padding:0 6px;border-radius:999px;line-height:1.2}
-#<?php echo esc_attr($container_id); ?> .room-list .badge[hidden]{display:none}
+#<?php echo esc_attr($container_id); ?> .room-list .label{font-weight:600}
 #<?php echo esc_attr($container_id); ?> .room-list .meta{font-size:12px;color:#9ca3af}
 #<?php echo esc_attr($container_id); ?> .room-list .empty{padding:20px;color:#9ca3af;font-style:italic}
 #<?php echo esc_attr($container_id); ?> .chat-pane{flex:1;min-width:0;background:transparent;display:flex;align-items:center;justify-content:center;padding:20px}
@@ -2062,13 +1775,11 @@ const root=document.getElementById('<?php echo esc_js($container_id); ?>'); if(!
 
 const rest=root.dataset.rest||'';
 const nonce=root.dataset.nonce||'';
-const meId=parseInt(root.dataset.me||'0',10)||0;
 const chat=root.querySelector('.chat-pane');
 const roomList=root.querySelector('.room-list');
 const rooms=Array.from(roomList?roomList.querySelectorAll('.room'):[]);
 const headers={'X-WP-Nonce':nonce,'Accept':'application/json'};
 const roomMap=new Map();
-const roomStates=new WeakMap();
 const channelCleanups=new Map();
 const cleanupFns=[];
 let active=null;
@@ -2107,270 +1818,7 @@ if(!window.ELXAO_ABLY){
 function registerCleanup(fn){ if(typeof fn==='function') cleanupFns.push(fn); }
 function runCleanup(){ while(cleanupFns.length){ const fn=cleanupFns.pop(); try{ fn(); }catch(e){} } }
 
-function parseMillis(value){
-  if(value instanceof Date){ const ms=value.getTime(); return Number.isFinite(ms)?ms:0; }
-  if(typeof value==='number' && isFinite(value)){ return value>1e12?Math.floor(value):Math.floor(value*1000); }
-  const str=String(value||'').trim(); if(!str) return 0;
-  if(/^-?\d+$/.test(str)){ const num=parseInt(str,10); return str.length<=10?num*1000:num; }
-  const normalized=str.replace(' ','T');
-  const date=new Date(normalized);
-  const ms=date.getTime();
-  return Number.isFinite(ms)?ms:0;
-}
-
-function formatIsoFromMs(ms){
-  if(!ms) return '';
-  const date=new Date(ms);
-  if(Number.isNaN(date.getTime())) return '';
-  return date.toISOString();
-}
-
-function buildBadgeLabel(count){
-  if(count>99) return '99 or more unread messages';
-  if(count===1) return '1 unread message';
-  if(count<=0) return 'No unread messages';
-  return count+' unread messages';
-}
-
-function updateBadgeDisplay(room,count){
-  const badge=room.querySelector('.badge');
-  if(!badge) return;
-  const label=buildBadgeLabel(count);
-  if(count>0){
-    badge.textContent=count>99?'99+':String(count);
-    badge.hidden=false;
-  } else {
-    badge.textContent='0';
-    badge.hidden=true;
-  }
-  if(label) badge.setAttribute('aria-label',label);
-}
-
-function ensureRoomState(room){
-  let state=roomStates.get(room);
-  if(state){
-    updateBadgeDisplay(room,state.unread);
-    return state;
-  }
-  const unreadAttr=parseInt(room.getAttribute('data-unread')||'0',10)||0;
-  const roleAttr=(room.getAttribute('data-role')||'other').toLowerCase();
-  const lastReadAttr=parseMillis(room.getAttribute('data-last-read'));
-  const lastReadIdAttr=parseInt(room.getAttribute('data-last-read-id')||'0',10)||0;
-  state={ unread:unreadAttr>0?unreadAttr:0, role:roleAttr||'other', lastRead:lastReadAttr>0?lastReadAttr:0, lastReadId:lastReadIdAttr>0?lastReadIdAttr:0, recentMessages:[] };
-  roomStates.set(room,state);
-  updateBadgeDisplay(room,state.unread);
-  return state;
-}
-
-function setUnreadCount(room,value){
-  const state=ensureRoomState(room);
-  const next=value>0?value:0;
-  state.unread=next;
-  room.dataset.unread=String(next);
-  updateBadgeDisplay(room,next);
-}
-
-function incrementUnread(room,delta){
-  const state=ensureRoomState(room);
-  const current=state.unread||0;
-  setUnreadCount(room,current+(delta||1));
-}
-
-function updateLastRead(room,state,value,id){
-  const ms=parseMillis(value);
-  const numericId=(typeof id==='number')?id:parseInt(id||'0',10)||0;
-  if(!ms) return false;
-  const currentMs=state.lastRead||0;
-  const currentId=state.lastReadId||0;
-  if(currentMs && ms<currentMs) return false;
-  if(currentMs && ms===currentMs && numericId<=currentId) return false;
-  state.lastRead=ms;
-  state.lastReadId=numericId>0?numericId:state.lastReadId||0;
-  const iso=formatIsoFromMs(ms);
-  if(iso) room.dataset.lastRead=iso;
-  if(state.lastReadId){ room.dataset.lastReadId=String(state.lastReadId); }
-  else { room.dataset.lastReadId='0'; }
-  return true;
-}
-
-function extractReadTimesPayload(source){
-  if(!source || typeof source!=='object') return null;
-  if(source.read_times && typeof source.read_times==='object') return source.read_times;
-  if(source.readTimes && typeof source.readTimes==='object') return source.readTimes;
-  if(source.reads && typeof source.reads==='object'){
-    const reads=source.reads;
-    if(reads.times && typeof reads.times==='object') return reads.times;
-  }
-  return null;
-}
-
-function extractReadStatusPayload(source){
-  if(!source || typeof source!=='object') return null;
-  if(source.read_status && typeof source.read_status==='object') return source.read_status;
-  if(source.readStatus && typeof source.readStatus==='object') return source.readStatus;
-  if(source.reads && typeof source.reads==='object'){
-    const reads=source.reads;
-    if(reads.roles && typeof reads.roles==='object') return reads.roles;
-  }
-  return null;
-}
-
-function extractReadRecordsPayload(source){
-  if(!source || typeof source!=='object') return null;
-  if(source.read_records && typeof source.read_records==='object') return source.read_records;
-  if(source.readRecords && typeof source.readRecords==='object') return source.readRecords;
-  if(source.reads && typeof source.reads==='object'){
-    const reads=source.reads;
-    if(reads.records && typeof reads.records==='object') return reads.records;
-  }
-  return null;
-}
-
-function resolveRoleValue(source,role){
-  if(!source || typeof source!=='object' || !role) return '';
-  const variants=[role,role.toLowerCase(),role.toUpperCase(),role.charAt(0).toUpperCase()+role.slice(1)];
-  for(let i=0;i<variants.length;i++){
-    const key=variants[i];
-    if(Object.prototype.hasOwnProperty.call(source,key) && source[key]) return source[key];
-  }
-  return '';
-}
-
-function resolveRoleBoolean(source,role){
-  if(!source || typeof source!=='object' || !role) return undefined;
-  const variants=[role,role.toLowerCase(),role.toUpperCase(),role.charAt(0).toUpperCase()+role.slice(1)];
-  for(let i=0;i<variants.length;i++){
-    const key=variants[i];
-    if(Object.prototype.hasOwnProperty.call(source,key)) return !!source[key];
-  }
-  return undefined;
-}
-
-function resolveRoleId(source,role){
-  if(!source || typeof source!=='object' || !role) return 0;
-  const variants=[role,role.toLowerCase(),role.toUpperCase(),role.charAt(0).toUpperCase()+role.slice(1)];
-  for(let i=0;i<variants.length;i++){
-    const key=variants[i];
-    if(!Object.prototype.hasOwnProperty.call(source,key)) continue;
-    const value=source[key];
-    if(typeof value==='number' && Number.isFinite(value)) return value>0?Math.floor(value):0;
-    if(typeof value==='string'){ const trimmed=value.trim(); if(/^-?\d+$/.test(trimmed)) return Math.abs(parseInt(trimmed,10)); }
-    if(value && typeof value==='object'){
-      if('id' in value){ const parsed=parseInt(value.id,10); if(!Number.isNaN(parsed)) return parsed>0?parsed:0; }
-      if('message_id' in value){ const parsed=parseInt(value.message_id,10); if(!Number.isNaN(parsed)) return parsed>0?parsed:0; }
-    }
-  }
-  return 0;
-}
-
-function payloadFingerprint(payload){
-  if(!payload || typeof payload!=='object') return '';
-  if(payload.id) return 'msg:'+payload.id;
-  const projectPart=payload.project||payload.project_id||'';
-  const userRaw=(payload.user!=null)?payload.user:(payload.user_id!=null?payload.user_id:'');
-  const atPart=payload.at||payload.published_at||payload.created_at||payload.timestamp||'';
-  const messagePart=payload.message||payload.content||'';
-  return 'msg:'+projectPart+':'+userRaw+':'+atPart+':'+messagePart;
-}
-
-function seenRecently(state,key){
-  if(!key) return false;
-  if(!state.recentMessages) state.recentMessages=[];
-  const arr=state.recentMessages;
-  if(!Array.isArray(arr)){
-    state.recentMessages=[];
-    state.recentMessages.push(key);
-    return false;
-  }
-  const idx=arr.indexOf(key);
-  if(idx!==-1) return true;
-  arr.push(key);
-  if(arr.length>50) arr.shift();
-  return false;
-}
-
-function handleReadReceiptPayload(room,state,payload){
-  const role=state.role;
-  if(!role || role==='other') return;
-  const times=extractReadTimesPayload(payload);
-  const statuses=extractReadStatusPayload(payload);
-  const records=extractReadRecordsPayload(payload);
-  let updated=false;
-  let rawTime=resolveRoleValue(times||{},role);
-  if((!rawTime||!rawTime.length) && records && typeof records==='object'){ const entry=records[role]||records[role.toLowerCase()]; if(entry&&typeof entry==='object'){ rawTime=entry.time||entry.datetime||entry.at||''; } }
-  const rawId=resolveRoleId(records||{},role);
-  if(rawTime) updated=updateLastRead(room,state,rawTime,rawId)||updated;
-  const roleStatus=resolveRoleBoolean(statuses,role);
-  if(roleStatus===true || updated){
-    setUnreadCount(room,0);
-  }
-}
-
-function handleMessagePayload(room,state,payload){
-  if(!payload || typeof payload!=='object') return;
-  const role=state.role;
-  if(!role || role==='other') return;
-  const type=(payload.type||payload.name||'').toString().toLowerCase();
-  if(type==='read_receipt'){ handleReadReceiptPayload(room,state,payload); return; }
-  if(type && ['text','message','chat','history'].indexOf(type)===-1 && !payload.message && !payload.content) return;
-  const messageRole=(payload.role||payload.user_role||'').toString().toLowerCase();
-  if(messageRole==='sys' || messageRole==='system') return;
-  const authorRaw=(payload.user!=null)?payload.user:(payload.user_id!=null?payload.user_id:0);
-  const authorId=parseInt(authorRaw,10)||0;
-  if(authorId && meId && authorId===meId) return;
-  const messageIdRaw=('id' in payload)?payload.id:(('message_id' in payload)?payload.message_id:(payload.messageId||payload.messageID));
-  const messageId=parseInt(messageIdRaw,10)||0;
-  const records=extractReadRecordsPayload(payload);
-  const statuses=extractReadStatusPayload(payload);
-  const statusForRole=resolveRoleBoolean(statuses,role);
-  if(statusForRole===true){
-    const timesForStatus=extractReadTimesPayload(payload);
-    let roleTime=resolveRoleValue(timesForStatus||{},role);
-    if((!roleTime||!roleTime.length) && records && typeof records==='object'){ const entry=records[role]||records[role.toLowerCase()]; if(entry&&typeof entry==='object'){ roleTime=entry.time||entry.datetime||entry.at||''; } }
-    const roleId=resolveRoleId(records||{},role) || messageId;
-    if(roleTime) updateLastRead(room,state,roleTime,roleId);
-    return;
-  }
-  const fingerprint=payloadFingerprint(payload);
-  const wasSeen=seenRecently(state,fingerprint);
-  const times=extractReadTimesPayload(payload);
-  if(times){
-    const rawTime=resolveRoleValue(times,role);
-    if(rawTime){
-      const roleId=resolveRoleId(records||{},role) || messageId;
-      updateLastRead(room,state,rawTime,roleId);
-    }
-  } else if(records && typeof records==='object'){
-    const entry=records[role]||records[role.toLowerCase()];
-    if(entry && typeof entry==='object'){ const rawTime=entry.time||entry.datetime||entry.at||''; if(rawTime){ const roleId=resolveRoleId(records,role)||messageId; updateLastRead(room,state,rawTime,roleId); } }
-  }
-  const atMs=parseMillis(payload.at||payload.published_at||payload.created_at||payload.timestamp||Date.now());
-  if(state.lastRead){
-    if(atMs && atMs<state.lastRead) return;
-    if(atMs && atMs===state.lastRead){
-      const lastId=state.lastReadId||0;
-      if(lastId && messageId && messageId<=lastId) return;
-      if(!messageId && wasSeen) return;
-    }
-    if(!atMs && state.lastReadId && messageId && messageId<=state.lastReadId) return;
-  }
-  if(wasSeen) return;
-  incrementUnread(room,1);
-}
-
-function handleRoomPayload(projectId,payload){
-  if(!projectId || !payload) return;
-  const key=String(projectId);
-  const room=roomMap.get(key);
-  if(!room) return;
-  const state=ensureRoomState(room);
-  const type=(payload.type||payload.name||'').toString().toLowerCase();
-  if(type==='read_receipt'){ handleReadReceiptPayload(room,state,payload); return; }
-  handleMessagePayload(room,state,payload);
-}
-
 rooms.forEach(function(room){
-  ensureRoomState(room);
   const pid=room.getAttribute('data-project');
   if(pid) roomMap.set(String(pid),room);
   const latestAttr=room.getAttribute('data-latest');
@@ -2446,7 +1894,6 @@ function subscribeInbox(){
           seenChannels.add(channelName);
           const pid=room.getAttribute('data-project'); const projectId=pid?parseInt(pid,10):0;
           const unsubscribe=window.ELXAO_ABLY.registerChannel(client,channelName,projectId,function(payload){
-            handleRoomPayload(projectId,payload);
             const bumpAt=payload&&payload.at ? payload.at : Date.now();
             bumpRoom(projectId,bumpAt);
           });
@@ -2461,9 +1908,7 @@ function onChatEvent(ev){
   const detail=ev&&ev.detail?ev.detail:{}; if(!detail || typeof detail.project==='undefined') return;
   const payload=window.ELXAO_CHAT_NORMALIZE(detail.payload||{},detail.project);
   const projectId=payload.project||parseInt(detail.project,10)||0; if(!projectId) return;
-  handleRoomPayload(projectId,payload);
-  const bumpAt=(payload&&payload.at)?payload.at:Date.now();
-  bumpRoom(projectId,bumpAt);
+  const bumpAt=payload.at||Date.now(); bumpRoom(projectId,bumpAt);
 }
 
 window.addEventListener('elxao:chat',onChatEvent);
