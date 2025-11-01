@@ -681,7 +681,7 @@ function elxao_chat_rest_token(WP_REST_Request $r){
         return new WP_Error('forbidden','Not allowed',['status'=>403]);
 
     $room=elxao_chat_room_id($pid);
-    $token=elxao_chat_request_ably_token($uid,[$room=>['subscribe','presence']]);
+    $token=elxao_chat_request_ably_token($uid,[$room=>['subscribe','publish','presence']]);
     if(is_wp_error($token)) return $token;
     return new WP_REST_Response($token,200);
 }
