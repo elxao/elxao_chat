@@ -765,34 +765,19 @@ function elxao_chat_render_window($pid){
     $myRole = elxao_chat_role_for_user($pid,$meId);
 
     // CSS variables from hard-coded constants
-    $style_map = [
-        '--chat-color'          => ELXAO_CHAT_COLOR_BASE,
-        '--chat-client'         => ELXAO_CHAT_COLOR_CLIENT,
-        '--chat-pm'             => ELXAO_CHAT_COLOR_PM,
-        '--chat-admin'          => ELXAO_CHAT_COLOR_ADMIN,
-        '--chat-sys'            => ELXAO_CHAT_COLOR_SYS,
-        '--chat-read-unread'    => ELXAO_CHAT_COLOR_READ_UNREAD,
-        '--chat-read-read'      => ELXAO_CHAT_COLOR_READ_ALL,
-        '--chat-read-client'    => ELXAO_CHAT_COLOR_READ_CLIENT_ONLY,
-        '--chat-read-pm'        => ELXAO_CHAT_COLOR_READ_PM_ONLY,
-        '--chat-unread-bg'      => ELXAO_CHAT_COLOR_UNREAD_BG,
-        '--chat-muted'          => '#9ca3af',
-        '--chat-border'         => '#4b5563',
-        '--chat-divider'        => '#374151',
-        '--chat-surface'        => '#111827',
-        '--chat-surface-muted'  => '#1f2937',
-        '--chat-surface-hover'  => 'rgba(255,255,255,0.06)',
-        '--chat-surface-active' => 'rgba(255,255,255,0.1)',
-        '--chat-focus'          => 'rgba(148,163,184,0.65)',
-        '--chat-input-border'   => '#6b7280',
-        '--chat-input-hover'    => '#9ca3af',
-    ];
-
-    $style_vars = '';
-    foreach($style_map as $var => $value){
-        if($value === '' || $value === null) continue;
-        $style_vars .= $var.':'.$value.';';
-    }
+    $style_vars = sprintf(
+        '--chat-color:%s; --chat-client:%s; --chat-pm:%s; --chat-admin:%s; --chat-sys:%s; --chat-read-unread:%s; --chat-read-read:%s; --chat-read-client:%s; --chat-read-pm:%s; --chat-unread-bg:%s;',
+        esc_attr(ELXAO_CHAT_COLOR_BASE),
+        esc_attr(ELXAO_CHAT_COLOR_CLIENT),
+        esc_attr(ELXAO_CHAT_COLOR_PM),
+        esc_attr(ELXAO_CHAT_COLOR_ADMIN),
+        esc_attr(ELXAO_CHAT_COLOR_SYS),
+        esc_attr(ELXAO_CHAT_COLOR_READ_UNREAD),
+        esc_attr(ELXAO_CHAT_COLOR_READ_ALL),
+        esc_attr(ELXAO_CHAT_COLOR_READ_CLIENT_ONLY),
+        esc_attr(ELXAO_CHAT_COLOR_READ_PM_ONLY),
+        esc_attr(ELXAO_CHAT_COLOR_UNREAD_BG)
+    );
 
 ob_start();?>
 <div id="elxao-chat-<?php echo $pid;?>"
@@ -805,7 +790,7 @@ ob_start();?>
      data-myrole="<?php echo esc_attr($myRole); ?>"
      data-client="<?php echo (int)$ids['client'];?>"
      data-pm="<?php echo (int)$ids['pm'];?>"
-     style="<?php echo esc_attr($style_vars); ?>">
+     style="<?php echo $style_vars; ?>">
   <div class="list" aria-live="polite"></div>
   <div class="composer">
     <textarea rows="2" placeholder="Type your message..."></textarea>
@@ -818,24 +803,22 @@ ob_start();?>
 </div>
 <style>
 #elxao-chat-<?php echo $pid;?>{
-  border:1px solid var(--chat-border,#4b5563);
-  border-radius:12px;
+  border:1px solid #4b5563;border-radius:12px;
   display:flex;flex-direction:column;height:460px;
-  font:14px/1.45 system-ui;
-  background:var(--chat-surface,#111827);
-  color:var(--chat-color,#f3f4f6);
+  font:14px/1.45 system-ui;background:transparent;
+  color:var(--chat-color);
 }
-#elxao-chat-<?php echo $pid;?> .list{flex:1;overflow:auto;padding:12px;color:inherit;background:var(--chat-surface,#111827)}
+#elxao-chat-<?php echo $pid;?> .list{flex:1;overflow:auto;padding:12px;color:inherit}
 #elxao-chat-<?php echo $pid;?> .sys    { color:var(--chat-sys);opacity:.9 }
 #elxao-chat-<?php echo $pid;?> .client { color:var(--chat-client) }
 #elxao-chat-<?php echo $pid;?> .pm     { color:var(--chat-pm) }
 #elxao-chat-<?php echo $pid;?> .admin  { color:var(--chat-admin) }
-#elxao-chat-<?php echo $pid;?> .chat-line{display:flex;gap:8px;align-items:flex-start;margin-bottom:8px;padding:10px 12px;border-radius:10px;transition:background-color .25s ease;background:var(--chat-surface-muted,#1f2937);border:1px solid var(--chat-divider,#374151)}
+#elxao-chat-<?php echo $pid;?> .chat-line{display:flex;gap:8px;align-items:flex-start;margin-bottom:8px;padding:6px 10px;border-radius:10px;transition:background-color .25s ease}
 #elxao-chat-<?php echo $pid;?> .chat-line:last-child{margin-bottom:0}
-#elxao-chat-<?php echo $pid;?> .chat-line.is-unread{background:var(--chat-unread-bg);border-color:rgba(255,255,255,0.18)}
+#elxao-chat-<?php echo $pid;?> .chat-line.is-unread{background:var(--chat-unread-bg)}
 #elxao-chat-<?php echo $pid;?> .chat-line .chat-text{flex:1;color:inherit;display:flex;flex-direction:column;gap:4px}
 #elxao-chat-<?php echo $pid;?> .chat-line .chat-message{word-break:break-word;white-space:pre-wrap}
-#elxao-chat-<?php echo $pid;?> .chat-line .chat-timestamp{font-size:12px;opacity:.7;color:var(--chat-muted,#9ca3af)}
+#elxao-chat-<?php echo $pid;?> .chat-line .chat-timestamp{font-size:12px;opacity:.65;color:inherit}
 #elxao-chat-<?php echo $pid;?> .chat-line .chat-timestamp.is-empty{display:none}
 #elxao-chat-<?php echo $pid;?> .chat-read-indicator{width:10px;height:10px;border-radius:999px;background:var(--chat-read-unread);margin-top:6px;flex:0 0 10px;box-shadow:0 0 0 1px rgba(0,0,0,0.35)}
 #elxao-chat-<?php echo $pid;?> .chat-read-indicator.chat-read-indicator--unread{background:var(--chat-read-unread)}
@@ -843,13 +826,10 @@ ob_start();?>
 #elxao-chat-<?php echo $pid;?> .chat-read-indicator.chat-read-indicator--read{background:var(--chat-read-read)}
 #elxao-chat-<?php echo $pid;?> .chat-read-indicator.chat-read-indicator--client{background:var(--chat-read-client)}
 #elxao-chat-<?php echo $pid;?> .chat-read-indicator.chat-read-indicator--pm{background:var(--chat-read-pm)}
-#elxao-chat-<?php echo $pid;?> .composer{display:flex;gap:8px;border-top:1px solid var(--chat-divider,#374151);padding:12px;background:var(--chat-surface-muted,#1f2937)}
-#elxao-chat-<?php echo $pid;?> textarea{flex:1;resize:none;background:var(--chat-surface,#111827);border:1px solid var(--chat-input-border,#6b7280);border-radius:8px;padding:10px;color:inherit;transition:border-color .2s ease, box-shadow .2s ease}
-#elxao-chat-<?php echo $pid;?> textarea::placeholder{color:var(--chat-muted,#9ca3af);opacity:.75}
-#elxao-chat-<?php echo $pid;?> textarea:focus-visible{outline:2px solid var(--chat-focus,rgba(148,163,184,0.65));outline-offset:2px;border-color:var(--chat-input-hover,#9ca3af)}
-#elxao-chat-<?php echo $pid;?> .send{display:inline-flex;align-items:center;justify-content:center;border:1px solid var(--chat-input-border,#6b7280);border-radius:10px;padding:0 12px;background:var(--chat-surface,#111827);cursor:pointer;min-width:44px;color:inherit;transition:border-color .2s ease, background-color .2s ease, box-shadow .2s ease}
-#elxao-chat-<?php echo $pid;?> .send:hover{background:var(--chat-surface-hover,rgba(255,255,255,0.06));border-color:var(--chat-input-hover,#9ca3af)}
-#elxao-chat-<?php echo $pid;?> .send:focus-visible{outline:2px solid var(--chat-focus,rgba(148,163,184,0.65));outline-offset:2px}
+#elxao-chat-<?php echo $pid;?> .composer{display:flex;gap:8px;border-top:1px solid #4b5563;padding:10px}
+#elxao-chat-<?php echo $pid;?> textarea{flex:1;resize:none;background:transparent;border:1px solid #6b7280;border-radius:8px;padding:10px;color:inherit}
+#elxao-chat-<?php echo $pid;?> .send{display:inline-flex;align-items:center;justify-content:center;border:1px solid #6b7280;border-radius:10px;padding:0 10px;background:transparent;cursor:pointer;min-width:44px;color:inherit}
+#elxao-chat-<?php echo $pid;?> .send:hover{background:rgba(255,255,255,.08);border-color:#9ca3af}
 #elxao-chat-<?php echo $pid;?> .send:disabled{opacity:.5;cursor:not-allowed}
 </style>
 <script>
@@ -2109,29 +2089,10 @@ function elxao_chat_render_inbox(){
     $rest_base=rest_url();
     $container_id='elxao-chat-inbox-'.wp_rand(1000,999999);
 
-    $style_map=[
-        '--chat-color'         => ELXAO_CHAT_COLOR_BASE,
-        '--chat-muted'         => '#9ca3af',
-        '--chat-border'        => '#4b5563',
-        '--chat-divider'       => '#374151',
-        '--chat-surface'       => '#111827',
-        '--chat-surface-muted' => '#1f2937',
-        '--chat-surface-hover' => 'rgba(255,255,255,0.06)',
-        '--chat-surface-active' => 'rgba(255,255,255,0.1)',
-        '--chat-focus'         => 'rgba(148,163,184,0.65)',
-        '--chat-unread-bg'     => ELXAO_CHAT_COLOR_UNREAD_BG,
-    ];
-    $style_vars='';
-    foreach($style_map as $var=>$value){
-        if($value === '' || $value === null) continue;
-        $style_vars.=$var.':'.$value.';';
-    }
-
     ob_start();
 ?>
 <div id="<?php echo esc_attr($container_id); ?>"
      class="elxao-chat-inbox"
-     style="<?php echo esc_attr($style_vars); ?>"
      data-rest="<?php echo esc_url($rest_base); ?>"
      data-nonce="<?php echo esc_attr($rest_nonce); ?>"
      data-user="<?php echo (int)$uid; ?>">
@@ -2172,24 +2133,24 @@ function elxao_chat_render_inbox(){
   </div>
 </div>
 <style>
-#<?php echo esc_attr($container_id); ?>{display:flex;flex-direction:column;font:14px/1.45 system-ui;color:var(--chat-color,#f3f4f6)}
-#<?php echo esc_attr($container_id); ?> .inbox-shell{display:flex;gap:0;border:1px solid var(--chat-border,#4b5563);border-radius:12px;overflow:hidden;min-height:460px;background:var(--chat-surface,#111827)}
-#<?php echo esc_attr($container_id); ?> .room-list{width:220px;max-width:260px;border-right:1px solid var(--chat-divider,#374151);background:var(--chat-surface-muted,#1f2937);display:flex;flex-direction:column}
-#<?php echo esc_attr($container_id); ?> .room-list .room{all:unset;cursor:pointer;padding:12px 14px;border-bottom:1px solid rgba(255,255,255,0.05);display:flex;flex-direction:column;gap:4px;color:var(--chat-color,#f3f4f6)}
-#<?php echo esc_attr($container_id); ?> .room-list .room:focus-visible{outline:2px solid var(--chat-focus,rgba(148,163,184,0.65));outline-offset:-2px}
-#<?php echo esc_attr($container_id); ?> .room-list .room:hover{background:var(--chat-surface-hover,rgba(255,255,255,0.06))}
-#<?php echo esc_attr($container_id); ?> .room-list .room.active{background:var(--chat-surface-active,rgba(255,255,255,0.1));box-shadow:inset 0 0 0 1px rgba(255,255,255,0.08)}
+#<?php echo esc_attr($container_id); ?>{display:flex;flex-direction:column;font:14px/1.45 system-ui;color:#f3f4f6}
+#<?php echo esc_attr($container_id); ?> .inbox-shell{display:flex;gap:0;border:1px solid #4b5563;border-radius:12px;overflow:hidden;min-height:460px;background:#111827}
+#<?php echo esc_attr($container_id); ?> .room-list{width:220px;max-width:260px;border-right:1px solid #374151;background:#1f2937;display:flex;flex-direction:column}
+#<?php echo esc_attr($container_id); ?> .room-list .room{all:unset;cursor:pointer;padding:12px 14px;border-bottom:1px solid rgba(255,255,255,0.05);display:flex;flex-direction:column;gap:4px;color:inherit}
+#<?php echo esc_attr($container_id); ?> .room-list .room:focus-visible{outline:2px solid rgba(96,165,250,0.9);outline-offset:-2px}
+#<?php echo esc_attr($container_id); ?> .room-list .room:hover{background:rgba(148,163,184,0.12)}
+#<?php echo esc_attr($container_id); ?> .room-list .room.active{background:rgba(96,165,250,0.18)}
 #<?php echo esc_attr($container_id); ?> .room-list .label{font-weight:600}
-#<?php echo esc_attr($container_id); ?> .room-list .meta{font-size:12px;color:var(--chat-muted,#9ca3af)}
+#<?php echo esc_attr($container_id); ?> .room-list .meta{font-size:12px;color:#9ca3af}
 #<?php echo esc_attr($container_id); ?> .room-list .meta-row{display:flex;align-items:center;justify-content:space-between;gap:8px}
 #<?php echo esc_attr($container_id); ?> .room-list .meta-row .meta{flex:1}
 #<?php echo esc_attr($container_id); ?> .room-list .badge{display:inline-flex;align-items:center;justify-content:center;font-size:12px;font-weight:700;line-height:1;padding:2px 8px;border-radius:999px;background:#ef4444;color:#fff;min-width:22px}
 #<?php echo esc_attr($container_id); ?> .room-list .badge[hidden]{display:none}
 #<?php echo esc_attr($container_id); ?> .room-list .room.has-unread:not(.active){background:rgba(239,68,68,0.14)}
 #<?php echo esc_attr($container_id); ?> .room-list .room.has-unread:not(.active) .label{color:#fca5a5}
-#<?php echo esc_attr($container_id); ?> .room-list .empty{padding:20px;color:var(--chat-muted,#9ca3af);font-style:italic}
-#<?php echo esc_attr($container_id); ?> .chat-pane{flex:1;min-width:0;background:var(--chat-surface,#111827);display:flex;align-items:center;justify-content:center;padding:20px;color:var(--chat-color,#f3f4f6)}
-#<?php echo esc_attr($container_id); ?> .chat-pane .placeholder{color:var(--chat-muted,#9ca3af);font-style:italic;text-align:center}
+#<?php echo esc_attr($container_id); ?> .room-list .empty{padding:20px;color:#9ca3af;font-style:italic}
+#<?php echo esc_attr($container_id); ?> .chat-pane{flex:1;min-width:0;background:transparent;display:flex;align-items:center;justify-content:center;padding:20px}
+#<?php echo esc_attr($container_id); ?> .chat-pane .placeholder{color:#9ca3af;font-style:italic;text-align:center}
 #<?php echo esc_attr($container_id); ?> .chat-pane .placeholder.error{color:#f87171;font-style:normal}
 @media (max-width: 900px){
   #<?php echo esc_attr($container_id); ?> .inbox-shell{flex-direction:column}
