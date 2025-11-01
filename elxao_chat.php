@@ -2160,37 +2160,38 @@ function elxao_chat_render_inbox(){
 </div>
 <style>
 #<?php echo esc_attr($container_id); ?>{display:flex;flex-direction:column;font:15px/1.5 "SF Pro Text","Inter",system-ui,-apple-system,"Segoe UI",sans-serif;color:#0f172a;gap:20px}
-#<?php echo esc_attr($container_id); ?> .inbox-shell{display:flex;gap:0;--inbox-frame-border:rgba(15,23,42,0.08);--inbox-frame-elevation:0 24px 50px rgba(15,23,42,0.08);border:1px solid var(--inbox-frame-border);border-radius:24px;overflow:hidden;height:460px;background:linear-gradient(135deg,#f8fafc 0%,#f2f5f9 100%);box-shadow:var(--inbox-frame-elevation)}
-#<?php echo esc_attr($container_id); ?> .room-list{width:260px;max-width:300px;border-right:1px solid rgba(15,23,42,0.08);background:rgba(255,255,255,0.88);backdrop-filter:saturate(180%) blur(18px);display:flex;flex-direction:column}
-#<?php echo esc_attr($container_id); ?> .room-list .room{all:unset;cursor:pointer;padding:18px 20px;border-bottom:1px solid rgba(15,23,42,0.06);display:flex;flex-direction:column;gap:8px;color:inherit;transition:background-color .2s ease,transform .2s ease,box-shadow .2s ease}
-#<?php echo esc_attr($container_id); ?> .room-list .room:focus-visible{outline:2px solid rgba(14,165,233,0.65);outline-offset:-4px;border-radius:16px}
-#<?php echo esc_attr($container_id); ?> .room-list .room:hover{background:rgba(37,99,235,0.08);box-shadow:inset 4px 0 0 rgba(37,99,235,0.25)}
-#<?php echo esc_attr($container_id); ?> .room-list .room.active{background:linear-gradient(135deg,rgba(14,165,233,0.22),rgba(37,99,235,0.18));box-shadow:inset 4px 0 0 #2563eb}
+#<?php echo esc_attr($container_id); ?> .inbox-shell{display:flex;gap:0;border:1px solid rgba(15,23,42,0.08);border-radius:18px;overflow:hidden;height:460px;background:#ffffff}
+#<?php echo esc_attr($container_id); ?> .room-list{width:260px;max-width:300px;border-right:1px solid rgba(15,23,42,0.08);background:#f8fafc;display:flex;flex-direction:column}
+#<?php echo esc_attr($container_id); ?> .room-list .room{all:unset;cursor:pointer;padding:18px 20px;border-bottom:1px solid rgba(15,23,42,0.06);display:flex;flex-direction:column;gap:8px;color:inherit;transition:background-color .2s ease,color .2s ease}
+#<?php echo esc_attr($container_id); ?> .room-list .room:focus-visible{outline:2px solid rgba(37,99,235,0.45);outline-offset:-4px;border-radius:12px}
+#<?php echo esc_attr($container_id); ?> .room-list .room:hover{background:#e0ecff}
+#<?php echo esc_attr($container_id); ?> .room-list .room.active{background:#dbeafe}
 #<?php echo esc_attr($container_id); ?> .room-list .room.active .label{color:#0f172a}
 #<?php echo esc_attr($container_id); ?> .room-list .label{font-weight:600;color:#1f2937}
 #<?php echo esc_attr($container_id); ?> .room-list .meta{font-size:12px;color:#64748b}
 #<?php echo esc_attr($container_id); ?> .room-list .meta-row{display:flex;align-items:center;justify-content:space-between;gap:10px}
 #<?php echo esc_attr($container_id); ?> .room-list .meta-row .meta{flex:1}
-#<?php echo esc_attr($container_id); ?> .room-list .badge{display:inline-flex;align-items:center;justify-content:center;font-size:12px;font-weight:700;line-height:1;padding:4px 10px;border-radius:999px;background:#10a37f;color:#f8fafc;min-width:28px;box-shadow:0 8px 16px rgba(16,163,127,0.25)}
+#<?php echo esc_attr($container_id); ?> .room-list .badge{display:inline-flex;align-items:center;justify-content:center;font-size:12px;font-weight:700;line-height:1;padding:4px 10px;border-radius:999px;background:#10a37f;color:#f8fafc;min-width:28px}
 #<?php echo esc_attr($container_id); ?> .room-list .badge[hidden]{display:none}
-#<?php echo esc_attr($container_id); ?> .room-list .room.has-unread:not(.active){background:linear-gradient(135deg,rgba(16,163,127,0.14),rgba(16,163,127,0.08));box-shadow:inset 4px 0 0 rgba(16,163,127,0.65)}
+#<?php echo esc_attr($container_id); ?> .room-list .room.has-unread:not(.active){background:#ecfdf5}
 #<?php echo esc_attr($container_id); ?> .room-list .room.has-unread:not(.active) .label{color:#0f172a}
 #<?php echo esc_attr($container_id); ?> .room-list .empty{padding:26px;color:#64748b;font-style:italic}
-#<?php echo esc_attr($container_id); ?> .chat-pane{flex:1;min-width:0;background:rgba(255,255,255,0.92);display:flex;align-items:stretch;justify-content:flex-start;padding:28px;box-sizing:border-box;height:100%;backdrop-filter:saturate(180%) blur(18px)}
-#<?php echo esc_attr($container_id); ?> .chat-pane .placeholder{color:#475569;font-style:italic;text-align:center;margin:auto;max-width:340px}
+#<?php echo esc_attr($container_id); ?> .chat-pane{flex:1;min-width:0;background:#ffffff;display:flex;align-items:stretch;justify-content:flex-start;padding:0;box-sizing:border-box;height:100%}
+#<?php echo esc_attr($container_id); ?> .chat-pane .placeholder{color:#475569;font-style:italic;text-align:center;margin:auto;max-width:340px;padding:24px}
 #<?php echo esc_attr($container_id); ?> .chat-pane .placeholder.error{color:#dc2626;font-style:normal}
-#<?php echo esc_attr($container_id); ?> .chat-pane > .elxao-chat{flex:1;height:100%;min-height:0;max-width:100%;--chat-frame-border:rgba(15,23,42,0.08);--chat-frame-elevation:0 12px 28px rgba(15,23,42,0.08);background:linear-gradient(135deg,#f9fafb 0%,#f4f7fb 100%);box-shadow:var(--chat-frame-elevation)}
-#<?php echo esc_attr($container_id); ?> .chat-pane > .elxao-chat .composer{background:rgba(255,255,255,0.78);border-top:1px solid rgba(15,23,42,0.08)}
+#<?php echo esc_attr($container_id); ?> .chat-pane > .elxao-chat{flex:1;height:100%;min-height:0;max-width:100%;border:none;border-radius:0;box-shadow:none;background:#ffffff}
+#<?php echo esc_attr($container_id); ?> .chat-pane > .elxao-chat .list{background:#ffffff}
+#<?php echo esc_attr($container_id); ?> .chat-pane > .elxao-chat .composer{background:#ffffff;border-top:1px solid rgba(15,23,42,0.08)}
 #<?php echo esc_attr($container_id); ?> .chat-pane > .elxao-chat textarea{background:#ffffff;border-color:#d0d7e5}
 @media (max-width: 900px){
   #<?php echo esc_attr($container_id); ?> .inbox-shell{flex-direction:column;height:auto}
   #<?php echo esc_attr($container_id); ?> .chat-pane{height:auto}
   #<?php echo esc_attr($container_id); ?> .room-list{width:100%;max-width:none;display:flex;flex-direction:row;overflow-x:auto}
-  #<?php echo esc_attr($container_id); ?> .room-list .room{flex:1;min-width:220px;border-bottom:none;border-right:1px solid rgba(15,23,42,0.08);border-radius:0;box-shadow:none}
+  #<?php echo esc_attr($container_id); ?> .room-list .room{flex:1;min-width:220px;border-bottom:none;border-right:1px solid rgba(15,23,42,0.08);border-radius:0}
   #<?php echo esc_attr($container_id); ?> .room-list .room:last-child{border-right:none}
-  #<?php echo esc_attr($container_id); ?> .room-list .room.active{box-shadow:inset 0 -4px 0 #2563eb}
-  #<?php echo esc_attr($container_id); ?> .room-list .room.has-unread:not(.active){box-shadow:inset 0 -4px 0 rgba(16,163,127,0.65)}
-  #<?php echo esc_attr($container_id); ?> .chat-pane{min-height:380px;padding:24px}
+  #<?php echo esc_attr($container_id); ?> .room-list .room.active{box-shadow:none}
+  #<?php echo esc_attr($container_id); ?> .room-list .room.has-unread:not(.active){box-shadow:none}
+  #<?php echo esc_attr($container_id); ?> .chat-pane{min-height:380px}
 }
 </style>
 <script>
