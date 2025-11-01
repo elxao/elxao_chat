@@ -38,6 +38,7 @@
 
       const typingUsers = new Map();
       let typingState = false;
+      let desiredTypingState = false;
       let typingTimeoutId = null;
       const TYPING_DELAY_MS = 3000;
       let channel = null;
@@ -54,18 +55,29 @@
         }
       }
 
-      function setTypingState(isTyping){
-        if(typingState === isTyping || !channel) return;
-        typingState = isTyping;
+      function syncTypingState(){
+        if(!channel) return;
+        if(typingState === desiredTypingState) return;
+        typingState = desiredTypingState;
         try{
-          channel.presence.update({ typing: isTyping, name: myName });
+          channel.presence.update({ typing: typingState, name: myName });
         }catch(err){/* ignore */}
       }
 
+      function setDesiredTypingState(isTyping){
+        const nextState = !!isTyping;
+        if(desiredTypingState === nextState && channel){
+          syncTypingState();
+          return;
+        }
+        desiredTypingState = nextState;
+        syncTypingState();
+      }
+
       function onLocalInput(){
-        setTypingState(true);
+        setDesiredTypingState(true);
         if(typingTimeoutId) clearTimeout(typingTimeoutId);
-        typingTimeoutId = setTimeout(function(){ setTypingState(false); }, TYPING_DELAY_MS);
+        typingTimeoutId = setTimeout(function(){ setDesiredTypingState(false); }, TYPING_DELAY_MS);
       }
 
       const ably = window.ELXAO_ABLY;
@@ -73,7 +85,10 @@
 
       ably.ensureClient().then(function(client){
         channel = client.channels.get(room);
-        channel.presence.enter({ typing: false, name: myName }).catch(function(){});
+        channel.presence.enter({ typing: false, name: myName })
+          .then(function(){ syncTypingState(); })
+          .catch(function(){});
+        syncTypingState();
         channel.presence.subscribe(function(msg){
           if(!msg) return;
           const clientId = msg.clientId;
@@ -108,6 +123,8 @@
       if(textarea) textarea.addEventListener('input', onLocalInput);
 
       window.addEventListener('beforeunload', function(){
+        desiredTypingState = false;
+        syncTypingState();
         if(channel){
           try{
             channel.presence.leave();
