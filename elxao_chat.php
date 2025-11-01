@@ -978,7 +978,7 @@ if(ta){
   ta.addEventListener('keydown',function(e){
     if((e.key==='Enter') && (e.ctrlKey || e.metaKey)){
       e.preventDefault();
-      btn.click();
+      if(btn) btn.click();
       return;
     }
     if(shouldTriggerTypingFromKey(e)){
@@ -2451,24 +2451,26 @@ load({limit:HISTORY_INITIAL_LIMIT,order:'desc'})
   .catch(function(err){ console.error('ELXAO chat history unavailable',err); if(!fallbackActive) startFallbackPolling(FALLBACK_INTERVAL); });
 
 /* composer */
-btn.addEventListener('click', function(){
-  const v = ta.value.replace(/\s+$/,''); if(!v.trim()) return;
-  const meName = '<?php echo $meName;?>';
-  handleChatPayload({ type:'text', message:v, project:projectId||parseInt(pid,10), user:myId, user_display:meName, role:myRole });
-  rememberLocal(fingerprint(projectId,myId,v)); ta.value=''; btn.disabled=true;
-  stopLocalTyping();
-  if(typeof syncTextareaSize==='function') syncTextareaSize();
-  send(v).then(function(resp){
-    if(resp && resp.ok){
-      const resolvedProject=resp.project_id?parseInt(resp.project_id,10):projectId;
-      if(resolvedProject){
-        window.ELXAO_CHAT_BUS.emit({ project:resolvedProject, payload:{ type:'text', message:v, project:resolvedProject, user:myId, user_display:meName, role:myRole, at:resp.at||new Date().toISOString(), id:resp.id } });
+if(btn){
+  btn.addEventListener('click', function(){
+    const v = ta.value.replace(/\s+$/,''); if(!v.trim()) return;
+    const meName = '<?php echo $meName;?>';
+    handleChatPayload({ type:'text', message:v, project:projectId||parseInt(pid,10), user:myId, user_display:meName, role:myRole });
+    rememberLocal(fingerprint(projectId,myId,v)); ta.value=''; btn.disabled=true;
+    stopLocalTyping();
+    if(typeof syncTextareaSize==='function') syncTextareaSize();
+    send(v).then(function(resp){
+      if(resp && resp.ok){
+        const resolvedProject=resp.project_id?parseInt(resp.project_id,10):projectId;
+        if(resolvedProject){
+          window.ELXAO_CHAT_BUS.emit({ project:resolvedProject, payload:{ type:'text', message:v, project:resolvedProject, user:myId, user_display:meName, role:myRole, at:resp.at||new Date().toISOString(), id:resp.id } });
+        }
+        applyServerAck(resp);
       }
-      applyServerAck(resp);
-    }
-  }).catch(function(err){ console.error('Failed to send chat message',err); })
-    .finally(()=>{ btn.disabled=false; ta.focus(); });
-});
+    }).catch(function(err){ console.error('Failed to send chat message',err); })
+      .finally(()=>{ btn.disabled=false; ta.focus(); });
+  });
+}
 
 /* evaluate seen on scroll/resize as well */
 if(list){
