@@ -860,6 +860,14 @@ ob_start();?>
 #elxao-chat-<?php echo $pid;?> .chat-read-indicator.chat-read-indicator--read{background:var(--chat-read-read)}
 #elxao-chat-<?php echo $pid;?> .chat-read-indicator.chat-read-indicator--client{background:var(--chat-read-client)}
 #elxao-chat-<?php echo $pid;?> .chat-read-indicator.chat-read-indicator--pm{background:var(--chat-read-pm)}
+#elxao-chat-<?php echo $pid;?> .typing-indicator-row{display:flex;align-items:center;gap:10px;margin:10px 18px 0;padding:10px 18px;border-radius:12px;background:rgba(148,163,184,0.12);color:#475569;font-size:13px;opacity:0;transform:translateY(6px);transition:opacity .24s ease,transform .24s ease;pointer-events:none}
+#elxao-chat-<?php echo $pid;?> .typing-indicator-row.is-visible{opacity:1;transform:translateY(0)}
+#elxao-chat-<?php echo $pid;?> .typing-indicator-row .typing-dots{display:inline-flex;gap:6px}
+#elxao-chat-<?php echo $pid;?> .typing-indicator-row .typing-dots span{width:6px;height:6px;border-radius:50%;background:currentColor;opacity:.45;animation:elxao-chat-typing-bounce 1.1s infinite ease-in-out}
+#elxao-chat-<?php echo $pid;?> .typing-indicator-row .typing-dots span:nth-child(2){animation-delay:.12s}
+#elxao-chat-<?php echo $pid;?> .typing-indicator-row .typing-dots span:nth-child(3){animation-delay:.24s}
+#elxao-chat-<?php echo $pid;?> .typing-indicator-row .typing-text{font-weight:500}
+@keyframes elxao-chat-typing-bounce{0%,80%,100%{transform:scale(0.75);opacity:.35}40%{transform:scale(1);opacity:1}}
 #elxao-chat-<?php echo $pid;?> .composer{border-top:1px solid rgba(15,23,42,0.08);padding:18px 20px;background:rgba(255,255,255,0.78);backdrop-filter:saturate(180%) blur(22px)}
 #elxao-chat-<?php echo $pid;?> .composer-input{position:relative;display:flex;align-items:center;width:100%;background:#ffffff;border:1px solid #d0d7e5;border-radius:999px;padding:10px 18px;box-shadow:inset 0 1px 3px rgba(15,23,42,0.08);transition:border-color .2s ease,box-shadow .2s ease}
 #elxao-chat-<?php echo $pid;?> textarea{flex:1;resize:none;background:transparent;border:none;padding:12px 64px 12px 0;color:var(--chat-color);font:inherit;line-height:1.5;min-height:0;height:auto;overflow-y:hidden}
@@ -877,12 +885,72 @@ const list=root.querySelector('.list');
 const ta=root.querySelector('textarea');
 const btn=root.querySelector('.send');
 let syncTextareaSize=null;
+const typingUsers=new Map();
+const TYPING_DISPLAY_DURATION=3200;
+const TYPING_IDLE_TIMEOUT=2600;
+const TYPING_REFRESH_INTERVAL=1500;
+let typingIndicatorRow=null;
+let typingIndicatorText=null;
+let realtimeChannel=null;
+const localTypingState={active:false,timeout:null,lastSent:0};
 
 if(ta){
   ta.setAttribute('rows','1');
   ta.style.overflowY='hidden';
   let baseHeight=0;
   const MAX_AUTO_HEIGHT=180;
+
+  const composerTrimmedValue=function(){
+    return ta.value.replace(/\s+$/,'').trim();
+  };
+
+  const evaluateTypingState=function(){
+    const trimmed=composerTrimmedValue();
+    if(trimmed){
+      updateLocalTypingActivity();
+    } else {
+      stopLocalTyping();
+    }
+  };
+
+  const queueTypingEvaluation=function(){
+    if(typeof requestAnimationFrame==='function'){
+      requestAnimationFrame(evaluateTypingState);
+    } else {
+      setTimeout(evaluateTypingState,0);
+    }
+  };
+
+  const shouldTriggerTypingFromKey=function(event){
+    if(!event) return false;
+    const key=event.key || '';
+    if(key==='Enter') return false;
+    if(event.ctrlKey || event.metaKey) return false;
+    if(event.altKey && key!=='Backspace' && key!=='Delete') return false;
+    const normalizedKey=key.length===1 ? '' : key;
+    switch(normalizedKey){
+      case 'Shift':
+      case 'CapsLock':
+      case 'Tab':
+      case 'Escape':
+      case 'ArrowUp':
+      case 'ArrowDown':
+      case 'ArrowLeft':
+      case 'ArrowRight':
+      case 'PageUp':
+      case 'PageDown':
+      case 'Home':
+      case 'End':
+      case 'Insert':
+      case 'NumLock':
+      case 'ScrollLock':
+      case 'Pause':
+      case 'ContextMenu':
+        return false;
+    }
+    if(normalizedKey && /^F\d{1,2}$/i.test(normalizedKey)) return false;
+    return true;
+  };
 
   syncTextareaSize=()=>{
     ta.style.height='auto';
@@ -898,6 +966,44 @@ if(ta){
   syncTextareaSize();
   ta.addEventListener('input',syncTextareaSize);
   ta.addEventListener('focus',syncTextareaSize);
+
+  const handleTypingInput=function(){
+    evaluateTypingState();
+  };
+
+  ta.addEventListener('input',handleTypingInput);
+  ta.addEventListener('compositionend',handleTypingInput);
+  ta.addEventListener('blur',function(){ stopLocalTyping(); });
+
+  ta.addEventListener('keydown',function(e){
+    if((e.key==='Enter') && (e.ctrlKey || e.metaKey)){
+      e.preventDefault();
+      if(btn) btn.click();
+      return;
+    }
+    if(shouldTriggerTypingFromKey(e)){
+      if(e.key==='Backspace' || e.key==='Delete'){
+        if(composerTrimmedValue()) updateLocalTypingActivity();
+        queueTypingEvaluation();
+      } else {
+        updateLocalTypingActivity();
+        queueTypingEvaluation();
+      }
+    }
+  });
+}
+
+if(list){
+  typingIndicatorRow=document.createElement('div');
+  typingIndicatorRow.className='typing-indicator-row';
+  typingIndicatorRow.setAttribute('aria-live','polite');
+  const dots=document.createElement('span');
+  dots.className='typing-dots';
+  for(let i=0;i<3;i++){ const dot=document.createElement('span'); dots.appendChild(dot); }
+  typingIndicatorText=document.createElement('span');
+  typingIndicatorText.className='typing-text';
+  typingIndicatorRow.appendChild(dots);
+  typingIndicatorRow.appendChild(typingIndicatorText);
 }
 
 if(!window.ELXAO_CHAT_FORMAT_DATE){
@@ -925,6 +1031,7 @@ if(!window.ELXAO_CHAT_FORMAT_DATE){
 const pid=root.dataset.project,room=root.dataset.room,rest=root.dataset.rest,nonce=root.dataset.nonce;
 const myId=parseInt(root.dataset.myid,10)||0;
 const myRole=(root.dataset.myrole||'other');
+const myName='<?php echo $meName;?>';
 const hdr={'X-WP-Nonce':nonce};
 const projectId=parseInt(pid,10)||0;
 const clientId=parseInt(root.dataset.client,10)||0;
@@ -1375,6 +1482,149 @@ function extractReadTimes(source){
   return null;
 }
 
+function clearTypingEntry(key){
+  const existing=typingUsers.get(key);
+  if(existing && existing.timeout){ clearTimeout(existing.timeout); }
+  typingUsers.delete(key);
+}
+
+function renderTypingIndicator(){
+  if(!typingIndicatorRow || !typingIndicatorText) return;
+  const entries=[];
+  typingUsers.forEach(function(info){ entries.push(info); });
+  if(!entries.length){
+    typingIndicatorText.textContent='';
+    typingIndicatorRow.classList.remove('is-visible');
+    if(typingIndicatorRow.parentNode){ typingIndicatorRow.parentNode.removeChild(typingIndicatorRow); }
+    return;
+  }
+  const single=entries.length===1;
+  const label=single ? (entries[0] && entries[0].name ? entries[0].name : 'Someone') : '';
+  typingIndicatorText.textContent=single ? (label+' is typing…') : 'Several people are typing…';
+  typingIndicatorRow.classList.add('is-visible');
+  if(list && typingIndicatorRow.parentNode!==list){
+    list.appendChild(typingIndicatorRow);
+  }
+}
+
+function setTypingState(userId,name,isTyping){
+  const numericId=parseInt(userId,10)||0;
+  if(!numericId) return;
+  if(myId && numericId===myId) return;
+  const key=String(numericId);
+  if(isTyping){
+    const existing=typingUsers.get(key);
+    if(existing && existing.timeout){ clearTimeout(existing.timeout); }
+    const timeout=setTimeout(function(){ clearTypingEntry(key); renderTypingIndicator(); },TYPING_DISPLAY_DURATION);
+    typingUsers.set(key,{name:name||'Someone',timeout:timeout});
+    renderTypingIndicator();
+  } else {
+    clearTypingEntry(key);
+    renderTypingIndicator();
+  }
+}
+
+function clearAllTypingStates(){
+  typingUsers.forEach(function(entry){ if(entry && entry.timeout) clearTimeout(entry.timeout); });
+  typingUsers.clear();
+  renderTypingIndicator();
+}
+
+function coerceTypingValue(value){
+  if(value===undefined || value===null) return null;
+  if(typeof value==='boolean') return value;
+  if(typeof value==='number') return value>0;
+  if(typeof value==='string'){
+    const normalized=value.trim().toLowerCase();
+    if(!normalized) return false;
+    if(normalized==='true' || normalized==='1' || normalized==='yes' || normalized==='y') return true;
+    if(normalized==='false' || normalized==='0' || normalized==='no' || normalized==='n') return false;
+  }
+  return !!value;
+}
+
+function applyTypingPayload(data){
+  if(!data) return;
+  const userId=data.user||data.user_id||data.userId||0;
+  const display=data.user_display||data.user_name||data.username||'Someone';
+  let typingValue=null;
+  if(Object.prototype.hasOwnProperty.call(data,'is_typing')) typingValue=data.is_typing;
+  else if(Object.prototype.hasOwnProperty.call(data,'typing')) typingValue=data.typing;
+  else if(Object.prototype.hasOwnProperty.call(data,'active')) typingValue=data.active;
+  const interpreted=coerceTypingValue(typingValue);
+  if(interpreted===null) return;
+  if(interpreted){
+    setTypingState(userId,display,true);
+  } else {
+    setTypingState(userId,display,false);
+  }
+}
+
+function publishTypingState(isTyping){
+  const now=new Date();
+  const payload={
+    type:'typing',
+    event:'typing',
+    is_typing:!!isTyping,
+    user:myId,
+    user_id:myId,
+    user_display:myName,
+    user_name:myName,
+    role:myRole,
+    project:projectId,
+    project_id:projectId,
+    timestamp:now.toISOString()
+  };
+  if(!realtimeChannel || typeof realtimeChannel.publish!=='function'){
+    if(window.ELXAO_CHAT_BUS && typeof window.ELXAO_CHAT_BUS.emit==='function'){
+      try{ window.ELXAO_CHAT_BUS.emit({ project:projectId, payload:payload }); }
+      catch(e){}
+    }
+    return Promise.resolve();
+  }
+  try{
+    const result=realtimeChannel.publish('typing',payload);
+    if(window.ELXAO_CHAT_BUS && typeof window.ELXAO_CHAT_BUS.emit==='function'){
+      try{ window.ELXAO_CHAT_BUS.emit({ project:projectId, payload:Object.assign({},payload) }); }
+      catch(e){}
+    }
+    if(result && typeof result.catch==='function') return result.catch(function(){});
+    return Promise.resolve(result);
+  }catch(e){
+    if(window.ELXAO_CHAT_BUS && typeof window.ELXAO_CHAT_BUS.emit==='function'){
+      try{ window.ELXAO_CHAT_BUS.emit({ project:projectId, payload:Object.assign({},payload) }); }
+      catch(err){}
+    }
+    return Promise.resolve();
+  }
+}
+
+function stopLocalTyping(){
+  if(localTypingState.timeout){
+    clearTimeout(localTypingState.timeout);
+    localTypingState.timeout=null;
+  }
+  if(localTypingState.active){
+    localTypingState.active=false;
+    localTypingState.lastSent=Date.now();
+    publishTypingState(false);
+  }
+}
+
+function updateLocalTypingActivity(){
+  const now=Date.now();
+  const shouldSend=!localTypingState.active || (now-localTypingState.lastSent)>=TYPING_REFRESH_INTERVAL;
+  if(shouldSend){
+    localTypingState.lastSent=now;
+    publishTypingState(true);
+  }
+  localTypingState.active=true;
+  if(localTypingState.timeout){
+    clearTimeout(localTypingState.timeout);
+  }
+  localTypingState.timeout=setTimeout(stopLocalTyping,TYPING_IDLE_TIMEOUT);
+}
+
 /* ---------- live state ---------- */
 const currentReadTimes={client:'',pm:'',admin:''};
 let isRenderingHistory=false;
@@ -1677,6 +1927,10 @@ function handleChatPayload(payload,options){
   if(!payload) return;
   const data=window.ELXAO_CHAT_NORMALIZE(payload,projectId);
   if(!data) return;
+  if((data.type||'').toLowerCase()==='typing'){
+    applyTypingPayload(data);
+    return;
+  }
   if(data.type==='read_receipt'){
     applyReadReceipt(data);
     return;
@@ -1690,6 +1944,10 @@ function handleRealtimePayload(payload){
   const data=window.ELXAO_CHAT_NORMALIZE(payload,projectId);
   if(!data) return;
   if(data.project && data.project!==projectId) return;
+  if((data.type||'').toLowerCase()==='typing'){
+    applyTypingPayload(data);
+    return;
+  }
   if(data.type==='read_receipt'){
     applyReadReceipt(data);
     return;
@@ -1710,6 +1968,10 @@ function onChatEvent(ev){
   const targetProject=hintedProject||payloadProject||0;
   if(targetProject && targetProject!==projectId) return;
   if(!payload.project) payload.project=projectId;
+  if((payload.type||'').toLowerCase()==='typing'){
+    applyTypingPayload(payload);
+    return;
+  }
   const fp=fingerprint(projectId,payload.user||0,payload.message||'');
   if(isRecentLocal(fp)) return;
   handleChatPayload(payload);
@@ -1723,6 +1985,7 @@ function subscribeRealtime(tokenDetails){
     if(realtimeCleanup){ try{ realtimeCleanup(); }catch(e){} realtimeCleanup=null; }
     const unsubscribe=window.ELXAO_ABLY.registerChannel(client,room,projectId,handleRealtimePayload);
     realtimeCleanup=unsubscribe;
+    realtimeChannel=client && client.channels ? client.channels.get(room) : null;
     realtimeReady=true;
     stopFallbackPolling();
   });
@@ -1731,6 +1994,9 @@ function subscribeRealtime(tokenDetails){
 function cleanup(){
   if(realtimeCleanup){ try{ realtimeCleanup(); }catch(e){} realtimeCleanup=null; }
   realtimeReady=false;
+  realtimeChannel=null;
+  stopLocalTyping();
+  clearAllTypingStates();
   latestSeenAtMs=0;
   optimisticLatestReadMs=0;
   latestAt='';
@@ -1777,6 +2043,7 @@ function mapHistoryItem(item){
 function renderHistory(items,meta){
   const source=Array.isArray(items)?items:[];
   isRenderingHistory=true;
+  clearAllTypingStates();
   latestAt=''; latestId=0;
   oldestAt=''; oldestId=0;
   historyReady=false;
@@ -1962,6 +2229,8 @@ function appendChatLine(source,options){
   const stamp=String(data.at||data.published_at||data.created_at||'');
   const userId=('user' in data && data.user!=null)?String(data.user): (('user_id' in data && data.user_id!=null)?String(data.user_id):'');
 
+  if(userId) setTypingState(userId,null,false);
+
   let existing=null;
   if(list && list.children && list.children.length){
     if(messageId){
@@ -2104,6 +2373,9 @@ function appendChatLine(source,options){
   } else {
     list.appendChild(line);
   }
+  if(typingIndicatorRow && typingIndicatorRow.parentNode===list){
+    list.appendChild(typingIndicatorRow);
+  }
   updateUnreadStateForLine(line);
   if(prepend && list){
     const newHeight=list.scrollHeight;
@@ -2179,27 +2451,26 @@ load({limit:HISTORY_INITIAL_LIMIT,order:'desc'})
   .catch(function(err){ console.error('ELXAO chat history unavailable',err); if(!fallbackActive) startFallbackPolling(FALLBACK_INTERVAL); });
 
 /* composer */
-btn.addEventListener('click', function(){
-  const v = ta.value.replace(/\s+$/,''); if(!v.trim()) return;
-  const meName = '<?php echo $meName;?>';
-  handleChatPayload({ type:'text', message:v, project:projectId||parseInt(pid,10), user:myId, user_display:meName, role:myRole });
-  rememberLocal(fingerprint(projectId,myId,v)); ta.value=''; btn.disabled=true;
-  if(typeof syncTextareaSize==='function') syncTextareaSize();
-  send(v).then(function(resp){
-    if(resp && resp.ok){
-      const resolvedProject=resp.project_id?parseInt(resp.project_id,10):projectId;
-      if(resolvedProject){
-        window.ELXAO_CHAT_BUS.emit({ project:resolvedProject, payload:{ type:'text', message:v, project:resolvedProject, user:myId, user_display:meName, role:myRole, at:resp.at||new Date().toISOString(), id:resp.id } });
+if(btn){
+  btn.addEventListener('click', function(){
+    const v = ta.value.replace(/\s+$/,''); if(!v.trim()) return;
+    const meName = '<?php echo $meName;?>';
+    handleChatPayload({ type:'text', message:v, project:projectId||parseInt(pid,10), user:myId, user_display:meName, role:myRole });
+    rememberLocal(fingerprint(projectId,myId,v)); ta.value=''; btn.disabled=true;
+    stopLocalTyping();
+    if(typeof syncTextareaSize==='function') syncTextareaSize();
+    send(v).then(function(resp){
+      if(resp && resp.ok){
+        const resolvedProject=resp.project_id?parseInt(resp.project_id,10):projectId;
+        if(resolvedProject){
+          window.ELXAO_CHAT_BUS.emit({ project:resolvedProject, payload:{ type:'text', message:v, project:resolvedProject, user:myId, user_display:meName, role:myRole, at:resp.at||new Date().toISOString(), id:resp.id } });
+        }
+        applyServerAck(resp);
       }
-      applyServerAck(resp);
-    }
-  }).catch(function(err){ console.error('Failed to send chat message',err); })
-    .finally(()=>{ btn.disabled=false; ta.focus(); });
-});
-
-ta.addEventListener('keydown', function(e){
-  if ((e.key === 'Enter') && (e.ctrlKey || e.metaKey)) { e.preventDefault(); btn.click(); }
-});
+    }).catch(function(err){ console.error('Failed to send chat message',err); })
+      .finally(()=>{ btn.disabled=false; ta.focus(); });
+  });
+}
 
 /* evaluate seen on scroll/resize as well */
 if(list){
@@ -2293,6 +2564,15 @@ function elxao_chat_render_inbox(){
 #<?php echo esc_attr($container_id); ?> .room-list .badge[hidden]{display:none}
 #<?php echo esc_attr($container_id); ?> .room-list .room.has-unread:not(.active){background:#ecfdf5}
 #<?php echo esc_attr($container_id); ?> .room-list .room.has-unread:not(.active) .label{color:#0f172a}
+#<?php echo esc_attr($container_id); ?> .room-list .meta-row .typing-indicator{display:none;align-items:center;gap:8px;color:#475569;font-size:12px;opacity:0;transition:opacity .24s ease}
+#<?php echo esc_attr($container_id); ?> .room-list .meta-row .typing-indicator.is-visible{display:inline-flex;opacity:1}
+#<?php echo esc_attr($container_id); ?> .room-list .meta-row .typing-indicator .typing-dots{display:inline-flex;gap:4px;margin-right:2px}
+#<?php echo esc_attr($container_id); ?> .room-list .meta-row .typing-indicator .typing-dots span{width:5px;height:5px;border-radius:50%;background:currentColor;opacity:.45;animation:elxao-chat-typing-bounce 1s infinite ease-in-out}
+#<?php echo esc_attr($container_id); ?> .room-list .meta-row .typing-indicator .typing-dots span:nth-child(2){animation-delay:.1s}
+#<?php echo esc_attr($container_id); ?> .room-list .meta-row .typing-indicator .typing-dots span:nth-child(3){animation-delay:.2s}
+#<?php echo esc_attr($container_id); ?> .room-list .meta-row .typing-indicator .typing-text{font-weight:500}
+#<?php echo esc_attr($container_id); ?> .room-list .meta-row .meta.is-hidden{display:none}
+@keyframes elxao-chat-typing-bounce{0%,80%,100%{transform:scale(0.75);opacity:.35}40%{transform:scale(1);opacity:1}}
 #<?php echo esc_attr($container_id); ?> .room-list .empty{padding:26px;color:#64748b;font-style:italic}
 #<?php echo esc_attr($container_id); ?> .chat-pane{flex:1;min-width:0;background:#ffffff;display:flex;align-items:stretch;justify-content:flex-start;padding:0;box-sizing:border-box;height:100%}
 #<?php echo esc_attr($container_id); ?> .chat-pane .placeholder{color:#475569;font-style:italic;text-align:center;margin:auto;max-width:340px;padding:24px}
@@ -2331,6 +2611,8 @@ const myUserId=parseInt(root.dataset.user||'0',10);
 const roomState=new WeakMap();
 const FALLBACK_INTERVAL=45000;
 let fallbackTimer=null;
+const roomTypingState=new Map();
+const ROOM_TYPING_TIMEOUT=3200;
 
 /* ---- shared helpers (may already exist) ---- */
 if(!window.ELXAO_CHAT_FORMAT_DATE){
@@ -2430,6 +2712,132 @@ function setReadState(room,iso){
   room.dataset.readAt=iso;
 }
 
+function ensureRoomTypingIndicator(room){
+  if(!room) return null;
+  const metaRow=room.querySelector('.meta-row');
+  if(!metaRow) return null;
+  let indicator=metaRow.querySelector('.typing-indicator');
+  if(!indicator){
+    indicator=document.createElement('span');
+    indicator.className='typing-indicator';
+    const dots=document.createElement('span');
+    dots.className='typing-dots';
+    for(let i=0;i<3;i++){ const dot=document.createElement('span'); dots.appendChild(document.createElement('span')); }
+    const text=document.createElement('span');
+    text.className='typing-text';
+    indicator.appendChild(dots);
+    indicator.appendChild(text);
+    metaRow.insertBefore(indicator,metaRow.firstChild||null);
+  }
+  return indicator;
+}
+
+function renderRoomTyping(projectId){
+  const key=String(projectId||'');
+  const room=roomMap.get(key);
+  if(!room) return;
+  const indicator=ensureRoomTypingIndicator(room);
+  const meta=room.querySelector('.meta');
+  if(!indicator || !meta) return;
+  const entry=roomTypingState.get(key);
+  const activeUsers=entry ? Array.from(entry.users.values()) : [];
+  if(!activeUsers.length){
+    indicator.classList.remove('is-visible');
+    const textNode=indicator.querySelector('.typing-text');
+    if(textNode) textNode.textContent='';
+    meta.classList.remove('is-hidden');
+    return;
+  }
+  const textNode=indicator.querySelector('.typing-text');
+  if(textNode){
+    if(activeUsers.length===1){
+      const name=activeUsers[0] && activeUsers[0].name ? activeUsers[0].name : 'Someone';
+      textNode.textContent=name+' is typing…';
+    } else {
+      textNode.textContent='Several people are typing…';
+    }
+  }
+  indicator.classList.add('is-visible');
+  meta.classList.add('is-hidden');
+}
+
+function clearRoomTyping(projectId,userId){
+  const pid=parseInt(projectId,10)||0;
+  if(!pid) return;
+  const uid=parseInt(userId,10)||0;
+  if(!uid) return;
+  const key=String(pid);
+  const entry=roomTypingState.get(key);
+  if(!entry) return;
+  const userKey=String(uid);
+  const record=entry.users.get(userKey);
+  if(record && record.timeout){ clearTimeout(record.timeout); }
+  entry.users.delete(userKey);
+  if(entry.users.size===0){
+    roomTypingState.delete(key);
+  }
+  renderRoomTyping(pid);
+}
+
+function setRoomTyping(projectId,userId,name,isTyping){
+  const pid=parseInt(projectId,10)||0;
+  const uid=parseInt(userId,10)||0;
+  if(!pid || !uid) return;
+  if(myUserId && uid===myUserId){
+    if(!isTyping) clearRoomTyping(pid,uid);
+    return;
+  }
+  if(!isTyping){
+    clearRoomTyping(pid,uid);
+    return;
+  }
+  const key=String(pid);
+  let entry=roomTypingState.get(key);
+  if(!entry){
+    entry={users:new Map()};
+    roomTypingState.set(key,entry);
+  }
+  const userKey=String(uid);
+  const existing=entry.users.get(userKey);
+  if(existing && existing.timeout){ clearTimeout(existing.timeout); }
+  const timeout=setTimeout(function(){ clearRoomTyping(pid,uid); },ROOM_TYPING_TIMEOUT);
+  entry.users.set(userKey,{name:name||'Someone',timeout:timeout});
+  renderRoomTyping(pid);
+}
+
+function interpretTypingFlag(value){
+  if(value===undefined || value===null) return null;
+  if(typeof value==='boolean') return value;
+  if(typeof value==='number') return value>0;
+  if(typeof value==='string'){
+    const normalized=value.trim().toLowerCase();
+    if(!normalized) return false;
+    if(normalized==='true' || normalized==='1' || normalized==='yes' || normalized==='y') return true;
+    if(normalized==='false' || normalized==='0' || normalized==='no' || normalized==='n') return false;
+  }
+  return !!value;
+}
+
+function applyRoomTyping(room,payload){
+  if(!room || !payload) return;
+  const projectId=parseInt(room.getAttribute('data-project')||'0',10);
+  if(!projectId) return;
+  const userId=parseInt(payload.user||payload.user_id||payload.userId||0,10);
+  if(!userId) return;
+  const display=payload.user_display||payload.user_name||payload.username||'Someone';
+  let typingValue=null;
+  if(Object.prototype.hasOwnProperty.call(payload,'is_typing')) typingValue=payload.is_typing;
+  else if(Object.prototype.hasOwnProperty.call(payload,'typing')) typingValue=payload.typing;
+  else if(Object.prototype.hasOwnProperty.call(payload,'active')) typingValue=payload.active;
+  const interpreted=interpretTypingFlag(typingValue);
+  if(interpreted===null) return;
+  if(interpreted){
+    setRoomTyping(projectId,userId,display,true);
+  } else {
+    setRoomTyping(projectId,userId,display,false);
+  }
+}
+
 function extractRoleStatus(payload,role){
   if(!payload || !role) return null;
   const sources=[payload.read_status,payload.readStatus];
@@ -2470,6 +2878,7 @@ function applyRoomMessage(room,payload){
   if(!room || !payload) return;
   const role=(room.dataset.role||'other').toLowerCase();
   const state=getRoomState(room);
+  const projectId=parseInt(room.getAttribute('data-project')||'0',10);
   const msgId=parseInt(payload.id||payload.message_id||payload.messageId||0,10);
   const atSource=payload.at||payload.published_at||payload.created_at||'';
   const messageMs=parseMs(atSource);
@@ -2494,6 +2903,7 @@ function applyRoomMessage(room,payload){
   if(role==='other') return;
 
   const fromUser=parseInt(payload.user||payload.user_id||payload.userId||0,10);
+  if(projectId && fromUser) clearRoomTyping(projectId,fromUser);
   if(fromUser && myUserId && fromUser===myUserId) return;
 
   const roleStatus=extractRoleStatus(payload,role);
@@ -2556,11 +2966,12 @@ function handleInboxPayload(payload,hintProject){
   if(!room) return;
   payload.__inboxHandled=true;
   const typeRaw=String(payload.type||payload.name||'').toLowerCase();
-  if(typeRaw!=='read_receipt'){
+  if(typeRaw!=='read_receipt' && typeRaw!=='typing'){
     const bumpAt=payload.at||payload.published_at||payload.created_at||Date.now();
     bumpRoom(projectId,bumpAt);
   }
   if(typeRaw==='read_receipt') applyRoomReadReceipt(room,payload);
+  else if(typeRaw==='typing') applyRoomTyping(room,payload);
   else applyRoomMessage(room,payload);
 }
 
@@ -2717,6 +3128,15 @@ if(window.ELXAO_CHAT_BUS.channel && window.ELXAO_CHAT_BUS.channel.addEventListen
 
 registerCleanup(stopFallbackPolling);
 registerCleanup(function(){ channelCleanups.forEach(function(unsub){ try{ unsub(); }catch(e){} }); channelCleanups.clear(); });
+registerCleanup(function(){
+  roomTypingState.forEach(function(entry){
+    if(entry && entry.users){
+      entry.users.forEach(function(record){ if(record && record.timeout) clearTimeout(record.timeout); });
+      entry.users.clear();
+    }
+  });
+  roomTypingState.clear();
+});
 
 const observer=new MutationObserver(function(){ if(!document.body.contains(root)){ observer.disconnect(); runCleanup(); } });
 observer.observe(document.body,{childList:true,subtree:true});
