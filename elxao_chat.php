@@ -181,6 +181,85 @@ function elxao_chat_build_message_read_status($pid,$message_role,$published_at,?
     return $status;
 }
 
+function elxao_chat_count_unread_messages($pid,$role,$uid,?array $reads=null){
+    if (!in_array($role,['client','pm','admin'],true)) return 0;
+
+    if ($reads === null) {
+        $reads = elxao_chat_get_last_reads($pid);
+    }
+
+    $cutoff = '';
+    if (!empty($reads[$role])) {
+        $cutoff = elxao_chat_normalize_datetime_value($reads[$role]);
+    }
+
+    global $wpdb;
+    $t = $wpdb->prefix.'elxao_chat_messages';
+    $where = ['project_id=%d'];
+    $params = [$pid];
+
+    if ($cutoff) {
+        $where[] = 'published_at > %s';
+        $params[] = $cutoff;
+    }
+
+    if ($uid) {
+        $where[] = 'user_id <> %d';
+        $params[] = $uid;
+    }
+
+    $sql = 'SELECT COUNT(*) FROM '.$t.' WHERE '.implode(' AND ',$where);
+    $count = (int)$wpdb->get_var($wpdb->prepare($sql,...$params));
+
+    return max(0,$count);
+}
+
+function elxao_chat_build_room_entry($pid,$uid){
+    $pid = (int)$pid;
+    if(!$pid) return null;
+    if(!elxao_chat_user_can_access_project($pid,$uid)) return null;
+
+    if(function_exists('get_field')){
+        $latest = get_field('latest_message_at',$pid);
+    } else {
+        $latest = get_post_meta($pid,'latest_message_at',true);
+    }
+
+    if($latest instanceof DateTimeInterface){
+        $latest = $latest->format('Y-m-d H:i:s');
+    }
+
+    if(!$latest){
+        $fallback = get_post_meta($pid,'latest_message_at',true);
+        $latest = $fallback?:'';
+    }
+
+    if(!$latest){
+        $latest = get_post_modified_time('Y-m-d H:i:s',true,$pid);
+    }
+
+    $timestamp = $latest?strtotime($latest):0;
+
+    $role  = elxao_chat_role_for_user($pid,$uid);
+    $reads = elxao_chat_get_last_reads($pid);
+    $read_at = '';
+    if($role && isset($reads[$role])){
+        $read_at = (string)$reads[$role];
+    }
+
+    $unread = elxao_chat_count_unread_messages($pid,$role,$uid,$reads);
+
+    return [
+        'id'        => $pid,
+        'title'     => get_the_title($pid),
+        'latest'    => $latest,
+        'timestamp' => $timestamp?:0,
+        'role'      => $role,
+        'read_at'   => $read_at?:'',
+        'unread'    => $unread,
+    ];
+}
+
 function elxao_chat_publish_read_receipt($pid,array $reads,$user_id=0){
     $role_flags = [
         'client' => elxao_chat_parse_datetime($reads['client'] ?? '') > 0,
@@ -247,28 +326,8 @@ function elxao_chat_collect_rooms_for_user($uid){
 
     $rooms=[];
     foreach($ids as $pid){
-        $pid=(int)$pid;
-        if(!elxao_chat_user_can_access_project($pid,$uid)) continue;
-
-        $latest=function_exists('get_field')?get_field('latest_message_at',$pid):get_post_meta($pid,'latest_message_at',true);
-        if($latest instanceof DateTimeInterface){
-            $latest=$latest->format('Y-m-d H:i:s');
-        }
-        if(!$latest){
-            $fallback=get_post_meta($pid,'latest_message_at',true);
-            $latest=$fallback?:'';
-        }
-        if(!$latest){
-            $latest=get_post_modified_time('Y-m-d H:i:s',true,$pid);
-        }
-        $timestamp=$latest?strtotime($latest):0;
-
-        $rooms[]=[
-            'id'=>$pid,
-            'title'=>get_the_title($pid),
-            'latest'=>$latest,
-            'timestamp'=>$timestamp?:0,
-        ];
+        $entry=elxao_chat_build_room_entry($pid,$uid);
+        if($entry) $rooms[]=$entry;
     }
 
     usort($rooms,function($a,$b){
@@ -307,6 +366,10 @@ add_action('rest_api_init',function(){
     ]);
     register_rest_route('elxao/v1','/inbox-token',[
         'methods'=>'GET','callback'=>'elxao_chat_rest_inbox_token',
+        'permission_callback'=>fn()=>is_user_logged_in()
+    ]);
+    register_rest_route('elxao/v1','/inbox-state',[
+        'methods'=>'GET','callback'=>'elxao_chat_rest_inbox_state',
         'permission_callback'=>fn()=>is_user_logged_in()
     ]);
     register_rest_route('elxao/v1','/chat-window',[
@@ -559,6 +622,24 @@ function elxao_chat_rest_inbox_token(WP_REST_Request $r){
     $token=elxao_chat_request_ably_token($uid,$capability);
     if(is_wp_error($token)) return $token;
     return new WP_REST_Response($token,200);
+}
+
+function elxao_chat_rest_inbox_state(WP_REST_Request $r){
+    $uid=get_current_user_id();
+    $ids=$r->get_param('project_ids');
+    if(is_null($ids)) $ids=[];
+    if(!is_array($ids)) $ids=[$ids];
+
+    $ids=array_unique(array_map('intval',$ids));
+
+    $rooms=[];
+    foreach($ids as $pid){
+        if(!$pid) continue;
+        $entry=elxao_chat_build_room_entry($pid,$uid);
+        if($entry) $rooms[]=$entry;
+    }
+
+    return new WP_REST_Response(['rooms'=>$rooms],200);
 }
 
 function elxao_chat_rest_window(WP_REST_Request $r){
@@ -1721,7 +1802,8 @@ function elxao_chat_render_inbox(){
 <div id="<?php echo esc_attr($container_id); ?>"
      class="elxao-chat-inbox"
      data-rest="<?php echo esc_url($rest_base); ?>"
-     data-nonce="<?php echo esc_attr($rest_nonce); ?>">
+     data-nonce="<?php echo esc_attr($rest_nonce); ?>"
+     data-user="<?php echo (int)$uid; ?>">
   <div class="inbox-shell">
     <div class="room-list" role="navigation" aria-label="Chat rooms">
       <?php if($rooms){ foreach($rooms as $idx=>$room){
@@ -1729,15 +1811,25 @@ function elxao_chat_render_inbox(){
         $activity=elxao_chat_format_activity($room['latest']);
         $room_id=elxao_chat_room_id($room['id']);
         $timestamp_attr=$room['timestamp']? (int)$room['timestamp'] : 0;
+        $role_attr=!empty($room['role'])? $room['role'] : 'other';
+        $read_attr=!empty($room['read_at'])? $room['read_at'] : '';
+        $unread_count=isset($room['unread'])?(int)$room['unread']:0;
+        $badge_text=$unread_count>99?'99+':($unread_count>0?(string)$unread_count:'');
       ?>
       <button type="button"
-              class="room<?php echo $idx===0?' active':''; ?>"
+              class="room<?php echo $idx===0?' active':''; ?><?php echo $unread_count>0?' has-unread':''; ?>"
               data-project="<?php echo (int)$room['id']; ?>"
               data-room="<?php echo esc_attr($room_id); ?>"
               data-latest="<?php echo esc_attr($room['latest']); ?>"
-              data-timestamp="<?php echo esc_attr($timestamp_attr); ?>">
+              data-timestamp="<?php echo esc_attr($timestamp_attr); ?>"
+              data-role="<?php echo esc_attr($role_attr); ?>"
+              data-read-at="<?php echo esc_attr($read_attr); ?>"
+              data-unread="<?php echo esc_attr($unread_count); ?>">
         <span class="label"><?php echo esc_html($label); ?></span>
-        <span class="meta"><?php echo esc_html($activity?:'—'); ?></span>
+        <span class="meta-row">
+          <span class="meta"><?php echo esc_html($activity?:'—'); ?></span>
+          <span class="badge"<?php if($unread_count<=0) echo ' hidden'; ?>><?php echo esc_html($badge_text); ?></span>
+        </span>
       </button>
       <?php }} else { ?>
       <div class="empty">No chat rooms available.</div>
@@ -1758,6 +1850,12 @@ function elxao_chat_render_inbox(){
 #<?php echo esc_attr($container_id); ?> .room-list .room.active{background:rgba(96,165,250,0.18)}
 #<?php echo esc_attr($container_id); ?> .room-list .label{font-weight:600}
 #<?php echo esc_attr($container_id); ?> .room-list .meta{font-size:12px;color:#9ca3af}
+#<?php echo esc_attr($container_id); ?> .room-list .meta-row{display:flex;align-items:center;justify-content:space-between;gap:8px}
+#<?php echo esc_attr($container_id); ?> .room-list .meta-row .meta{flex:1}
+#<?php echo esc_attr($container_id); ?> .room-list .badge{display:inline-flex;align-items:center;justify-content:center;font-size:12px;font-weight:700;line-height:1;padding:2px 8px;border-radius:999px;background:#ef4444;color:#fff;min-width:22px}
+#<?php echo esc_attr($container_id); ?> .room-list .badge[hidden]{display:none}
+#<?php echo esc_attr($container_id); ?> .room-list .room.has-unread:not(.active){background:rgba(239,68,68,0.14)}
+#<?php echo esc_attr($container_id); ?> .room-list .room.has-unread:not(.active) .label{color:#fca5a5}
 #<?php echo esc_attr($container_id); ?> .room-list .empty{padding:20px;color:#9ca3af;font-style:italic}
 #<?php echo esc_attr($container_id); ?> .chat-pane{flex:1;min-width:0;background:transparent;display:flex;align-items:center;justify-content:center;padding:20px}
 #<?php echo esc_attr($container_id); ?> .chat-pane .placeholder{color:#9ca3af;font-style:italic;text-align:center}
@@ -1784,6 +1882,10 @@ const channelCleanups=new Map();
 const cleanupFns=[];
 let active=null;
 let busCleanup=null;
+const myUserId=parseInt(root.dataset.user||'0',10);
+const roomState=new WeakMap();
+const FALLBACK_INTERVAL=45000;
+let fallbackTimer=null;
 
 /* ---- shared helpers (may already exist) ---- */
 if(!window.ELXAO_CHAT_BUS){
@@ -1818,6 +1920,215 @@ if(!window.ELXAO_ABLY){
 function registerCleanup(fn){ if(typeof fn==='function') cleanupFns.push(fn); }
 function runCleanup(){ while(cleanupFns.length){ const fn=cleanupFns.pop(); try{ fn(); }catch(e){} } }
 
+function getRoomState(room){
+  let state=roomState.get(room);
+  if(!state){
+    state={ unread:0, readMs:0, lastMessageMs:0, lastMessageId:0 };
+    roomState.set(room,state);
+  }
+  return state;
+}
+
+function parseMs(value){
+  const date=parseTimestamp(value);
+  return (date && !isNaN(date.getTime()))?date.getTime():0;
+}
+
+function updateUnreadDisplay(room,count){
+  const state=getRoomState(room);
+  const next=count>0?count:0;
+  state.unread=next;
+  room.dataset.unread=String(next);
+  const badge=room.querySelector('.badge');
+  if(badge){
+    if(next>0){
+      badge.textContent=next>99?'99+':String(next);
+      badge.hidden=false;
+    }else{
+      badge.textContent='';
+      badge.hidden=true;
+    }
+  }
+  if(next>0) room.classList.add('has-unread');
+  else room.classList.remove('has-unread');
+}
+
+function setReadState(room,iso){
+  if(!iso) return;
+  const ms=parseMs(iso);
+  if(!ms) return;
+  const state=getRoomState(room);
+  if(ms<=state.readMs) return;
+  state.readMs=ms;
+  room.dataset.readAt=iso;
+}
+
+function extractRoleStatus(payload,role){
+  if(!payload || !role) return null;
+  const sources=[payload.read_status,payload.readStatus];
+  for(const src of sources){
+    if(src && Object.prototype.hasOwnProperty.call(src,role)) return !!src[role];
+  }
+  if(payload.reads && payload.reads.roles && Object.prototype.hasOwnProperty.call(payload.reads.roles,role)){
+    return !!payload.reads.roles[role];
+  }
+  return null;
+}
+
+function extractRoleTime(payload,role){
+  if(!payload || !role) return '';
+  const sources=[payload.read_times,payload.readTimes];
+  for(const src of sources){
+    if(src && typeof src==='object' && src[role]) return src[role];
+  }
+  if(payload.reads && payload.reads.times && payload.reads.times[role]) return payload.reads.times[role];
+  return '';
+}
+
+function resolveProjectId(payload,hint){
+  const resolver=window.ELXAO_CHAT_RESOLVE_PROJECT_ID||function(){ return 0; };
+  const hintVal=hint?parseInt(hint,10)||0:0;
+  const resolved=resolver(
+    payload && payload.project,
+    payload && payload.project_id,
+    payload && payload.projectId,
+    payload && payload.projectID,
+    hintVal
+  );
+  const projectId=parseInt(resolved||hintVal||0,10);
+  return projectId>0?projectId:0;
+}
+
+function applyRoomMessage(room,payload){
+  if(!room || !payload) return;
+  const role=(room.dataset.role||'other').toLowerCase();
+  const state=getRoomState(room);
+  const msgId=parseInt(payload.id||payload.message_id||payload.messageId||0,10);
+  const atSource=payload.at||payload.published_at||payload.created_at||'';
+  const messageMs=parseMs(atSource);
+  const messageRole=(payload.role||'').toLowerCase();
+
+  if(messageRole==='sys') return;
+
+  if(msgId){
+    if(state.lastMessageId && msgId<=state.lastMessageId){
+      if(messageMs && messageMs>state.lastMessageMs) state.lastMessageMs=messageMs;
+      return;
+    }
+    state.lastMessageId=msgId;
+  } else if(messageMs && state.lastMessageMs && messageMs<=state.lastMessageMs){
+    return;
+  }
+
+  if(messageMs && (!state.lastMessageMs || messageMs>state.lastMessageMs)){
+    state.lastMessageMs=messageMs;
+  }
+
+  if(role==='other') return;
+
+  const fromUser=parseInt(payload.user||payload.user_id||payload.userId||0,10);
+  if(fromUser && myUserId && fromUser===myUserId) return;
+
+  const roleStatus=extractRoleStatus(payload,role);
+  if(roleStatus===true) return;
+
+  const roleTime=extractRoleTime(payload,role);
+  if(roleTime){
+    setReadState(room,roleTime);
+    const readMs=parseMs(roleTime);
+    if(readMs && messageMs && readMs>=messageMs) return;
+  }
+
+  const readMs=state.readMs;
+  if(messageMs && readMs && messageMs<=readMs) return;
+
+  updateUnreadDisplay(room,state.unread+1);
+}
+
+function applyRoomReadReceipt(room,payload){
+  if(!room || !payload) return;
+  const role=(room.dataset.role||'other').toLowerCase();
+  if(role==='other') return;
+  const iso=extractRoleTime(payload,role);
+  if(!iso) return;
+  const ms=parseMs(iso);
+  if(!ms) return;
+  const state=getRoomState(room);
+  if(ms>state.readMs){
+    state.readMs=ms;
+    room.dataset.readAt=iso;
+  }
+  if(state.unread>0){
+    updateUnreadDisplay(room,0);
+  }
+}
+
+function applyRoomSnapshot(room,snapshot){
+  if(!room || !snapshot) return;
+  if(snapshot.role) room.dataset.role=String(snapshot.role);
+  if(Object.prototype.hasOwnProperty.call(snapshot,'unread')){
+    const count=parseInt(snapshot.unread,10);
+    updateUnreadDisplay(room,isNaN(count)?0:count);
+  }
+  if(snapshot.read_at){
+    setReadState(room,snapshot.read_at);
+  }
+  if(snapshot.latest){
+    setRoomActivity(room,snapshot.latest);
+    const ms=parseMs(snapshot.latest);
+    const state=getRoomState(room);
+    if(ms && (!state.lastMessageMs || ms>state.lastMessageMs)) state.lastMessageMs=ms;
+  }
+}
+
+function handleInboxPayload(payload,hintProject){
+  if(!payload || payload.__inboxHandled) return;
+  const projectId=resolveProjectId(payload,hintProject);
+  if(!projectId) return;
+  const room=roomMap.get(String(projectId));
+  if(!room) return;
+  payload.__inboxHandled=true;
+  const typeRaw=String(payload.type||payload.name||'').toLowerCase();
+  if(typeRaw!=='read_receipt'){
+    const bumpAt=payload.at||payload.published_at||payload.created_at||Date.now();
+    bumpRoom(projectId,bumpAt);
+  }
+  if(typeRaw==='read_receipt') applyRoomReadReceipt(room,payload);
+  else applyRoomMessage(room,payload);
+}
+
+function refreshInboxState(){
+  if(!rest || !roomMap.size) return Promise.resolve();
+  const params=[];
+  roomMap.forEach((_room,pid)=>{ if(pid) params.push('project_ids[]='+encodeURIComponent(pid)); });
+  if(!params.length) return Promise.resolve();
+  return fetch(rest+'elxao/v1/inbox-state?'+params.join('&'),{ credentials:'same-origin', headers:headers })
+    .then(r=>{ if(!r.ok) throw new Error(''+r.status); return r.json(); })
+    .then(data=>{
+      if(!data || !Array.isArray(data.rooms)) return;
+      data.rooms.forEach(function(snapshot){
+        if(!snapshot || typeof snapshot.id==='undefined') return;
+        const room=roomMap.get(String(snapshot.id));
+        if(!room) return;
+        applyRoomSnapshot(room,snapshot);
+      });
+    })
+    .catch(()=>{});
+}
+
+function startFallbackPolling(immediate){
+  if(fallbackTimer) return;
+  const runner=function(){ refreshInboxState(); };
+  if(immediate) runner();
+  fallbackTimer=setInterval(runner,FALLBACK_INTERVAL);
+}
+
+function stopFallbackPolling(){
+  if(!fallbackTimer) return;
+  clearInterval(fallbackTimer);
+  fallbackTimer=null;
+}
+
 rooms.forEach(function(room){
   const pid=room.getAttribute('data-project');
   if(pid) roomMap.set(String(pid),room);
@@ -1827,6 +2138,16 @@ rooms.forEach(function(room){
   if(latestAttr){ setRoomActivity(room,latestAttr); }
   else if(tsNumeric>0){ setRoomActivity(room,tsAttr); }
   else { room.dataset.timestamp=room.dataset.timestamp||'0'; room.dataset.latest=room.dataset.latest||''; }
+  const state=getRoomState(room);
+  const initialUnread=parseInt(room.getAttribute('data-unread')||'0',10);
+  state.unread=initialUnread>0?initialUnread:0;
+  const readAttr=room.getAttribute('data-read-at')||'';
+  const readMs=readAttr?parseMs(readAttr):0;
+  if(readMs>state.readMs) state.readMs=readMs;
+  const latestIso=room.getAttribute('data-latest')||room.dataset.latest||'';
+  const latestMs=latestIso?parseMs(latestIso):0;
+  if(latestMs>state.lastMessageMs) state.lastMessageMs=latestMs;
+  updateUnreadDisplay(room,state.unread);
 });
 
 function parseTimestamp(value){
@@ -1885,30 +2206,34 @@ function subscribeInbox(){
   fetch(rest+'elxao/v1/inbox-token?'+params.join('&'),{ credentials:'same-origin', headers:headers })
     .then(r=>{ if(!r.ok) throw new Error(''+r.status); return r.json(); })
     .then(token=>{
-      if(!token || token.error) return;
-      if(!window.ELXAO_ABLY.ensureClient) return;
+      if(!token || token.error){ startFallbackPolling(true); return; }
+      if(!window.ELXAO_ABLY.ensureClient){ startFallbackPolling(true); return; }
       return window.ELXAO_ABLY.ensureClient(token).then(function(client){
+        stopFallbackPolling();
         const seenChannels=new Set();
         rooms.forEach(function(room){
           const channelName=room.getAttribute('data-room'); if(!channelName || seenChannels.has(channelName)) return;
           seenChannels.add(channelName);
           const pid=room.getAttribute('data-project'); const projectId=pid?parseInt(pid,10):0;
           const unsubscribe=window.ELXAO_ABLY.registerChannel(client,channelName,projectId,function(payload){
-            const bumpAt=payload&&payload.at ? payload.at : Date.now();
-            bumpRoom(projectId,bumpAt);
+            handleInboxPayload(payload,projectId);
           });
           if(typeof unsubscribe==='function'){ channelCleanups.set(channelName,unsubscribe); }
         });
-      });
+      }).catch(()=>{ startFallbackPolling(true); });
     })
-    .catch(()=>{ /* ignore */ });
+    .catch(()=>{ startFallbackPolling(true); });
 }
 
 function onChatEvent(ev){
-  const detail=ev&&ev.detail?ev.detail:{}; if(!detail || typeof detail.project==='undefined') return;
-  const payload=window.ELXAO_CHAT_NORMALIZE(detail.payload||{},detail.project);
-  const projectId=payload.project||parseInt(detail.project,10)||0; if(!projectId) return;
-  const bumpAt=payload.at||Date.now(); bumpRoom(projectId,bumpAt);
+  const detail=ev&&ev.detail?ev.detail:{};
+  if(!detail) return;
+  const hintedProject=detail.project?parseInt(detail.project,10):0;
+  const rawPayload=detail.payload||detail.data||null;
+  if(!rawPayload) return;
+  if(rawPayload.__inboxHandled) return;
+  const normalized=window.ELXAO_CHAT_NORMALIZE?window.ELXAO_CHAT_NORMALIZE(rawPayload,hintedProject):rawPayload;
+  handleInboxPayload(normalized,hintedProject);
 }
 
 window.addEventListener('elxao:chat',onChatEvent);
@@ -1921,6 +2246,7 @@ if(window.ELXAO_CHAT_BUS.channel && window.ELXAO_CHAT_BUS.channel.addEventListen
   registerCleanup(function(){ if(busCleanup){ try{ busCleanup(); }catch(e){} busCleanup=null; }});
 }
 
+registerCleanup(stopFallbackPolling);
 registerCleanup(function(){ channelCleanups.forEach(function(unsub){ try{ unsub(); }catch(e){} }); channelCleanups.clear(); });
 
 const observer=new MutationObserver(function(){ if(!document.body.contains(root)){ observer.disconnect(); runCleanup(); } });
