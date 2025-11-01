@@ -799,12 +799,6 @@ ob_start();?>
      style="<?php echo $style_vars; ?>">
   <div class="list" aria-live="polite"></div>
   <div class="composer">
-    <div class="typing-indicator" aria-live="polite" aria-atomic="true" hidden>
-      <span class="typing-indicator__text"></span>
-      <span class="typing-indicator__dots" aria-hidden="true">
-        <span></span><span></span><span></span>
-      </span>
-    </div>
     <div class="composer-input">
       <textarea rows="1" placeholder="Type your message..."></textarea>
       <button class="send" type="button" aria-label="Send message" title="Send">
@@ -855,16 +849,7 @@ ob_start();?>
 #elxao-chat-<?php echo $pid;?> .chat-read-indicator.chat-read-indicator--read{background:var(--chat-read-read)}
 #elxao-chat-<?php echo $pid;?> .chat-read-indicator.chat-read-indicator--client{background:var(--chat-read-client)}
 #elxao-chat-<?php echo $pid;?> .chat-read-indicator.chat-read-indicator--pm{background:var(--chat-read-pm)}
-#elxao-chat-<?php echo $pid;?> .composer{border-top:1px solid rgba(15,23,42,0.08);padding:18px 20px;background:rgba(255,255,255,0.78);backdrop-filter:saturate(180%) blur(22px);display:flex;flex-direction:column;gap:10px}
-#elxao-chat-<?php echo $pid;?> .typing-indicator{display:flex;align-items:center;gap:8px;font-size:13px;color:#64748b;padding:0 8px;min-height:20px;opacity:0;transition:opacity .2s ease}
-#elxao-chat-<?php echo $pid;?> .typing-indicator.is-active{opacity:1}
-#elxao-chat-<?php echo $pid;?> .typing-indicator[hidden]{display:none}
-#elxao-chat-<?php echo $pid;?> .typing-indicator__dots{display:inline-flex;gap:4px;margin-left:4px}
-#elxao-chat-<?php echo $pid;?> .typing-indicator__dots span{width:6px;height:6px;border-radius:999px;background:rgba(148,163,184,0.9);animation:elxaoTypingDot 1s ease-in-out infinite}
-#elxao-chat-<?php echo $pid;?> .typing-indicator__dots span:nth-child(2){animation-delay:.2s}
-#elxao-chat-<?php echo $pid;?> .typing-indicator__dots span:nth-child(3){animation-delay:.4s}
-#elxao-chat-<?php echo $pid;?> .typing-indicator__dots:empty{display:none}
-@keyframes elxaoTypingDot{0%,80%,100%{opacity:.25;transform:translateY(0)}40%{opacity:1;transform:translateY(-3px)}}
+#elxao-chat-<?php echo $pid;?> .composer{border-top:1px solid rgba(15,23,42,0.08);padding:18px 20px;background:rgba(255,255,255,0.78);backdrop-filter:saturate(180%) blur(22px)}
 #elxao-chat-<?php echo $pid;?> .composer-input{position:relative;display:flex;align-items:center;width:100%;background:#ffffff;border:1px solid #d0d7e5;border-radius:999px;padding:10px 18px;box-shadow:inset 0 1px 3px rgba(15,23,42,0.08);transition:border-color .2s ease,box-shadow .2s ease}
 #elxao-chat-<?php echo $pid;?> textarea{flex:1;resize:none;background:transparent;border:none;padding:12px 64px 12px 0;color:var(--chat-color);font:inherit;line-height:1.5;min-height:0;height:auto;overflow-y:hidden}
 #elxao-chat-<?php echo $pid;?> textarea:focus{outline:none}
@@ -880,8 +865,6 @@ const root=document.getElementById('elxao-chat-<?php echo $pid;?>'); if(!root) r
 const list=root.querySelector('.list');
 const ta=root.querySelector('textarea');
 const btn=root.querySelector('.send');
-const typingIndicator=root.querySelector('.typing-indicator');
-const typingIndicatorText=typingIndicator?typingIndicator.querySelector('.typing-indicator__text'):null;
 let syncTextareaSize=null;
 
 if(ta){
@@ -902,17 +885,8 @@ if(ta){
   };
 
   syncTextareaSize();
-  const onTextareaInput=()=>{
-    if(typeof syncTextareaSize==='function') syncTextareaSize();
-    publishTypingState(ta.value.trim().length>0);
-  };
-  const onTextareaFocus=()=>{
-    if(typeof syncTextareaSize==='function') syncTextareaSize();
-    if(ta.value.trim().length>0) publishTypingState(true);
-  };
-  ta.addEventListener('input',onTextareaInput);
-  ta.addEventListener('focus',onTextareaFocus);
-  ta.addEventListener('blur',()=>{ publishTypingState(false); });
+  ta.addEventListener('input',syncTextareaSize);
+  ta.addEventListener('focus',syncTextareaSize);
 }
 
 if(!window.ELXAO_CHAT_FORMAT_DATE){
@@ -944,231 +918,10 @@ const hdr={'X-WP-Nonce':nonce};
 const projectId=parseInt(pid,10)||0;
 const clientId=parseInt(root.dataset.client,10)||0;
 const pmId=parseInt(root.dataset.pm,10)||0;
-const meName='<?php echo $meName;?>';
 const localEchoes=new Map();
 let realtimeCleanup=null;
 let busCleanup=null;
 let realtimeReady=false;
-
-/* =========================
-   TYPING INDICATOR STATE
-   ========================= */
-const typingEntries=new Map();
-let typingPresenceChannel=null;
-let typingPresenceCleanup=null;
-let typingPresenceReady=false;
-let typingPresenceEnterPromise=null;
-let typingPruneTimer=null;
-let typingStopTimer=null;
-let typingPresenceRetryTimer=null;
-let typingStateActive=false;
-let typingDesiredState=false;
-let typingLastSent=0;
-const TYPING_EXPIRE_MS=6000;
-const TYPING_THROTTLE_MS=1200;
-
-function clearTypingStopTimer(){ if(typingStopTimer){ clearTimeout(typingStopTimer); typingStopTimer=null; } }
-function scheduleTypingStop(){ clearTypingStopTimer(); typingStopTimer=setTimeout(()=>{ typingStopTimer=null; publishTypingState(false); },TYPING_EXPIRE_MS); }
-
-function updateTypingIndicatorUI(){
-  if(!typingIndicator) return;
-  const now=Date.now();
-  const unique=new Map();
-  typingEntries.forEach((info,key)=>{
-    if(!info || !info.expires || info.expires<=now){ typingEntries.delete(key); return; }
-    const mapKey=info.userId||('name:'+info.name);
-    const existing=unique.get(mapKey);
-    if(!existing || existing.expires<info.expires) unique.set(mapKey,info);
-  });
-  const active=Array.from(unique.values());
-  if(!active.length){
-    typingIndicator.hidden=true;
-    typingIndicator.setAttribute('aria-hidden','true');
-    typingIndicator.classList.remove('is-active');
-    if(typingIndicatorText) typingIndicatorText.textContent='';
-    return;
-  }
-  active.sort((a,b)=>a.name.localeCompare(b.name));
-  let message='';
-  if(active.length===1){
-    message=active[0].name+' is typing…';
-  } else if(active.length===2){
-    message=active[0].name+' and '+active[1].name+' are typing…';
-  } else {
-    message=active[0].name+', '+active[1].name+', and others are typing…';
-  }
-  if(typingIndicatorText) typingIndicatorText.textContent=message;
-  typingIndicator.hidden=false;
-  typingIndicator.removeAttribute('aria-hidden');
-  typingIndicator.classList.add('is-active');
-}
-
-function ensureTypingPruneTimer(){
-  if(typingPruneTimer) return;
-  typingPruneTimer=setInterval(()=>{
-    const now=Date.now();
-    let changed=false;
-    typingEntries.forEach((info,key)=>{
-      if(!info || !info.expires || info.expires<=now){ typingEntries.delete(key); changed=true; }
-    });
-    if(changed) updateTypingIndicatorUI();
-    if(!typingEntries.size){ clearInterval(typingPruneTimer); typingPruneTimer=null; }
-  },1000);
-}
-
-function parsePresenceUserId(member,data){
-  if(data){
-    const direct=Number(data.user||data.user_id||data.userId||0);
-    if(Number.isFinite(direct) && direct>0) return Math.floor(direct);
-  }
-  const clientId=member&&member.clientId?String(member.clientId):'';
-  const match=clientId.match(/wpuser_(\d+)/);
-  if(match) return parseInt(match[1],10)||0;
-  return 0;
-}
-
-function resolvePresenceName(data,userId){
-  if(data){
-    const candidates=[data.display,data.display_name,data.name,data.user_display,data.username];
-    for(let i=0;i<candidates.length;i++){ const val=candidates[i]; if(val){ const str=String(val).trim(); if(str) return str; } }
-  }
-  return userId?('User '+userId):'Someone';
-}
-
-function handleTypingPresenceMember(member){
-  if(!member) return;
-  const action=(member.action||member.Action||'').toLowerCase();
-  const data=(member.data && typeof member.data==='object')?member.data:{};
-  const userId=parsePresenceUserId(member,data);
-  const key=member && member.connectionId ? member.connectionId : (member && member.clientId ? 'client:'+member.clientId : (userId?'user:'+userId:'anon:'+Math.random()));
-  if(!userId || userId===myId){ typingEntries.delete(key); updateTypingIndicatorUI(); return; }
-  const isTyping=!!data.typing && action!=='leave';
-  if(isTyping){
-    typingEntries.set(key,{
-      userId:userId,
-      role:String(data.role||'other'),
-      name:resolvePresenceName(data,userId),
-      expires:Date.now()+TYPING_EXPIRE_MS
-    });
-    ensureTypingPruneTimer();
-  } else {
-    typingEntries.delete(key);
-  }
-  updateTypingIndicatorUI();
-}
-
-function clearTypingPresenceRetry(){
-  if(typingPresenceRetryTimer){
-    clearTimeout(typingPresenceRetryTimer);
-    typingPresenceRetryTimer=null;
-  }
-}
-
-function scheduleTypingPresenceRetry(){
-  if(typingPresenceRetryTimer) return;
-  typingPresenceRetryTimer=setTimeout(()=>{
-    typingPresenceRetryTimer=null;
-    ensureTypingPresenceReady();
-  },4000);
-}
-
-function ensureTypingPresenceReady(){
-  if(!typingPresenceChannel || !typingPresenceChannel.presence) return null;
-  if(typingPresenceReady) return Promise.resolve(true);
-  if(typingPresenceEnterPromise) return typingPresenceEnterPromise;
-  const presence=typingPresenceChannel.presence;
-  const initialPayload={typing:false,user:myId,display:meName,role:myRole};
-  const enterPromise=typingPresenceChannel.attach()
-    .catch(()=>{})
-    .then(()=>presence.enter(initialPayload))
-    .then(()=>{
-      typingPresenceReady=true;
-      typingPresenceEnterPromise=null;
-      clearTypingPresenceRetry();
-      return true;
-    })
-    .catch(err=>{
-      typingPresenceReady=false;
-      typingPresenceEnterPromise=null;
-      scheduleTypingPresenceRetry();
-      throw err;
-    });
-  typingPresenceEnterPromise=enterPromise;
-  return enterPromise;
-}
-
-function setupTypingPresence(channel){
-  if(!channel || !channel.presence) return;
-  if(typingPresenceCleanup){ try{ typingPresenceCleanup(); }catch(e){} typingPresenceCleanup=null; }
-  typingEntries.clear();
-  updateTypingIndicatorUI();
-  typingPresenceChannel=channel;
-  typingPresenceReady=false;
-  typingPresenceEnterPromise=null;
-  typingStateActive=false;
-  typingDesiredState=false;
-  clearTypingStopTimer();
-  clearTypingPresenceRetry();
-  const presence=channel.presence;
-  const handler=member=>handleTypingPresenceMember(member);
-  try{ presence.subscribe(handler); }catch(e){}
-  if(presence.get){ presence.get().then(members=>{ if(Array.isArray(members)) members.forEach(handleTypingPresenceMember); }).catch(()=>{}); }
-  const enterPromise=ensureTypingPresenceReady();
-  if(enterPromise && typeof enterPromise.finally==='function'){
-    enterPromise.finally(()=>{ if(typingPresenceEnterPromise===enterPromise) typingPresenceEnterPromise=null; });
-  } else if(enterPromise && typeof enterPromise.then==='function'){
-    enterPromise.then(()=>{ if(typingPresenceEnterPromise===enterPromise) typingPresenceEnterPromise=null; }).catch(()=>{ if(typingPresenceEnterPromise===enterPromise) typingPresenceEnterPromise=null; });
-  }
-  typingPresenceCleanup=function(){
-    try{ presence.unsubscribe(handler); }catch(e){}
-    try{
-      const payload={typing:false,user:myId,display:meName,role:myRole};
-      const result=presence.leave(payload);
-      if(result && typeof result.then==='function') result.catch(()=>{});
-    }catch(e){}
-    typingEntries.clear();
-    updateTypingIndicatorUI();
-    typingPresenceChannel=null;
-    typingPresenceReady=false;
-    typingPresenceEnterPromise=null;
-    typingStateActive=false;
-    typingDesiredState=false;
-    clearTypingStopTimer();
-    clearTypingPresenceRetry();
-    if(typingPruneTimer){ clearInterval(typingPruneTimer); typingPruneTimer=null; }
-  };
-}
-
-function publishTypingState(active){
-  const desired=!!active;
-  typingDesiredState=desired;
-  if(desired){ scheduleTypingStop(); }
-  else clearTypingStopTimer();
-  if(!typingPresenceChannel || !typingPresenceChannel.presence) return;
-  const now=Date.now();
-  if(desired){
-    if(typingStateActive && (now-typingLastSent)<TYPING_THROTTLE_MS) return;
-  } else {
-    if(!typingStateActive && typingPresenceReady) return;
-  }
-  const sendUpdate=()=>{
-    try{
-      const payload={typing:desired,user:myId,display:meName,role:myRole};
-      const result=typingPresenceChannel.presence.update(payload);
-      if(result && typeof result.then==='function') result.catch(()=>{ scheduleTypingPresenceRetry(); });
-    }catch(e){ scheduleTypingPresenceRetry(); return; }
-    typingStateActive=desired;
-    typingLastSent=now;
-    if(desired) scheduleTypingStop();
-  };
-  if(typingPresenceReady){ sendUpdate(); return; }
-  const enterPromise=ensureTypingPresenceReady();
-  if(enterPromise && typeof enterPromise.then==='function'){
-    enterPromise.then(()=>{
-      if(typingPresenceReady && typingDesiredState===desired) sendUpdate();
-    }).catch(()=>{});
-  }
-}
 
 /* =========================
    READ-LOGIC GUARDS (FOCUS + VISIBILITY + IN-VIEW)
@@ -1570,13 +1323,11 @@ if(!window.ELXAO_ABLY){
     else if(entry.channel){
       entry.channel.attach().catch(()=>{});
     }
-    const cleanup=function(){
+    return function(){
       if(onMessage && entry.callbacks) entry.callbacks.delete(onMessage);
       entry.refCount--;
       if(entry.refCount<=0){ if(entry.channel&&entry.handler) entry.channel.unsubscribe(entry.handler); map.delete(channelName); }
     };
-    cleanup.channel=entry.channel||null;
-    return cleanup;
   };
 }
 
@@ -1959,19 +1710,14 @@ function subscribeRealtime(tokenDetails){
   }
   return window.ELXAO_ABLY.ensureClient(tokenDetails).then(function(client){
     if(realtimeCleanup){ try{ realtimeCleanup(); }catch(e){} realtimeCleanup=null; }
-    publishTypingState(false);
-    if(typingPresenceCleanup){ try{ typingPresenceCleanup(); }catch(e){} typingPresenceCleanup=null; }
     const unsubscribe=window.ELXAO_ABLY.registerChannel(client,room,projectId,handleRealtimePayload);
-    if(unsubscribe && unsubscribe.channel){ setupTypingPresence(unsubscribe.channel); }
-    realtimeCleanup=typeof unsubscribe==='function'?unsubscribe:null;
+    realtimeCleanup=unsubscribe;
     realtimeReady=true;
     stopFallbackPolling();
   });
 }
 
 function cleanup(){
-  publishTypingState(false);
-  if(typingPresenceCleanup){ try{ typingPresenceCleanup(); }catch(e){} typingPresenceCleanup=null; }
   if(realtimeCleanup){ try{ realtimeCleanup(); }catch(e){} realtimeCleanup=null; }
   realtimeReady=false;
   latestSeenAtMs=0;
@@ -2424,9 +2170,9 @@ load({limit:HISTORY_INITIAL_LIMIT,order:'desc'})
 /* composer */
 btn.addEventListener('click', function(){
   const v = ta.value.replace(/\s+$/,''); if(!v.trim()) return;
+  const meName = '<?php echo $meName;?>';
   handleChatPayload({ type:'text', message:v, project:projectId||parseInt(pid,10), user:myId, user_display:meName, role:myRole });
   rememberLocal(fingerprint(projectId,myId,v)); ta.value=''; btn.disabled=true;
-  publishTypingState(false);
   if(typeof syncTextareaSize==='function') syncTextareaSize();
   send(v).then(function(resp){
     if(resp && resp.ok){
