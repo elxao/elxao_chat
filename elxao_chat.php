@@ -823,19 +823,27 @@ ob_start();?>
   overflow:hidden;
 }
 #elxao-chat-<?php echo $pid;?> .list{flex:1;overflow:auto;padding:20px;color:inherit;background:rgba(255,255,255,0.85)}
-#elxao-chat-<?php echo $pid;?> .sys    { color:var(--chat-sys);opacity:.85 }
-#elxao-chat-<?php echo $pid;?> .client { color:var(--chat-client) }
-#elxao-chat-<?php echo $pid;?> .pm     { color:var(--chat-pm) }
-#elxao-chat-<?php echo $pid;?> .admin  { color:var(--chat-admin) }
-#elxao-chat-<?php echo $pid;?> .chat-line{display:flex;gap:12px;align-items:flex-start;margin-bottom:12px;padding:14px 18px;border-radius:16px;background:#ffffff;border:1px solid rgba(15,23,42,0.08);box-shadow:0 8px 20px rgba(15,23,42,0.08);transition:box-shadow .2s ease,border-color .2s ease,transform .2s ease;width:fit-content;max-width:100%}
+#elxao-chat-<?php echo $pid;?> .chat-line{display:flex;gap:14px;align-items:flex-start;margin-bottom:12px;padding:14px 18px;border-radius:16px;background:#ffffff;border:1px solid rgba(15,23,42,0.08);box-shadow:0 8px 20px rgba(15,23,42,0.08);transition:box-shadow .2s ease,border-color .2s ease,transform .2s ease;width:fit-content;max-width:100%;color:var(--chat-color)}
 #elxao-chat-<?php echo $pid;?> .chat-line:last-child{margin-bottom:0}
 #elxao-chat-<?php echo $pid;?> .chat-line:hover{transform:translateY(-2px);box-shadow:0 16px 32px rgba(15,23,42,0.08)}
 #elxao-chat-<?php echo $pid;?> .chat-line.is-unread{background:#ecfdf5;border-color:rgba(16,163,127,0.32);box-shadow:0 18px 32px rgba(16,163,127,0.16)}
-#elxao-chat-<?php echo $pid;?> .chat-line .chat-text{flex:1;color:inherit;display:flex;flex-direction:column;gap:6px}
+#elxao-chat-<?php echo $pid;?> .chat-line.sys{color:var(--chat-sys)}
+#elxao-chat-<?php echo $pid;?> .chat-line .chat-avatar{flex:0 0 40px;width:40px;height:40px;border-radius:50%;background:rgba(15,23,42,0.08);color:var(--chat-color);font-weight:600;display:flex;align-items:center;justify-content:center;text-transform:uppercase;box-shadow:0 4px 12px rgba(15,23,42,0.12)}
+#elxao-chat-<?php echo $pid;?> .chat-line.client .chat-avatar{background:rgba(34,197,94,0.16);color:var(--chat-client)}
+#elxao-chat-<?php echo $pid;?> .chat-line.pm .chat-avatar{background:rgba(37,99,235,0.16);color:#2563eb}
+#elxao-chat-<?php echo $pid;?> .chat-line.admin .chat-avatar{background:rgba(96,165,250,0.18);color:var(--chat-admin)}
+#elxao-chat-<?php echo $pid;?> .chat-line.sys .chat-avatar{display:none}
+#elxao-chat-<?php echo $pid;?> .chat-line .chat-text{flex:1;display:flex;flex-direction:column;gap:6px;min-width:0;color:inherit}
+#elxao-chat-<?php echo $pid;?> .chat-line .chat-username{font-weight:600;color:var(--chat-color)}
+#elxao-chat-<?php echo $pid;?> .chat-line.client .chat-username{color:var(--chat-client)}
+#elxao-chat-<?php echo $pid;?> .chat-line.pm .chat-username{color:#2563eb}
+#elxao-chat-<?php echo $pid;?> .chat-line.admin .chat-username{color:var(--chat-admin)}
+#elxao-chat-<?php echo $pid;?> .chat-line.sys .chat-username{display:none}
 #elxao-chat-<?php echo $pid;?> .chat-line .chat-message{word-break:break-word;white-space:pre-wrap;color:var(--chat-color)}
+#elxao-chat-<?php echo $pid;?> .chat-line.sys .chat-message{color:var(--chat-sys)}
 #elxao-chat-<?php echo $pid;?> .chat-line .chat-timestamp{font-size:12px;color:#475569}
 #elxao-chat-<?php echo $pid;?> .chat-line .chat-timestamp.is-empty{display:none}
-#elxao-chat-<?php echo $pid;?> .chat-read-indicator{width:12px;height:12px;border-radius:999px;background:var(--chat-read-unread);margin-top:6px;flex:0 0 12px;box-shadow:0 0 0 1px rgba(255,255,255,0.8),0 4px 10px rgba(15,23,42,0.15)}
+#elxao-chat-<?php echo $pid;?> .chat-read-indicator{width:12px;height:12px;border-radius:999px;background:var(--chat-read-unread);margin-top:8px;margin-left:12px;flex:0 0 12px;box-shadow:0 0 0 1px rgba(255,255,255,0.8),0 4px 10px rgba(15,23,42,0.15)}
 #elxao-chat-<?php echo $pid;?> .chat-read-indicator.chat-read-indicator--unread{background:var(--chat-read-unread)}
 #elxao-chat-<?php echo $pid;?> .chat-read-indicator.is-hidden{opacity:0;visibility:hidden}
 #elxao-chat-<?php echo $pid;?> .chat-read-indicator.chat-read-indicator--read{background:var(--chat-read-read)}
@@ -1309,6 +1317,18 @@ function createTextFragment(text){
     fragment.appendChild(document.createTextNode(part));
   });
   return fragment;
+}
+
+function extractInitial(name){
+  const value=String(name||'').trim();
+  if(!value) return '?';
+  const parts=value.split(/\s+/).filter(Boolean);
+  if(!parts.length) return '?';
+  const first=parts[0].charAt(0)||'';
+  const last=parts.length>1?parts[parts.length-1].charAt(0)||'':'';
+  const combined=(first+last).toUpperCase();
+  if(combined) return combined;
+  return (first||last||'?').toUpperCase();
 }
 function extractReadTimes(source){
   if(!source || typeof source!=='object') return null;
@@ -1898,7 +1918,11 @@ function appendChatLine(source,options){
   const messageText=normalizeContent(data.message);
   if(!messageText && role!=='sys') return;
   const display=data.user_display||('User '+(data.user||''));
-  const fullText=(role==='sys')?messageText:(display+': '+messageText);
+  const showIdentity=(role!=='sys');
+  const displayName=String(display||'').trim();
+  const fallbackDisplay='User '+(data.user||'');
+  const resolvedDisplayName=displayName||fallbackDisplay;
+  const avatarInitial=showIdentity?extractInitial(displayName||data.user||fallbackDisplay):'';
 
   const messageId=('id' in data && data.id!=null)?String(data.id): (('message_id' in data && data.message_id!=null)?String(data.message_id):'');
   const stamp=String(data.at||data.published_at||data.created_at||'');
@@ -1920,6 +1944,11 @@ function appendChatLine(source,options){
     node.appendChild(createTextFragment(text));
   };
 
+  const ensureAvatarContent=function(node,initial){
+    if(!node) return;
+    node.textContent=String(initial||'').slice(0,2).toUpperCase();
+  };
+
   const ensureTimestampContent=function(node,value){
     if(!node) return;
     const formatted=formatLineTimestamp(value);
@@ -1933,23 +1962,57 @@ function appendChatLine(source,options){
     const merged=Object.assign({},payload,data);
     existing.__chatPayload=merged;
     const indicator=existing.querySelector('.chat-read-indicator');
-    if(indicator) applyIndicatorState(indicator,determineIndicator(merged,role));
-    const textNode=existing.querySelector('.chat-text');
-    let messageNode=textNode?textNode.querySelector('.chat-message'):null;
-    if(!messageNode && textNode){
+    if(indicator){
+      applyIndicatorState(indicator,determineIndicator(merged,role));
+      existing.appendChild(indicator);
+    }
+    let avatarNode=existing.querySelector('.chat-avatar');
+    if(showIdentity){
+      if(!avatarNode){
+        avatarNode=document.createElement('div');
+        avatarNode.className='chat-avatar';
+        existing.insertBefore(avatarNode,existing.firstChild);
+      }
+      ensureAvatarContent(avatarNode,avatarInitial);
+    } else if(avatarNode){
+      avatarNode.remove();
+      avatarNode=null;
+    }
+    const textNode=existing.querySelector('.chat-text')||document.createElement('div');
+    if(!textNode.parentNode){
+      textNode.className='chat-text';
+      existing.insertBefore(textNode,indicator||null);
+    }
+    let usernameNode=textNode.querySelector('.chat-username');
+    if(showIdentity){
+      if(!usernameNode){
+        usernameNode=document.createElement('div');
+        usernameNode.className='chat-username';
+        textNode.insertBefore(usernameNode,textNode.firstChild);
+      }
+      ensureTextContent(usernameNode,resolvedDisplayName);
+    } else if(usernameNode){
+      usernameNode.remove();
+      usernameNode=null;
+    }
+    let messageNode=textNode.querySelector('.chat-message');
+    if(!messageNode){
       messageNode=document.createElement('div');
       messageNode.className='chat-message';
-      while(textNode.firstChild){ messageNode.appendChild(textNode.firstChild); }
-      textNode.appendChild(messageNode);
+      const referenceNode=textNode.querySelector('.chat-timestamp');
+      if(referenceNode) textNode.insertBefore(messageNode,referenceNode);
+      else textNode.appendChild(messageNode);
     }
-    ensureTextContent(messageNode||textNode,fullText);
-    let timestampNode=textNode?textNode.querySelector('.chat-timestamp'):null;
-    if(!timestampNode && textNode){
+    ensureTextContent(messageNode,messageText);
+    let timestampNode=textNode.querySelector('.chat-timestamp');
+    if(!timestampNode){
       timestampNode=document.createElement('div');
       timestampNode.className='chat-timestamp';
       textNode.appendChild(timestampNode);
     }
     ensureTimestampContent(timestampNode,stamp);
+    if(showIdentity) existing.classList.add('chat-line--has-identity');
+    else existing.classList.remove('chat-line--has-identity');
     existing.dataset.role=role;
     if(stamp) existing.dataset.at=stamp; else delete existing.dataset.at;
     if(messageId) existing.dataset.messageId=messageId;
@@ -1964,20 +2027,33 @@ function appendChatLine(source,options){
 
   const line=document.createElement('div');
   line.className='chat-line '+role;
-  const indicator=document.createElement('span');
-  applyIndicatorState(indicator,determineIndicator(data,role));
-  line.appendChild(indicator);
+  if(showIdentity) line.classList.add('chat-line--has-identity');
+  if(showIdentity){
+    const avatarNode=document.createElement('div');
+    avatarNode.className='chat-avatar';
+    ensureAvatarContent(avatarNode,avatarInitial);
+    line.appendChild(avatarNode);
+  }
   const textNode=document.createElement('div');
   textNode.className='chat-text';
+  if(showIdentity){
+    const usernameNode=document.createElement('div');
+    usernameNode.className='chat-username';
+    ensureTextContent(usernameNode,resolvedDisplayName);
+    textNode.appendChild(usernameNode);
+  }
   const messageNode=document.createElement('div');
   messageNode.className='chat-message';
-  ensureTextContent(messageNode,fullText);
+  ensureTextContent(messageNode,messageText);
   const timestampNode=document.createElement('div');
   timestampNode.className='chat-timestamp';
   ensureTimestampContent(timestampNode,stamp);
   textNode.appendChild(messageNode);
   textNode.appendChild(timestampNode);
   line.appendChild(textNode);
+  const indicator=document.createElement('span');
+  applyIndicatorState(indicator,determineIndicator(data,role));
+  line.appendChild(indicator);
   line.__chatPayload=data;
   line.dataset.role=role;
   if(stamp) line.dataset.at=stamp; else delete line.dataset.at;
