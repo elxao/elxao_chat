@@ -900,6 +900,58 @@ if(ta){
   let baseHeight=0;
   const MAX_AUTO_HEIGHT=180;
 
+  const composerTrimmedValue=function(){
+    return ta.value.replace(/\s+$/,'').trim();
+  };
+
+  const evaluateTypingState=function(){
+    const trimmed=composerTrimmedValue();
+    if(trimmed){
+      updateLocalTypingActivity();
+    } else {
+      stopLocalTyping();
+    }
+  };
+
+  const queueTypingEvaluation=function(){
+    if(typeof requestAnimationFrame==='function'){
+      requestAnimationFrame(evaluateTypingState);
+    } else {
+      setTimeout(evaluateTypingState,0);
+    }
+  };
+
+  const shouldTriggerTypingFromKey=function(event){
+    if(!event) return false;
+    const key=event.key || '';
+    if(key==='Enter') return false;
+    if(event.ctrlKey || event.metaKey) return false;
+    if(event.altKey && key!=='Backspace' && key!=='Delete') return false;
+    const normalizedKey=key.length===1 ? '' : key;
+    switch(normalizedKey){
+      case 'Shift':
+      case 'CapsLock':
+      case 'Tab':
+      case 'Escape':
+      case 'ArrowUp':
+      case 'ArrowDown':
+      case 'ArrowLeft':
+      case 'ArrowRight':
+      case 'PageUp':
+      case 'PageDown':
+      case 'Home':
+      case 'End':
+      case 'Insert':
+      case 'NumLock':
+      case 'ScrollLock':
+      case 'Pause':
+      case 'ContextMenu':
+        return false;
+    }
+    if(normalizedKey && /^F\d{1,2}$/i.test(normalizedKey)) return false;
+    return true;
+  };
+
   syncTextareaSize=()=>{
     ta.style.height='auto';
     const scrollHeight=ta.scrollHeight;
@@ -914,16 +966,31 @@ if(ta){
   syncTextareaSize();
   ta.addEventListener('input',syncTextareaSize);
   ta.addEventListener('focus',syncTextareaSize);
+
   const handleTypingInput=function(){
-    const trimmed=ta.value.replace(/\s+$/,'').trim();
-    if(trimmed){
-      updateLocalTypingActivity();
-    } else {
-      stopLocalTyping();
-    }
+    evaluateTypingState();
   };
+
   ta.addEventListener('input',handleTypingInput);
+  ta.addEventListener('compositionend',handleTypingInput);
   ta.addEventListener('blur',function(){ stopLocalTyping(); });
+
+  ta.addEventListener('keydown',function(e){
+    if((e.key==='Enter') && (e.ctrlKey || e.metaKey)){
+      e.preventDefault();
+      btn.click();
+      return;
+    }
+    if(shouldTriggerTypingFromKey(e)){
+      if(e.key==='Backspace' || e.key==='Delete'){
+        if(composerTrimmedValue()) updateLocalTypingActivity();
+        queueTypingEvaluation();
+      } else {
+        updateLocalTypingActivity();
+        queueTypingEvaluation();
+      }
+    }
+  });
 }
 
 if(list){
@@ -2401,10 +2468,6 @@ btn.addEventListener('click', function(){
     }
   }).catch(function(err){ console.error('Failed to send chat message',err); })
     .finally(()=>{ btn.disabled=false; ta.focus(); });
-});
-
-ta.addEventListener('keydown', function(e){
-  if ((e.key === 'Enter') && (e.ctrlKey || e.metaKey)) { e.preventDefault(); btn.click(); }
 });
 
 /* evaluate seen on scroll/resize as well */
