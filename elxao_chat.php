@@ -1380,7 +1380,7 @@ let fallbackInFlight=false;
 let optimisticLatestReadMs=0;
 const FALLBACK_INTERVAL=4000;
 const DEBUG=false;
-const HISTORY_PAGE_SIZE=10;
+const HISTORY_PAGE_SIZE=5;
 const HISTORY_INITIAL_LIMIT=HISTORY_PAGE_SIZE;
 const HISTORY_SCROLL_OFFSET=48;
 
