@@ -960,7 +960,9 @@ let typingPresenceReady=false;
 let typingPresenceEnterPromise=null;
 let typingPruneTimer=null;
 let typingStopTimer=null;
+let typingPresenceRetryTimer=null;
 let typingStateActive=false;
+let typingDesiredState=false;
 let typingLastSent=0;
 const TYPING_EXPIRE_MS=6000;
 const TYPING_THROTTLE_MS=1200;
@@ -1055,6 +1057,46 @@ function handleTypingPresenceMember(member){
   updateTypingIndicatorUI();
 }
 
+function clearTypingPresenceRetry(){
+  if(typingPresenceRetryTimer){
+    clearTimeout(typingPresenceRetryTimer);
+    typingPresenceRetryTimer=null;
+  }
+}
+
+function scheduleTypingPresenceRetry(){
+  if(typingPresenceRetryTimer) return;
+  typingPresenceRetryTimer=setTimeout(()=>{
+    typingPresenceRetryTimer=null;
+    ensureTypingPresenceReady();
+  },4000);
+}
+
+function ensureTypingPresenceReady(){
+  if(!typingPresenceChannel || !typingPresenceChannel.presence) return null;
+  if(typingPresenceReady) return Promise.resolve(true);
+  if(typingPresenceEnterPromise) return typingPresenceEnterPromise;
+  const presence=typingPresenceChannel.presence;
+  const initialPayload={typing:false,user:myId,display:meName,role:myRole};
+  const enterPromise=typingPresenceChannel.attach()
+    .catch(()=>{})
+    .then(()=>presence.enter(initialPayload))
+    .then(()=>{
+      typingPresenceReady=true;
+      typingPresenceEnterPromise=null;
+      clearTypingPresenceRetry();
+      return true;
+    })
+    .catch(err=>{
+      typingPresenceReady=false;
+      typingPresenceEnterPromise=null;
+      scheduleTypingPresenceRetry();
+      throw err;
+    });
+  typingPresenceEnterPromise=enterPromise;
+  return enterPromise;
+}
+
 function setupTypingPresence(channel){
   if(!channel || !channel.presence) return;
   if(typingPresenceCleanup){ try{ typingPresenceCleanup(); }catch(e){} typingPresenceCleanup=null; }
@@ -1063,20 +1105,20 @@ function setupTypingPresence(channel){
   typingPresenceChannel=channel;
   typingPresenceReady=false;
   typingPresenceEnterPromise=null;
+  typingStateActive=false;
+  typingDesiredState=false;
+  clearTypingStopTimer();
+  clearTypingPresenceRetry();
   const presence=channel.presence;
   const handler=member=>handleTypingPresenceMember(member);
   try{ presence.subscribe(handler); }catch(e){}
   if(presence.get){ presence.get().then(members=>{ if(Array.isArray(members)) members.forEach(handleTypingPresenceMember); }).catch(()=>{}); }
-  try{
-    const initialPayload={typing:false,user:myId,display:meName,role:myRole};
-    const enterPromise=channel.attach().then(()=>presence.enter(initialPayload)).then(()=>{ typingPresenceReady=true; }).catch(()=>{ typingPresenceReady=false; });
-    typingPresenceEnterPromise=enterPromise;
-    if(enterPromise && typeof enterPromise.finally==='function'){
-      enterPromise.finally(()=>{ if(typingPresenceEnterPromise===enterPromise) typingPresenceEnterPromise=null; });
-    } else if(enterPromise && typeof enterPromise.then==='function'){
-      enterPromise.then(()=>{ if(typingPresenceEnterPromise===enterPromise) typingPresenceEnterPromise=null; }).catch(()=>{ if(typingPresenceEnterPromise===enterPromise) typingPresenceEnterPromise=null; });
-    }
-  }catch(e){ typingPresenceEnterPromise=null; }
+  const enterPromise=ensureTypingPresenceReady();
+  if(enterPromise && typeof enterPromise.finally==='function'){
+    enterPromise.finally(()=>{ if(typingPresenceEnterPromise===enterPromise) typingPresenceEnterPromise=null; });
+  } else if(enterPromise && typeof enterPromise.then==='function'){
+    enterPromise.then(()=>{ if(typingPresenceEnterPromise===enterPromise) typingPresenceEnterPromise=null; }).catch(()=>{ if(typingPresenceEnterPromise===enterPromise) typingPresenceEnterPromise=null; });
+  }
   typingPresenceCleanup=function(){
     try{ presence.unsubscribe(handler); }catch(e){}
     try{
@@ -1090,13 +1132,16 @@ function setupTypingPresence(channel){
     typingPresenceReady=false;
     typingPresenceEnterPromise=null;
     typingStateActive=false;
+    typingDesiredState=false;
     clearTypingStopTimer();
+    clearTypingPresenceRetry();
     if(typingPruneTimer){ clearInterval(typingPruneTimer); typingPruneTimer=null; }
   };
 }
 
 function publishTypingState(active){
   const desired=!!active;
+  typingDesiredState=desired;
   if(desired){ scheduleTypingStop(); }
   else clearTypingStopTimer();
   if(!typingPresenceChannel || !typingPresenceChannel.presence) return;
@@ -1104,21 +1149,24 @@ function publishTypingState(active){
   if(desired){
     if(typingStateActive && (now-typingLastSent)<TYPING_THROTTLE_MS) return;
   } else {
-    if(!typingStateActive) return;
+    if(!typingStateActive && typingPresenceReady) return;
   }
   const sendUpdate=()=>{
     try{
       const payload={typing:desired,user:myId,display:meName,role:myRole};
       const result=typingPresenceChannel.presence.update(payload);
-      if(result && typeof result.then==='function') result.catch(()=>{});
-    }catch(e){}
+      if(result && typeof result.then==='function') result.catch(()=>{ scheduleTypingPresenceRetry(); });
+    }catch(e){ scheduleTypingPresenceRetry(); return; }
     typingStateActive=desired;
     typingLastSent=now;
     if(desired) scheduleTypingStop();
   };
   if(typingPresenceReady){ sendUpdate(); return; }
-  if(typingPresenceEnterPromise && typeof typingPresenceEnterPromise.then==='function'){
-    typingPresenceEnterPromise.then(()=>{ typingPresenceReady=true; sendUpdate(); }).catch(()=>{});
+  const enterPromise=ensureTypingPresenceReady();
+  if(enterPromise && typeof enterPromise.then==='function'){
+    enterPromise.then(()=>{
+      if(typingPresenceReady && typingDesiredState===desired) sendUpdate();
+    }).catch(()=>{});
   }
 }
 
