@@ -699,7 +699,7 @@ function elxao_chat_rest_inbox_token(WP_REST_Request $r){
         if(!$pid) continue;
         if(!elxao_chat_user_can_access_project($pid,$uid)) continue;
         $room=elxao_chat_room_id($pid);
-        $capability[$room]=['subscribe'];
+        $capability[$room]=['subscribe','presence'];
     }
 
     if(empty($capability))
@@ -858,6 +858,14 @@ ob_start();?>
 #elxao-chat-<?php echo $pid;?> .send:hover{box-shadow:0 12px 24px rgba(37,99,235,0.25);filter:brightness(1.03);transform:translateY(-1px)}
 #elxao-chat-<?php echo $pid;?> .send:active{transform:translateY(0);box-shadow:0 8px 16px rgba(37,99,235,0.2)}
 #elxao-chat-<?php echo $pid;?> .send:disabled{opacity:.45;cursor:not-allowed;transform:none;box-shadow:none;filter:none}
+@keyframes elxaoTypingBounce{0%,80%,100%{transform:scale(0.6);opacity:0.35;}40%{transform:scale(1);opacity:1;}}
+#elxao-chat-<?php echo $pid;?> .chat-typing-indicator{display:flex;align-items:center;gap:10px;margin:12px 0 0 58px;color:#475569;font-size:14px;line-height:1.4;}
+#elxao-chat-<?php echo $pid;?> .chat-typing-indicator.is-hidden{display:none}
+#elxao-chat-<?php echo $pid;?> .chat-typing-indicator .typing-label{font-style:italic}
+#elxao-chat-<?php echo $pid;?> .chat-typing-indicator .typing-dots{display:inline-flex;align-items:center;gap:6px}
+#elxao-chat-<?php echo $pid;?> .chat-typing-indicator .typing-dots span{width:8px;height:8px;border-radius:50%;background:#94a3b8;animation:elxaoTypingBounce 1.2s infinite ease-in-out}
+#elxao-chat-<?php echo $pid;?> .chat-typing-indicator .typing-dots span:nth-child(2){animation-delay:0.2s}
+#elxao-chat-<?php echo $pid;?> .chat-typing-indicator .typing-dots span:nth-child(3){animation-delay:0.4s}
 </style>
 <script>
 (function(){
@@ -885,8 +893,9 @@ if(ta){
   };
 
   syncTextareaSize();
-  ta.addEventListener('input',syncTextareaSize);
+  ta.addEventListener('input',function(){ syncTextareaSize(); markTypingActivity(); });
   ta.addEventListener('focus',syncTextareaSize);
+  ta.addEventListener('blur',stopTypingNow);
 }
 
 if(!window.ELXAO_CHAT_FORMAT_DATE){
@@ -918,6 +927,7 @@ const hdr={'X-WP-Nonce':nonce};
 const projectId=parseInt(pid,10)||0;
 const clientId=parseInt(root.dataset.client,10)||0;
 const pmId=parseInt(root.dataset.pm,10)||0;
+const meName='<?php echo $meName;?>';
 const localEchoes=new Map();
 let realtimeCleanup=null;
 let busCleanup=null;
@@ -1323,11 +1333,13 @@ if(!window.ELXAO_ABLY){
     else if(entry.channel){
       entry.channel.attach().catch(()=>{});
     }
-    return function(){
+    const cleanup=function(){
       if(onMessage && entry.callbacks) entry.callbacks.delete(onMessage);
       entry.refCount--;
       if(entry.refCount<=0){ if(entry.channel&&entry.handler) entry.channel.unsubscribe(entry.handler); map.delete(channelName); }
     };
+    cleanup.channel=entry.channel;
+    return cleanup;
   };
 }
 
@@ -1365,6 +1377,20 @@ function extractReadTimes(source){
 }
 
 /* ---------- live state ---------- */
+const TYPING_IDLE_MS=2200;
+const TYPING_SWEEP_MS=600;
+const TYPING_THROTTLE_MS=1000;
+const typingUsers=new Map();
+let typingIndicator=null;
+let typingLabelNode=null;
+let typingSweepTimer=null;
+let typingStopTimer=null;
+let ablyChannel=null;
+let ablyClientId='';
+let presenceInitPromise=null;
+let presenceEntered=false;
+let lastTypingState=false;
+let lastTypingSentAt=0;
 const currentReadTimes={client:'',pm:'',admin:''};
 let isRenderingHistory=false;
 let latestAt='';
@@ -1383,6 +1409,204 @@ const DEBUG=false;
 const HISTORY_PAGE_SIZE=5;
 const HISTORY_INITIAL_LIMIT=HISTORY_PAGE_SIZE;
 const HISTORY_SCROLL_OFFSET=48;
+
+/* ---------- typing indicator helpers ---------- */
+function typingEventPayload(active){
+  return {
+    type:'typing',
+    project:projectId,
+    user:myId,
+    user_display:meName,
+    role:myRole,
+    typing:!!active,
+    timestamp:new Date().toISOString()
+  };
+}
+
+function ensureTypingIndicator(){
+  if(typingIndicator) return typingIndicator;
+  if(!list) return null;
+  typingIndicator=document.createElement('div');
+  typingIndicator.className='chat-typing-indicator is-hidden';
+  typingIndicator.setAttribute('aria-hidden','true');
+  typingIndicator.setAttribute('aria-live','polite');
+  typingLabelNode=document.createElement('span');
+  typingLabelNode.className='typing-label';
+  typingIndicator.appendChild(typingLabelNode);
+  const dots=document.createElement('span');
+  dots.className='typing-dots';
+  for(let i=0;i<3;i++){ dots.appendChild(document.createElement('span')); }
+  typingIndicator.appendChild(dots);
+  list.appendChild(typingIndicator);
+  return typingIndicator;
+}
+
+function formatTypingLabel(entries){
+  const names=[];
+  entries.forEach(info=>{
+    const name=(info&&info.name)?String(info.name).trim():'';
+    if(name && !names.includes(name)) names.push(name);
+  });
+  if(names.length===0) return 'Someone is typing…';
+  if(names.length===1) return names[0]+' is typing…';
+  if(names.length===2) return names[0]+' and '+names[1]+' are typing…';
+  return 'Several people are typing…';
+}
+
+function updateTypingIndicator(){
+  const indicator=ensureTypingIndicator();
+  if(!indicator) return;
+  const now=Date.now();
+  const active=[];
+  typingUsers.forEach((info,key)=>{
+    if(info && info.expires && info.expires>now){ active.push(info); }
+    else typingUsers.delete(key);
+  });
+  if(!active.length){
+    indicator.classList.add('is-hidden');
+    indicator.setAttribute('aria-hidden','true');
+    if(typingLabelNode) typingLabelNode.textContent='';
+    return;
+  }
+  if(typingLabelNode) typingLabelNode.textContent=formatTypingLabel(active);
+  indicator.classList.remove('is-hidden');
+  indicator.removeAttribute('aria-hidden');
+}
+
+function scheduleTypingSweep(){
+  if(typingSweepTimer) return;
+  typingSweepTimer=setTimeout(()=>{ typingSweepTimer=null; pruneTyping(); },TYPING_SWEEP_MS);
+}
+
+function pruneTyping(){
+  const now=Date.now();
+  let changed=false;
+  typingUsers.forEach((info,key)=>{
+    if(!info || !info.expires || info.expires<=now){ typingUsers.delete(key); changed=true; }
+  });
+  if(changed) updateTypingIndicator();
+  if(typingUsers.size>0) scheduleTypingSweep();
+}
+
+function typingKeyFromPayload(payload,fallback){
+  if(payload && typeof payload==='object'){
+    const userRaw=('user' in payload && payload.user!=null)?payload.user:(('user_id' in payload && payload.user_id!=null)?payload.user_id:null);
+    if(userRaw!==null){
+      const parsed=parseInt(userRaw,10);
+      if(!Number.isNaN(parsed) && parsed>0) return 'u'+parsed;
+    }
+    const clientRaw=payload.client_id||payload.clientId||payload.clientID||'';
+    if(clientRaw) return 'c'+String(clientRaw);
+  }
+  if(fallback) return 'c'+String(fallback);
+  return '';
+}
+
+function typingDisplayName(payload){
+  if(!payload || typeof payload!=='object') return 'Someone';
+  const raw=payload.user_display||payload.userDisplay||payload.username||payload.name||'';
+  const trimmed=String(raw||'').trim();
+  if(trimmed) return trimmed;
+  const userRaw=('user' in payload && payload.user!=null)?payload.user:(('user_id' in payload && payload.user_id!=null)?payload.user_id:null);
+  const parsed=parseInt(userRaw,10);
+  if(!Number.isNaN(parsed) && parsed>0) return 'User '+parsed;
+  return 'Someone';
+}
+
+function applyTypingPayload(payload){
+  if(!payload || typeof payload!=='object') return;
+  const key=typingKeyFromPayload(payload,'');
+  if(!key) return;
+  const userRaw=('user' in payload && payload.user!=null)?payload.user:(('user_id' in payload && payload.user_id!=null)?payload.user_id:0);
+  const userId=parseInt(userRaw,10);
+  if(!Number.isNaN(userId) && userId>0 && userId===myId) return;
+  const active=('typing' in payload)?!!payload.typing:true;
+  const clientKey=payload.client_id||payload.clientId||payload.clientID||'';
+  if(active){
+    typingUsers.set(key,{name:typingDisplayName(payload),expires:Date.now()+TYPING_IDLE_MS,client:clientKey});
+    scheduleTypingSweep();
+  }else if(typingUsers.has(key)){
+    typingUsers.delete(key);
+  }else if(clientKey){
+    let removed=false;
+    typingUsers.forEach((info,mapKey)=>{
+      if(!removed && info && info.client && info.client===clientKey){ typingUsers.delete(mapKey); removed=true; }
+    });
+  }
+  updateTypingIndicator();
+}
+
+function handleTypingPresenceMessage(msg){
+  if(!msg) return;
+  const clientKey=msg.clientId||msg.clientID||'';
+  if(clientKey && ablyClientId && clientKey===ablyClientId) return;
+  if(msg.action && String(msg.action).toLowerCase()==='leave'){
+    const leaveKey=typingKeyFromPayload(msg.data||{},clientKey);
+    let removed=false;
+    if(leaveKey && typingUsers.has(leaveKey)){ typingUsers.delete(leaveKey); removed=true; }
+    if(!removed && clientKey){
+      typingUsers.forEach((info,key)=>{
+        if(!removed && info && info.client && info.client===clientKey){ typingUsers.delete(key); removed=true; }
+      });
+    }
+    if(removed) updateTypingIndicator();
+    return;
+  }
+  const data=(msg.data && typeof msg.data==='object')?msg.data:{};
+  const type=(data.type||'').toLowerCase();
+  const hasTyping=Object.prototype.hasOwnProperty.call(data,'typing');
+  if(type && type!=='typing' && !hasTyping) return;
+  const payload=Object.assign({},data,{type:'typing',client_id:clientKey});
+  if(!('typing' in payload)) payload.typing=true;
+  if(!payload.project) payload.project=projectId;
+  applyTypingPayload(payload);
+}
+
+function ensurePresenceReady(){
+  if(!ablyChannel || !ablyChannel.presence || typeof ablyChannel.presence.enter!=='function') return Promise.reject(new Error('no channel'));
+  if(presenceEntered) return Promise.resolve();
+  if(presenceInitPromise) return presenceInitPromise;
+  const attachPromise=(ablyChannel.attach && typeof ablyChannel.attach==='function')?ablyChannel.attach().catch(()=>{}):Promise.resolve();
+  presenceInitPromise=attachPromise
+    .then(()=>ablyChannel.presence.enter(typingEventPayload(false)))
+    .then(()=>{ presenceEntered=true; })
+    .catch(err=>{ presenceInitPromise=null; throw err; });
+  return presenceInitPromise;
+}
+
+function broadcastTypingState(active,force){
+  if(!projectId || !myId) return;
+  const now=Date.now();
+  if(active){
+    if(!force && lastTypingState && (now-lastTypingSentAt)<TYPING_THROTTLE_MS) return;
+  }else if(!force && !lastTypingState){
+    return;
+  }
+  lastTypingState=!!active;
+  lastTypingSentAt=now;
+  const payload=typingEventPayload(active);
+  window.ELXAO_CHAT_BUS.emit({project:projectId,payload:payload});
+  if(!ablyChannel || !ablyChannel.presence) return;
+  ensurePresenceReady()
+    .then(()=>{
+      const method=presenceEntered?'update':'enter';
+      if(typeof ablyChannel.presence[method]==='function') return ablyChannel.presence[method](payload);
+      return null;
+    })
+    .then(()=>{ presenceEntered=true; })
+    .catch(()=>{});
+}
+
+function markTypingActivity(){
+  broadcastTypingState(true);
+  if(typingStopTimer) clearTimeout(typingStopTimer);
+  typingStopTimer=setTimeout(()=>{ typingStopTimer=null; broadcastTypingState(false); },TYPING_IDLE_MS);
+}
+
+function stopTypingNow(){
+  if(typingStopTimer){ clearTimeout(typingStopTimer); typingStopTimer=null; }
+  if(lastTypingState) broadcastTypingState(false);
+}
 
 function updateCurrentReadTimes(times){
   if(!times || typeof times!=='object') return false;
@@ -1670,6 +1894,10 @@ function handleChatPayload(payload,options){
     applyReadReceipt(data);
     return;
   }
+  if(data.type==='typing'){
+    applyTypingPayload(data);
+    return;
+  }
   appendChatLine(data,options);
 }
 
@@ -1681,6 +1909,10 @@ function handleRealtimePayload(payload){
   if(data.project && data.project!==projectId) return;
   if(data.type==='read_receipt'){
     applyReadReceipt(data);
+    return;
+  }
+  if(data.type==='typing'){
+    applyTypingPayload(data);
     return;
   }
   const fp=fingerprint(projectId,data.user||0,data.message||'');
@@ -1710,8 +1942,26 @@ function subscribeRealtime(tokenDetails){
   }
   return window.ELXAO_ABLY.ensureClient(tokenDetails).then(function(client){
     if(realtimeCleanup){ try{ realtimeCleanup(); }catch(e){} realtimeCleanup=null; }
-    const unsubscribe=window.ELXAO_ABLY.registerChannel(client,room,projectId,handleRealtimePayload);
-    realtimeCleanup=unsubscribe;
+    const channelCleanup=window.ELXAO_ABLY.registerChannel(client,room,projectId,handleRealtimePayload);
+    ablyChannel=(channelCleanup && channelCleanup.channel)?channelCleanup.channel:(client && client.channels?client.channels.get(room):null);
+    ablyClientId=(client && client.auth && client.auth.clientId)?client.auth.clientId:'';
+    presenceEntered=false;
+    presenceInitPromise=null;
+    let presenceCleanup=null;
+    if(ablyChannel && ablyChannel.presence && typeof ablyChannel.presence.subscribe==='function'){
+      const presenceHandler=function(msg){ handleTypingPresenceMessage(msg); };
+      Promise.resolve(ablyChannel.presence.subscribe(['enter','update','leave'],presenceHandler)).catch(()=>{});
+      presenceCleanup=function(){ try{ ablyChannel.presence.unsubscribe(['enter','update','leave'],presenceHandler); }catch(e){} };
+    }
+    if(ablyChannel && lastTypingState) broadcastTypingState(true,true);
+    realtimeCleanup=function(){
+      if(presenceCleanup){ try{ presenceCleanup(); }catch(e){} presenceCleanup=null; }
+      if(typeof channelCleanup==='function'){ try{ channelCleanup(); }catch(e){} }
+      ablyChannel=null;
+      ablyClientId='';
+      presenceEntered=false;
+      presenceInitPromise=null;
+    };
     realtimeReady=true;
     stopFallbackPolling();
   });
@@ -1722,6 +1972,17 @@ function cleanup(){
   realtimeReady=false;
   latestSeenAtMs=0;
   optimisticLatestReadMs=0;
+  stopTypingNow();
+  if(typingSweepTimer){ clearTimeout(typingSweepTimer); typingSweepTimer=null; }
+  typingUsers.clear();
+  updateTypingIndicator();
+  if(ablyChannel && ablyChannel.presence && typeof ablyChannel.presence.leave==='function'){
+    try{ ablyChannel.presence.leave(typingEventPayload(false)); }catch(e){}
+  }
+  ablyChannel=null;
+  ablyClientId='';
+  presenceEntered=false;
+  presenceInitPromise=null;
   latestAt='';
   latestId=0;
   oldestAt='';
@@ -2170,7 +2431,7 @@ load({limit:HISTORY_INITIAL_LIMIT,order:'desc'})
 /* composer */
 btn.addEventListener('click', function(){
   const v = ta.value.replace(/\s+$/,''); if(!v.trim()) return;
-  const meName = '<?php echo $meName;?>';
+  stopTypingNow();
   handleChatPayload({ type:'text', message:v, project:projectId||parseInt(pid,10), user:myId, user_display:meName, role:myRole });
   rememberLocal(fingerprint(projectId,myId,v)); ta.value=''; btn.disabled=true;
   if(typeof syncTextareaSize==='function') syncTextareaSize();
@@ -2252,7 +2513,13 @@ function elxao_chat_render_inbox(){
               data-unread="<?php echo esc_attr($unread_count); ?>">
         <span class="label"><?php echo esc_html($label); ?></span>
         <span class="meta-row">
-          <span class="meta"><?php echo esc_html($activity?:'—'); ?></span>
+          <span class="meta" data-default="<?php echo esc_attr($activity?:'—'); ?>">
+            <span class="meta-text"><?php echo esc_html($activity?:'—'); ?></span>
+            <span class="typing" hidden aria-live="polite">
+              <span class="typing-label">Someone is typing…</span>
+              <span class="typing-dots" aria-hidden="true"><span></span><span></span><span></span></span>
+            </span>
+          </span>
           <span class="badge"<?php if($unread_count<=0) echo ' hidden'; ?>><?php echo esc_html($badge_text); ?></span>
         </span>
       </button>
@@ -2275,7 +2542,17 @@ function elxao_chat_render_inbox(){
 #<?php echo esc_attr($container_id); ?> .room-list .room.active{background:#dbeafe}
 #<?php echo esc_attr($container_id); ?> .room-list .room.active .label{color:#0f172a}
 #<?php echo esc_attr($container_id); ?> .room-list .label{font-weight:600;color:#1f2937}
-#<?php echo esc_attr($container_id); ?> .room-list .meta{font-size:12px;color:#64748b}
+#<?php echo esc_attr($container_id); ?> .room-list .meta{font-size:12px;color:#64748b;display:flex;flex-direction:column;gap:4px}
+#<?php echo esc_attr($container_id); ?> .room-list .meta-text{display:block}
+#<?php echo esc_attr($container_id); ?> .room-list .meta .typing{display:none;align-items:center;gap:6px}
+#<?php echo esc_attr($container_id); ?> .room-list .meta .typing .typing-label{font-style:italic;color:#475569}
+#<?php echo esc_attr($container_id); ?> .room-list .meta .typing .typing-dots{display:inline-flex;align-items:center;gap:6px}
+#<?php echo esc_attr($container_id); ?> .room-list .meta .typing .typing-dots span{width:6px;height:6px;border-radius:50%;background:#94a3b8;animation:elxaoTypingBounce 1.2s infinite ease-in-out}
+#<?php echo esc_attr($container_id); ?> .room-list .meta .typing .typing-dots span:nth-child(2){animation-delay:0.2s}
+#<?php echo esc_attr($container_id); ?> .room-list .meta .typing .typing-dots span:nth-child(3){animation-delay:0.4s}
+#<?php echo esc_attr($container_id); ?> .room-list .meta.is-typing .meta-text{display:none}
+#<?php echo esc_attr($container_id); ?> .room-list .meta.is-typing .typing{display:inline-flex}
+#<?php echo esc_attr($container_id); ?> .room-list .room.is-typing .label{color:#0f172a}
 #<?php echo esc_attr($container_id); ?> .room-list .meta-row{display:flex;align-items:center;justify-content:space-between;gap:10px}
 #<?php echo esc_attr($container_id); ?> .room-list .meta-row .meta{flex:1}
 #<?php echo esc_attr($container_id); ?> .room-list .badge{display:inline-flex;align-items:center;justify-content:center;font-size:12px;font-weight:700;line-height:1;padding:4px 10px;border-radius:999px;background:#10a37f;color:#f8fafc;min-width:28px}
@@ -2297,9 +2574,10 @@ function elxao_chat_render_inbox(){
   #<?php echo esc_attr($container_id); ?> .room-list .room{flex:1;min-width:220px;border-bottom:none;border-right:1px solid rgba(15,23,42,0.08);border-radius:0}
   #<?php echo esc_attr($container_id); ?> .room-list .room:last-child{border-right:none}
   #<?php echo esc_attr($container_id); ?> .room-list .room.active{box-shadow:none}
-  #<?php echo esc_attr($container_id); ?> .room-list .room.has-unread:not(.active){box-shadow:none}
-  #<?php echo esc_attr($container_id); ?> .chat-pane{min-height:380px}
+#<?php echo esc_attr($container_id); ?> .room-list .room.has-unread:not(.active){box-shadow:none}
+#<?php echo esc_attr($container_id); ?> .chat-pane{min-height:380px}
 }
+@keyframes elxaoTypingBounce{0%,80%,100%{transform:scale(0.6);opacity:0.35;}40%{transform:scale(1);opacity:1;}}
 </style>
 <script>
 document.addEventListener('DOMContentLoaded', function(){
@@ -2313,12 +2591,15 @@ const rooms=Array.from(roomList?roomList.querySelectorAll('.room'):[]);
 const headers={'X-WP-Nonce':nonce,'Accept':'application/json'};
 const roomMap=new Map();
 const channelCleanups=new Map();
+const presenceCleanups=new Map();
 const cleanupFns=[];
 let active=null;
 let busCleanup=null;
 const myUserId=parseInt(root.dataset.user||'0',10);
 const roomState=new WeakMap();
 const FALLBACK_INTERVAL=45000;
+const TYPING_IDLE_MS=2200;
+const TYPING_SWEEP_MS=600;
 let fallbackTimer=null;
 
 /* ---- shared helpers (may already exist) ---- */
@@ -2379,7 +2660,7 @@ function runCleanup(){ while(cleanupFns.length){ const fn=cleanupFns.pop(); try{
 function getRoomState(room){
   let state=roomState.get(room);
   if(!state){
-    state={ unread:0, readMs:0, lastMessageMs:0, lastMessageId:0 };
+    state={ unread:0, readMs:0, lastMessageMs:0, lastMessageId:0, typing:new Map(), typingTimer:null };
     roomState.set(room,state);
   }
   return state;
@@ -2455,6 +2736,158 @@ function resolveProjectId(payload,hint){
   return projectId>0?projectId:0;
 }
 
+function inboxTypingKey(payload,fallback){
+  if(payload && typeof payload==='object'){
+    const userRaw=('user' in payload && payload.user!=null)?payload.user:(('user_id' in payload && payload.user_id!=null)?payload.user_id:null);
+    if(userRaw!==null){
+      const parsed=parseInt(userRaw,10);
+      if(!Number.isNaN(parsed) && parsed>0) return 'u'+parsed;
+    }
+    const clientRaw=payload.client_id||payload.clientId||payload.clientID||'';
+    if(clientRaw) return 'c'+String(clientRaw);
+  }
+  if(fallback) return 'c'+String(fallback);
+  return '';
+}
+
+function inboxTypingName(payload){
+  if(!payload || typeof payload!=='object') return 'Someone';
+  const raw=payload.user_display||payload.userDisplay||payload.username||payload.name||'';
+  const trimmed=String(raw||'').trim();
+  if(trimmed) return trimmed;
+  const userRaw=('user' in payload && payload.user!=null)?payload.user:(('user_id' in payload && payload.user_id!=null)?payload.user_id:null);
+  const parsed=parseInt(userRaw,10);
+  if(!Number.isNaN(parsed) && parsed>0) return 'User '+parsed;
+  return 'Someone';
+}
+
+function scheduleRoomTypingSweep(room){
+  const state=getRoomState(room);
+  if(!state.typing) state.typing=new Map();
+  if(state.typingTimer) return;
+  state.typingTimer=setTimeout(()=>{ state.typingTimer=null; pruneRoomTyping(room); },TYPING_SWEEP_MS);
+}
+
+function pruneRoomTyping(room){
+  const state=getRoomState(room);
+  if(!state.typing) return;
+  const now=Date.now();
+  let changed=false;
+  state.typing.forEach((info,key)=>{
+    if(!info || !info.expires || info.expires<=now){ state.typing.delete(key); changed=true; }
+  });
+  if(changed) updateRoomTypingDisplay(room);
+  if(state.typing.size>0) scheduleRoomTypingSweep(room);
+}
+
+function updateRoomTypingDisplay(room){
+  if(!room) return;
+  const meta=room.querySelector('.meta');
+  if(!meta) return;
+  const metaText=meta.querySelector('.meta-text');
+  const typingEl=meta.querySelector('.typing');
+  const labelEl=typingEl?typingEl.querySelector('.typing-label'):null;
+  const state=getRoomState(room);
+  const now=Date.now();
+  const active=[];
+  if(state.typing){
+    state.typing.forEach((info,key)=>{
+      if(info && info.expires && info.expires>now){ active.push(info); }
+      else state.typing.delete(key);
+    });
+  }
+  if(!active.length){
+    meta.classList.remove('is-typing');
+    room.classList.remove('is-typing');
+    if(typingEl) typingEl.hidden=true;
+    if(metaText){
+      const fallback=meta.dataset.default!==undefined?meta.dataset.default:'—';
+      metaText.textContent=fallback||'—';
+    }
+    if(state.typingTimer){ clearTimeout(state.typingTimer); state.typingTimer=null; }
+    return;
+  }
+  const names=[];
+  active.forEach(info=>{
+    const name=(info && info.name)?String(info.name).trim():'';
+    if(name && !names.includes(name)) names.push(name);
+  });
+  let label='Several people are typing…';
+  if(names.length===0) label='Someone is typing…';
+  else if(names.length===1) label=names[0]+' is typing…';
+  else if(names.length===2) label=names[0]+' and '+names[1]+' are typing…';
+  if(labelEl) labelEl.textContent=label;
+  if(typingEl) typingEl.hidden=false;
+  meta.classList.add('is-typing');
+  room.classList.add('is-typing');
+}
+
+function applyRoomTyping(room,payload){
+  if(!room || !payload) return;
+  const key=inboxTypingKey(payload,'');
+  if(!key) return;
+  const userRaw=('user' in payload && payload.user!=null)?payload.user:(('user_id' in payload && payload.user_id!=null)?payload.user_id:0);
+  const userId=parseInt(userRaw,10);
+  if(!Number.isNaN(userId) && userId>0 && userId===myUserId) return;
+  const state=getRoomState(room);
+  if(!state.typing) state.typing=new Map();
+  const active=('typing' in payload)?!!payload.typing:true;
+  const clientKey=payload.client_id||payload.clientId||payload.clientID||'';
+  if(active){
+    state.typing.set(key,{name:inboxTypingName(payload),expires:Date.now()+TYPING_IDLE_MS,client:clientKey});
+    scheduleRoomTypingSweep(room);
+  }else if(state.typing.has(key)){
+    state.typing.delete(key);
+  }else if(clientKey){
+    let removed=false;
+    state.typing.forEach((info,mapKey)=>{
+      if(!removed && info && info.client && info.client===clientKey){ state.typing.delete(mapKey); removed=true; }
+    });
+  }
+  updateRoomTypingDisplay(room);
+}
+
+function clearRoomTypingByUser(room,userId){
+  if(!room || !userId) return;
+  const state=getRoomState(room);
+  if(!state.typing || !state.typing.size) return;
+  const key='u'+userId;
+  if(state.typing.delete(key)) updateRoomTypingDisplay(room);
+}
+
+function handleInboxPresence(projectId,msg){
+  if(!projectId || !msg) return;
+  const room=roomMap.get(String(projectId));
+  if(!room) return;
+  const clientKey=msg.clientId||msg.clientID||'';
+  if(msg.action && String(msg.action).toLowerCase()==='leave'){
+    const state=getRoomState(room);
+    if(state.typing && state.typing.size){
+      const key=inboxTypingKey(msg.data||{},clientKey);
+      let removed=false;
+      if(key && state.typing.delete(key)) removed=true;
+      if(!removed && clientKey){
+        const fallbackKey='c'+String(clientKey);
+        if(state.typing.delete(fallbackKey)) removed=true;
+        if(!removed){
+          state.typing.forEach((info,mapKey)=>{
+            if(!removed && info && info.client && info.client===clientKey){ state.typing.delete(mapKey); removed=true; }
+          });
+        }
+      }
+      if(removed) updateRoomTypingDisplay(room);
+    }
+    return;
+  }
+  const data=(msg.data && typeof msg.data==='object')?msg.data:{};
+  const type=(data.type||'').toLowerCase();
+  const hasTyping=Object.prototype.hasOwnProperty.call(data,'typing');
+  if(type && type!=='typing' && !hasTyping) return;
+  const payload=Object.assign({},data,{type:'typing',client_id:clientKey,project:projectId});
+  if(!('typing' in payload)) payload.typing=true;
+  applyRoomTyping(room,payload);
+}
+
 function applyRoomMessage(room,payload){
   if(!room || !payload) return;
   const role=(room.dataset.role||'other').toLowerCase();
@@ -2483,6 +2916,7 @@ function applyRoomMessage(room,payload){
   if(role==='other') return;
 
   const fromUser=parseInt(payload.user||payload.user_id||payload.userId||0,10);
+  if(fromUser) clearRoomTypingByUser(room,fromUser);
   if(fromUser && myUserId && fromUser===myUserId) return;
 
   const roleStatus=extractRoleStatus(payload,role);
@@ -2545,11 +2979,12 @@ function handleInboxPayload(payload,hintProject){
   if(!room) return;
   payload.__inboxHandled=true;
   const typeRaw=String(payload.type||payload.name||'').toLowerCase();
-  if(typeRaw!=='read_receipt'){
+  if(typeRaw!=='read_receipt' && typeRaw!=='typing'){
     const bumpAt=payload.at||payload.published_at||payload.created_at||Date.now();
     bumpRoom(projectId,bumpAt);
   }
   if(typeRaw==='read_receipt') applyRoomReadReceipt(room,payload);
+  else if(typeRaw==='typing') applyRoomTyping(room,payload);
   else applyRoomMessage(room,payload);
 }
 
@@ -2619,7 +3054,19 @@ function formatTimestamp(date){
   if(window.ELXAO_CHAT_FORMAT_DATE) return window.ELXAO_CHAT_FORMAT_DATE(date,'—');
   return date.toLocaleString();
 }
-function updateMetaText(room,date){ const meta=room.querySelector('.meta'); if(meta && date instanceof Date && !isNaN(date.getTime())) meta.textContent=formatTimestamp(date); else if(meta && !meta.textContent) meta.textContent='—'; }
+function updateMetaText(room,date){
+  const meta=room.querySelector('.meta');
+  if(!meta) return;
+  const metaText=meta.querySelector('.meta-text');
+  let text='—';
+  if(date instanceof Date && !isNaN(date.getTime())) text=formatTimestamp(date);
+  if(metaText) metaText.textContent=text;
+  meta.dataset.default=text;
+  if(!meta.classList.contains('is-typing')){
+    const typingEl=meta.querySelector('.typing');
+    if(typingEl) typingEl.hidden=true;
+  }
+}
 function setRoomActivity(room,source){ const date=parseTimestamp(source); if(!date) return; room.dataset.timestamp=String(date.getTime()); room.dataset.latest=date.toISOString(); updateMetaText(room,date); }
 function bumpRoom(projectId,activity){
   if(!projectId) return; const key=String(projectId); const room=roomMap.get(key); if(!room) return;
@@ -2677,6 +3124,14 @@ function subscribeInbox(){
             handleInboxPayload(payload,projectId);
           });
           if(typeof unsubscribe==='function'){ channelCleanups.set(channelName,unsubscribe); }
+          const channel=(unsubscribe && unsubscribe.channel)?unsubscribe.channel:(client && client.channels?client.channels.get(channelName):null);
+          if(channel && channel.presence && typeof channel.presence.subscribe==='function'){
+            const presenceHandler=function(msg){ handleInboxPresence(projectId,msg); };
+            Promise.resolve(channel.presence.subscribe(['enter','update','leave'],presenceHandler)).catch(()=>{});
+            const existingCleanup=presenceCleanups.get(channelName);
+            if(existingCleanup){ try{ existingCleanup(); }catch(e){} presenceCleanups.delete(channelName); }
+            presenceCleanups.set(channelName,function(){ try{ channel.presence.unsubscribe(['enter','update','leave'],presenceHandler); }catch(e){} });
+          }
         });
       }).catch(()=>{ startFallbackPolling(true); });
     })
@@ -2706,6 +3161,7 @@ if(window.ELXAO_CHAT_BUS.channel && window.ELXAO_CHAT_BUS.channel.addEventListen
 
 registerCleanup(stopFallbackPolling);
 registerCleanup(function(){ channelCleanups.forEach(function(unsub){ try{ unsub(); }catch(e){} }); channelCleanups.clear(); });
+registerCleanup(function(){ presenceCleanups.forEach(function(unsub){ try{ unsub(); }catch(e){} }); presenceCleanups.clear(); });
 
 const observer=new MutationObserver(function(){ if(!document.body.contains(root)){ observer.disconnect(); runCleanup(); } });
 observer.observe(document.body,{childList:true,subtree:true});
