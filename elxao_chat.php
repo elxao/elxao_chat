@@ -816,7 +816,10 @@ ob_start();?>
 #elxao-chat-<?php echo $pid;?> .chat-line{display:flex;gap:8px;align-items:flex-start;margin-bottom:8px;padding:6px 10px;border-radius:10px;transition:background-color .25s ease}
 #elxao-chat-<?php echo $pid;?> .chat-line:last-child{margin-bottom:0}
 #elxao-chat-<?php echo $pid;?> .chat-line.is-unread{background:var(--chat-unread-bg)}
-#elxao-chat-<?php echo $pid;?> .chat-line .chat-text{flex:1;color:inherit;word-break:break-word;white-space:pre-wrap}
+#elxao-chat-<?php echo $pid;?> .chat-line .chat-content{flex:1;display:flex;flex-direction:column;gap:4px}
+#elxao-chat-<?php echo $pid;?> .chat-line .chat-text{color:inherit;word-break:break-word;white-space:pre-wrap}
+#elxao-chat-<?php echo $pid;?> .chat-line .chat-timestamp{font-size:12px;color:var(--chat-read-unread);}
+#elxao-chat-<?php echo $pid;?> .chat-line .chat-timestamp:empty{display:none}
 #elxao-chat-<?php echo $pid;?> .chat-read-indicator{width:10px;height:10px;border-radius:999px;background:var(--chat-read-unread);margin-top:6px;flex:0 0 10px;box-shadow:0 0 0 1px rgba(0,0,0,0.35)}
 #elxao-chat-<?php echo $pid;?> .chat-read-indicator.chat-read-indicator--unread{background:var(--chat-read-unread)}
 #elxao-chat-<?php echo $pid;?> .chat-read-indicator.is-hidden{opacity:0;visibility:hidden}
@@ -1813,6 +1816,13 @@ function stopFallbackPolling(){
   fallbackInFlight=false;
 }
 
+function formatMessageTimestamp(value){
+  const parsed=parseTimestamp(value);
+  if(!parsed) return '';
+  const formatted=formatTimestamp(parsed);
+  return formatted && formatted!=='—'?formatted:'';
+}
+
 /* ---------- append lines (with view-based observing) ---------- */
 function appendChatLine(source,options){
   if(!source || !list) return;
@@ -1863,6 +1873,11 @@ function appendChatLine(source,options){
     while(node.firstChild){ node.removeChild(node.firstChild); }
     node.appendChild(createTextFragment(text));
   };
+  const ensureTimestamp=function(node,value){
+    if(!node) return;
+    const formatted=formatMessageTimestamp(value);
+    ensureTextContent(node,formatted||'');
+  };
 
   if(existing){
     const payload=existing.__chatPayload||{};
@@ -1872,6 +1887,8 @@ function appendChatLine(source,options){
     if(indicator) applyIndicatorState(indicator,determineIndicator(merged,role));
     const textNode=existing.querySelector('.chat-text');
     ensureTextContent(textNode,fullText);
+    const timestampNode=existing.querySelector('.chat-timestamp');
+    ensureTimestamp(timestampNode,stamp);
     existing.dataset.role=role;
     if(stamp) existing.dataset.at=stamp; else delete existing.dataset.at;
     if(messageId) existing.dataset.messageId=messageId;
@@ -1889,10 +1906,17 @@ function appendChatLine(source,options){
   const indicator=document.createElement('span');
   applyIndicatorState(indicator,determineIndicator(data,role));
   line.appendChild(indicator);
+  const contentWrapper=document.createElement('div');
+  contentWrapper.className='chat-content';
   const textNode=document.createElement('div');
   textNode.className='chat-text';
   ensureTextContent(textNode,fullText);
-  line.appendChild(textNode);
+  contentWrapper.appendChild(textNode);
+  const timestampNode=document.createElement('div');
+  timestampNode.className='chat-timestamp';
+  ensureTimestamp(timestampNode,stamp);
+  contentWrapper.appendChild(timestampNode);
+  line.appendChild(contentWrapper);
   line.__chatPayload=data;
   line.dataset.role=role;
   if(stamp) line.dataset.at=stamp; else delete line.dataset.at;
@@ -1945,6 +1969,11 @@ function applyServerAck(resp){
     if(ackAt){
       payload.at=ackAt;
       line.dataset.at=String(ackAt);
+      const timestampNode=line.querySelector('.chat-timestamp');
+      if(timestampNode){
+        const formatted=formatMessageTimestamp(ackAt);
+        timestampNode.textContent=formatted||'';
+      }
     }
     if(ackTimes){
       payload.reads=payload.reads||{};
