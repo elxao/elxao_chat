@@ -405,20 +405,25 @@ function elxao_chat_request_ably_token($uid,array $capability,$ttl_ms=3600000){
         $body['ttl']=(int)$ttl_ms;
     }
 
-    $ch=curl_init($endpoint);
-    curl_setopt_array($ch,[
-        CURLOPT_HTTPHEADER=>['Content-Type: application/json','Authorization: Basic '.base64_encode(ELXAO_ABLY_KEY)],
-        CURLOPT_POST=>true, CURLOPT_POSTFIELDS=>wp_json_encode($body),
-        CURLOPT_RETURNTRANSFER=>true, CURLOPT_TIMEOUT=>10
-    ]);
-    $resp=curl_exec($ch);
-    $code=curl_getinfo($ch,CURLINFO_HTTP_CODE);
-    curl_close($ch);
+    $request_args=[
+        'headers'=>[
+            'Content-Type'=>'application/json',
+            'Authorization'=>'Basic '.base64_encode(ELXAO_ABLY_KEY),
+        ],
+        'body'=>wp_json_encode($body),
+        'timeout'=>10,
+    ];
 
+    $response=wp_remote_post($endpoint,$request_args);
+    if(is_wp_error($response))
+        return new WP_Error('token_fail','Token error',['status'=>500]);
+
+    $code=(int)wp_remote_retrieve_response_code($response);
     if($code<200||$code>=300)
         return new WP_Error('token_fail','Token error',['status'=>500]);
 
-    $data=json_decode($resp,true);
+    $resp_body=wp_remote_retrieve_body($response);
+    $data=json_decode($resp_body,true);
     if(!is_array($data))
         return new WP_Error('token_fail','Token error',['status'=>500]);
 
@@ -744,13 +749,19 @@ function elxao_chat_rest_window(WP_REST_Request $r){
 function elxao_chat_publish_to_ably($chName,$payload){
     if ( ! defined('ELXAO_ABLY_KEY') || ! ELXAO_ABLY_KEY ) return false;
     $url='https://rest.ably.io/channels/'.rawurlencode($chName).'/messages';
-    $ch=curl_init($url);
-    curl_setopt_array($ch,[
-        CURLOPT_HTTPHEADER=>['Content-Type: application/json','Authorization: Basic '.base64_encode(ELXAO_ABLY_KEY)],
-        CURLOPT_POST=>true, CURLOPT_POSTFIELDS=>wp_json_encode($payload),
-        CURLOPT_RETURNTRANSFER=>true, CURLOPT_TIMEOUT=>10
-    ]);
-    curl_exec($ch); curl_close($ch);
+    $args=[
+        'headers'=>[
+            'Content-Type'=>'application/json',
+            'Authorization'=>'Basic '.base64_encode(ELXAO_ABLY_KEY),
+        ],
+        'body'=>wp_json_encode($payload),
+        'timeout'=>10,
+    ];
+
+    $response=wp_remote_post($url,$args);
+    if(is_wp_error($response)) return false;
+    $code=(int)wp_remote_retrieve_response_code($response);
+    return $code>=200 && $code<300;
 }
 
 /* ===========================================================
