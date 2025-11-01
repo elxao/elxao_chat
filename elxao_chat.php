@@ -366,6 +366,14 @@ add_action('rest_api_init',function(){
         'methods'=>'POST','callback'=>'elxao_chat_rest_mark_read',
         'permission_callback'=>fn()=>is_user_logged_in()
     ]);
+    register_rest_route('elxao/v1','/typing',[
+        'methods'=>'POST','callback'=>'elxao_chat_rest_typing',
+        'permission_callback'=>fn()=>is_user_logged_in()
+    ]);
+    register_rest_route('elxao/v1','/typing',[
+        'methods'=>'GET','callback'=>'elxao_chat_rest_typing_state',
+        'permission_callback'=>fn()=>is_user_logged_in()
+    ]);
     register_rest_route('elxao/v1','/chat-token',[
         'methods'=>'GET','callback'=>'elxao_chat_rest_token',
         'permission_callback'=>fn()=>is_user_logged_in()
@@ -482,6 +490,7 @@ function elxao_chat_rest_send(WP_REST_Request $r){
             ],
         ]
     ]);
+    elxao_chat_clear_typing_state($pid,$uid);
     return new WP_REST_Response([
         'ok'          => true,
         'project_id'  => $pid,
@@ -743,6 +752,70 @@ function elxao_chat_rest_window(WP_REST_Request $r){
     return new WP_REST_Response(['html'=>$html],200);
 }
 
+function elxao_chat_rest_typing(WP_REST_Request $r){
+    $pid=(int)$r->get_param('project_id');
+    $uid=get_current_user_id();
+    if(!$pid || !elxao_chat_user_can_access_project($pid,$uid))
+        return new WP_Error('forbidden','Not allowed',['status'=>403]);
+
+    $raw=$r->get_param('is_typing');
+    if($raw===null) $raw=$r->get_param('typing');
+    if($raw===null) $raw=$r->get_param('active');
+    $active=elxao_chat_interpret_typing_flag_php($raw);
+    $user=get_userdata($uid);
+    $display=$user?$user->display_name:('User '.$uid);
+    $role=elxao_chat_role_for_user($pid,$uid);
+
+    elxao_chat_update_typing_state($pid,$uid,$display,$role,$active);
+
+    $payload=[
+        'type'=>'typing',
+        'project'=>$pid,
+        'project_id'=>$pid,
+        'user'=>$uid,
+        'user_id'=>$uid,
+        'user_display'=>$display,
+        'role'=>$role,
+        'is_typing'=>$active,
+        'timestamp'=>current_time('mysql'),
+    ];
+
+    elxao_chat_publish_to_ably(elxao_chat_room_id($pid),[
+        'name'=>'typing',
+        'data'=>$payload,
+    ]);
+
+    $snapshot=elxao_chat_get_typing_snapshot($pid);
+
+    return new WP_REST_Response([
+        'ok'=>true,
+        'project_id'=>$pid,
+        'typing'=>$snapshot,
+    ],200);
+}
+
+function elxao_chat_rest_typing_state(WP_REST_Request $r){
+    $uid=get_current_user_id();
+    $single=(int)$r->get_param('project_id');
+    $ids=$r->get_param('project_ids');
+    if(is_null($ids)) $ids=[];
+    if(!is_array($ids)) $ids=$ids!==null?[$ids]:[];
+    if($single) $ids[]=$single;
+    $ids=array_unique(array_map('intval',$ids));
+
+    $projects=[];
+    foreach($ids as $pid){
+        if(!$pid) continue;
+        if(!elxao_chat_user_can_access_project($pid,$uid)) continue;
+        $projects[]=[
+            'project_id'=>$pid,
+            'typing'=>elxao_chat_get_typing_snapshot($pid),
+        ];
+    }
+
+    return new WP_REST_Response(['projects'=>$projects],200);
+}
+
 /* ===========================================================
    Ably PUBLISHER
    =========================================================== */
@@ -762,6 +835,98 @@ function elxao_chat_publish_to_ably($chName,$payload){
     if(is_wp_error($response)) return false;
     $code=(int)wp_remote_retrieve_response_code($response);
     return $code>=200 && $code<300;
+}
+
+function elxao_chat_interpret_typing_flag_php($value){
+    if(is_bool($value)) return $value;
+    if(is_numeric($value)) return ((float)$value)>0;
+    if(is_string($value)){
+        $normalized=strtolower(trim($value));
+        if($normalized==='') return false;
+        if(in_array($normalized,['true','1','yes','y','on'],true)) return true;
+        if(in_array($normalized,['false','0','no','n','off'],true)) return false;
+    }
+    if(is_array($value) && isset($value['active'])) return elxao_chat_interpret_typing_flag_php($value['active']);
+    return (bool)$value;
+}
+
+function elxao_chat_typing_transient_key($pid){
+    return '_elxao_chat_typing_'.(int)$pid;
+}
+
+function elxao_chat_prune_typing_entries(array $entries){
+    $now=time();
+    foreach($entries as $uid=>$entry){
+        $expires=isset($entry['expires'])?(int)$entry['expires']:0;
+        if($expires && $expires<$now){
+            unset($entries[$uid]);
+        }
+    }
+    return $entries;
+}
+
+function elxao_chat_update_typing_state($pid,$uid,$display='',$role='',$active=true){
+    $pid=(int)$pid;
+    $uid=(int)$uid;
+    if(!$pid || !$uid) return [];
+    $key=elxao_chat_typing_transient_key($pid);
+    $entries=get_transient($key);
+    if(!is_array($entries)) $entries=[];
+    $entries=elxao_chat_prune_typing_entries($entries);
+    if($active){
+        $entries[$uid]=[
+            'user_display'=>$display?:('User '.$uid),
+            'role'=>$role?:'other',
+            'timestamp'=>current_time('mysql'),
+            'expires'=>time()+8,
+        ];
+    } else {
+        unset($entries[$uid]);
+    }
+    if($entries){
+        set_transient($key,$entries,15);
+    } else {
+        delete_transient($key);
+    }
+    return $entries;
+}
+
+function elxao_chat_get_typing_snapshot($pid){
+    $pid=(int)$pid;
+    if(!$pid) return [];
+    $key=elxao_chat_typing_transient_key($pid);
+    $entries=get_transient($key);
+    if(!is_array($entries)) $entries=[];
+    $entries=elxao_chat_prune_typing_entries($entries);
+    if($entries){
+        set_transient($key,$entries,15);
+    } else {
+        delete_transient($key);
+    }
+    $snapshot=[];
+    foreach($entries as $uid=>$entry){
+        $uid=(int)$uid;
+        if(!$uid) continue;
+        $display=isset($entry['user_display'])?$entry['user_display']:('User '.$uid);
+        $role=isset($entry['role'])?$entry['role']:'other';
+        $snapshot[]=[
+            'type'=>'typing',
+            'project'=>$pid,
+            'project_id'=>$pid,
+            'user'=>$uid,
+            'user_id'=>$uid,
+            'user_display'=>$display,
+            'role'=>$role,
+            'is_typing'=>true,
+            'active'=>true,
+            'timestamp'=>isset($entry['timestamp'])?$entry['timestamp']:current_time('mysql'),
+        ];
+    }
+    return $snapshot;
+}
+
+function elxao_chat_clear_typing_state($pid,$uid){
+    elxao_chat_update_typing_state($pid,$uid,'','',false);
 }
 
 /* ===========================================================
@@ -893,6 +1058,7 @@ let typingIndicatorRow=null;
 let typingIndicatorText=null;
 let realtimeChannel=null;
 const localTypingState={active:false,timeout:null,lastSent:0};
+const serverTypingState={active:false,last:0};
 
 if(ta){
   ta.setAttribute('rows','1');
@@ -1560,6 +1726,29 @@ function applyTypingPayload(data){
   }
 }
 
+function syncServerTypingState(isTyping){
+  if(!projectId || !rest) return;
+  const now=Date.now();
+  if(isTyping){
+    if(serverTypingState.active && (now-serverTypingState.last)<TYPING_REFRESH_INTERVAL) return;
+  } else {
+    if(!serverTypingState.active) return;
+  }
+  const url=rest+'elxao/v1/typing';
+  const payload={ project_id:projectId, is_typing:!!isTyping };
+  const options={
+    method:'POST',
+    credentials:'same-origin',
+    headers:Object.assign({'Content-Type':'application/json'},hdr),
+    body:JSON.stringify(payload),
+    keepalive:!isTyping,
+  };
+  try{ fetch(url,options).catch(()=>{}); }
+  catch(e){ }
+  serverTypingState.active=!!isTyping;
+  serverTypingState.last=isTyping?now:0;
+}
+
 function publishTypingState(isTyping){
   const now=new Date();
   const payload={
@@ -1575,6 +1764,7 @@ function publishTypingState(isTyping){
     project_id:projectId,
     timestamp:now.toISOString()
   };
+  syncServerTypingState(!!isTyping);
   if(!realtimeChannel || typeof realtimeChannel.publish!=='function'){
     if(window.ELXAO_CHAT_BUS && typeof window.ELXAO_CHAT_BUS.emit==='function'){
       try{ window.ELXAO_CHAT_BUS.emit({ project:projectId, payload:payload }); }
@@ -2141,6 +2331,45 @@ function handleHistoryScroll(){
 }
 
 /* ---------- polling fallback ---------- */
+function fetchTypingSnapshot(){
+  if(!rest || !pid) return Promise.resolve();
+  const url=rest+'elxao/v1/typing?project_id='+encodeURIComponent(pid);
+  return fetch(url,{credentials:'same-origin',headers:hdr})
+    .then(function(r){ if(!r.ok) throw new Error(''+r.status); return r.json(); })
+    .then(function(data){
+      const activeKeys=new Set();
+      const projects=Array.isArray(data && data.projects)?data.projects:[];
+      if(projects.length){
+        projects.forEach(function(entry){
+          const projectValue=entry && (entry.project_id||entry.project||entry.id);
+          const projectNumeric=parseInt(projectValue,10)||0;
+          if(projectNumeric && projectNumeric!==projectId) return;
+          const typingList=Array.isArray(entry && entry.typing)?entry.typing:[];
+          typingList.forEach(function(item){
+            if(!item) return;
+            const payload=Object.assign({type:'typing',project:projectId,project_id:projectId},item);
+            applyTypingPayload(payload);
+            const uid=parseInt(payload.user||payload.user_id||payload.userId||0,10);
+            if(uid) activeKeys.add(String(uid));
+          });
+        });
+      } else if(Array.isArray(data && data.typing)){
+        data.typing.forEach(function(item){
+          if(!item) return;
+          const payload=Object.assign({type:'typing',project:projectId,project_id:projectId},item);
+          applyTypingPayload(payload);
+          const uid=parseInt(payload.user||payload.user_id||payload.userId||0,10);
+          if(uid) activeKeys.add(String(uid));
+        });
+      }
+      typingUsers.forEach(function(_info,key){
+        if(!activeKeys.has(key)) clearTypingEntry(key);
+      });
+      renderTypingIndicator();
+    })
+    .catch(function(){});
+}
+
 function pollForUpdates(){
   if(fallbackInFlight) return Promise.resolve();
   if(!pid || !rest) return Promise.resolve();
@@ -2148,7 +2377,7 @@ function pollForUpdates(){
   if(latestAt) params.after=latestAt;
   if(latestId) params.after_id=latestId;
   fallbackInFlight=true;
-  return load(params)
+  const messagePromise=load(params)
     .then(function(r){
       if(r && typeof r==='object'){
         let readsChanged=false;
@@ -2161,7 +2390,9 @@ function pollForUpdates(){
         }
       }
     })
-    .catch(function(){})
+    .catch(function(){});
+  const typingPromise=fetchTypingSnapshot();
+  return Promise.all([messagePromise,typingPromise])
     .finally(function(){ fallbackInFlight=false; });
 }
 function isValidRealtimeToken(token){
@@ -2994,9 +3225,51 @@ function refreshInboxState(){
     .catch(()=>{});
 }
 
+function refreshInboxTyping(){
+  if(!rest || !roomMap.size) return Promise.resolve();
+  const params=[];
+  roomMap.forEach((_room,pid)=>{ if(pid) params.push('project_ids[]='+encodeURIComponent(pid)); });
+  if(!params.length) return Promise.resolve();
+  return fetch(rest+'elxao/v1/typing?'+params.join('&'),{ credentials:'same-origin', headers:headers })
+    .then(r=>{ if(!r.ok) throw new Error(''+r.status); return r.json(); })
+    .then(data=>{
+      const projectMap=new Map();
+      const projects=Array.isArray(data && data.projects)?data.projects:[];
+      projects.forEach(function(entry){
+        if(!entry) return;
+        const pidValue=entry.project_id||entry.project||entry.id;
+        const projectId=parseInt(pidValue,10)||0;
+        if(!projectId) return;
+        const list=Array.isArray(entry.typing)?entry.typing:[];
+        projectMap.set(String(projectId),list);
+      });
+      roomMap.forEach(function(room,key){
+        const projectId=parseInt(key,10)||0;
+        const entries=projectMap.get(key)||[];
+        const activeKeys=new Set();
+        entries.forEach(function(item){
+          if(!item) return;
+          const payload=Object.assign({type:'typing',project:projectId},item);
+          applyRoomTyping(room,payload);
+          const uid=parseInt(payload.user||payload.user_id||payload.userId||0,10);
+          if(uid) activeKeys.add(String(uid));
+        });
+        const state=roomTypingState.get(key);
+        if(state && state.users){
+          Array.from(state.users.keys()).forEach(function(userKey){
+            if(!activeKeys.has(userKey)) clearRoomTyping(projectId,parseInt(userKey,10));
+          });
+        }
+      });
+    })
+    .catch(()=>{});
+}
+
 function startFallbackPolling(immediate){
   if(fallbackTimer) return;
-  const runner=function(){ refreshInboxState(); };
+  const runner=function(){
+    Promise.resolve(refreshInboxState()).finally(()=>{ refreshInboxTyping(); });
+  };
   if(immediate) runner();
   fallbackTimer=setInterval(runner,FALLBACK_INTERVAL);
 }
