@@ -1404,11 +1404,16 @@ let fallbackActive=false;
 let fallbackTimer=null;
 let fallbackInFlight=false;
 let optimisticLatestReadMs=0;
+let connectionCleanup=null;
+let realtimeRetryTimer=null;
+let realtimeRetryDelay=0;
 const FALLBACK_INTERVAL=4000;
 const DEBUG=false;
 const HISTORY_PAGE_SIZE=5;
 const HISTORY_INITIAL_LIMIT=HISTORY_PAGE_SIZE;
 const HISTORY_SCROLL_OFFSET=48;
+const REALTIME_RETRY_BASE=5000;
+const REALTIME_RETRY_MAX=60000;
 
 /* ---------- typing indicator helpers ---------- */
 function typingEventPayload(active){
@@ -1942,6 +1947,7 @@ function subscribeRealtime(tokenDetails){
   }
   return window.ELXAO_ABLY.ensureClient(tokenDetails).then(function(client){
     if(realtimeCleanup){ try{ realtimeCleanup(); }catch(e){} realtimeCleanup=null; }
+    if(connectionCleanup){ try{ connectionCleanup(); }catch(e){} connectionCleanup=null; }
     const channelCleanup=window.ELXAO_ABLY.registerChannel(client,room,projectId,handleRealtimePayload);
     ablyChannel=(channelCleanup && channelCleanup.channel)?channelCleanup.channel:(client && client.channels?client.channels.get(room):null);
     ablyClientId=(client && client.auth && client.auth.clientId)?client.auth.clientId:'';
@@ -1954,9 +1960,11 @@ function subscribeRealtime(tokenDetails){
       presenceCleanup=function(){ try{ ablyChannel.presence.unsubscribe(['enter','update','leave'],presenceHandler); }catch(e){} };
     }
     if(ablyChannel && lastTypingState) broadcastTypingState(true,true);
+    connectionCleanup=attachConnectionMonitor(client);
     realtimeCleanup=function(){
       if(presenceCleanup){ try{ presenceCleanup(); }catch(e){} presenceCleanup=null; }
       if(typeof channelCleanup==='function'){ try{ channelCleanup(); }catch(e){} }
+      if(connectionCleanup){ try{ connectionCleanup(); }catch(e){} connectionCleanup=null; }
       ablyChannel=null;
       ablyClientId='';
       presenceEntered=false;
@@ -1964,11 +1972,13 @@ function subscribeRealtime(tokenDetails){
     };
     realtimeReady=true;
     stopFallbackPolling();
+    stopRealtimeRetry();
   });
 }
 
 function cleanup(){
   if(realtimeCleanup){ try{ realtimeCleanup(); }catch(e){} realtimeCleanup=null; }
+  else if(connectionCleanup){ try{ connectionCleanup(); }catch(e){} connectionCleanup=null; }
   realtimeReady=false;
   latestSeenAtMs=0;
   optimisticLatestReadMs=0;
@@ -1992,6 +2002,7 @@ function cleanup(){
   loadingOlder=false;
   if(busCleanup){ try{ busCleanup(); }catch(e){} busCleanup=null; }
   stopFallbackPolling();
+  stopRealtimeRetry();
   if(observer){
     observer.disconnect();
     observed.clear();
@@ -2171,6 +2182,88 @@ function stopFallbackPolling(){
   fallbackActive=false;
   if(fallbackTimer){ clearTimeout(fallbackTimer); fallbackTimer=null; }
   fallbackInFlight=false;
+}
+
+function ensureRealtimeRetryDefaults(){
+  if(!realtimeRetryDelay || realtimeRetryDelay<REALTIME_RETRY_BASE) realtimeRetryDelay=REALTIME_RETRY_BASE;
+}
+function stopRealtimeRetry(){
+  if(realtimeRetryTimer){ clearTimeout(realtimeRetryTimer); realtimeRetryTimer=null; }
+  realtimeRetryDelay=REALTIME_RETRY_BASE;
+}
+function scheduleRealtimeRetry(delay){
+  if(realtimeRetryTimer) return;
+  if(!root || (root.isConnected===false && !document.body.contains(root))) return;
+  ensureRealtimeRetryDefaults();
+  let wait;
+  if(typeof delay==='number' && delay>=0){
+    wait=delay;
+  }else{
+    wait=realtimeRetryDelay;
+    realtimeRetryDelay=Math.min(REALTIME_RETRY_MAX, realtimeRetryDelay*2);
+  }
+  realtimeRetryTimer=setTimeout(()=>{
+    realtimeRetryTimer=null;
+    attemptRealtimeConnection(true);
+  },wait);
+}
+function handleRealtimeFailure(){
+  realtimeReady=false;
+  presenceEntered=false;
+  presenceInitPromise=null;
+  if(!fallbackActive) startFallbackPolling(1000);
+  else scheduleFallback(1000);
+  scheduleRealtimeRetry();
+  if(realtimeCleanup){
+    try{ realtimeCleanup(); }
+    catch(e){}
+    realtimeCleanup=null;
+  }
+}
+
+function attachConnectionMonitor(client){
+  if(!client || !client.connection || typeof client.connection.on!=='function') return function(){};
+  const handler=function(state){
+    const raw=(state && state.current!==undefined)?state.current:state;
+    const text=typeof raw==='string'?raw:String(raw||'');
+    const current=text.toLowerCase();
+    if(current==='connected'){
+      realtimeReady=true;
+      stopFallbackPolling();
+      stopRealtimeRetry();
+      if(lastTypingState) broadcastTypingState(true,true);
+    }else if(current==='suspended' || current==='failed'){
+      handleRealtimeFailure();
+    }else if(current==='disconnected'){
+      if(!fallbackActive) startFallbackPolling(1000);
+      else scheduleFallback(1000);
+      scheduleRealtimeRetry();
+    }
+  };
+  client.connection.on(handler);
+  return function(){
+    try{ client.connection.off(handler); }
+    catch(e){}
+  };
+}
+
+function attemptRealtimeConnection(force){
+  if(!force && realtimeReady) return Promise.resolve(true);
+  if(!root || (root.isConnected===false && !document.body.contains(root))) return Promise.resolve(false);
+  return token()
+    .then(function(tk){
+      if(!isValidRealtimeToken(tk)) throw (tk && tk.message)?new Error(tk.message):new Error('token');
+      return subscribeRealtime(tk);
+    })
+    .then(function(){
+      stopRealtimeRetry();
+      return true;
+    })
+    .catch(function(err){
+      console.warn('ELXAO chat realtime unavailable',err);
+      handleRealtimeFailure();
+      return false;
+    });
 }
 
 /* ---------- append lines (with view-based observing) ---------- */
@@ -2412,9 +2505,7 @@ function applyServerAck(resp){
   }
 }
 
-token()
-  .then(function(tk){ if(!isValidRealtimeToken(tk)) throw (tk&&tk.message)?new Error(tk.message):new Error('token'); return subscribeRealtime(tk); })
-  .catch(function(err){ console.warn('ELXAO chat realtime unavailable',err); startFallbackPolling(1000); });
+attemptRealtimeConnection();
 
 load({limit:HISTORY_INITIAL_LIMIT,order:'desc'})
   .then(function(r){
@@ -2601,6 +2692,13 @@ const FALLBACK_INTERVAL=45000;
 const TYPING_IDLE_MS=2200;
 const TYPING_SWEEP_MS=600;
 let fallbackTimer=null;
+let realtimeReady=false;
+let realtimeInFlight=false;
+let realtimeRetryTimer=null;
+let realtimeRetryDelay=0;
+let connectionCleanup=null;
+const REALTIME_RETRY_BASE=5000;
+const REALTIME_RETRY_MAX=60000;
 
 /* ---- shared helpers (may already exist) ---- */
 if(!window.ELXAO_CHAT_FORMAT_DATE){
@@ -3020,6 +3118,69 @@ function stopFallbackPolling(){
   fallbackTimer=null;
 }
 
+function ensureRealtimeRetryDefaults(){
+  if(!realtimeRetryDelay || realtimeRetryDelay<REALTIME_RETRY_BASE) realtimeRetryDelay=REALTIME_RETRY_BASE;
+}
+function stopRealtimeRetry(){
+  if(realtimeRetryTimer){ clearTimeout(realtimeRetryTimer); realtimeRetryTimer=null; }
+  realtimeRetryDelay=REALTIME_RETRY_BASE;
+}
+function scheduleRealtimeRetry(delay){
+  if(realtimeRetryTimer) return;
+  if(!root || (root.isConnected===false && !document.body.contains(root))) return;
+  ensureRealtimeRetryDefaults();
+  let wait;
+  if(typeof delay==='number' && delay>=0){
+    wait=delay;
+  }else{
+    wait=realtimeRetryDelay;
+    realtimeRetryDelay=Math.min(REALTIME_RETRY_MAX,realtimeRetryDelay*2);
+  }
+  realtimeRetryTimer=setTimeout(function(){
+    realtimeRetryTimer=null;
+    subscribeInbox();
+  },wait);
+}
+function attachConnectionMonitor(client){
+  if(!client || !client.connection || typeof client.connection.on!=='function') return function(){};
+  const handler=function(state){
+    const raw=(state && state.current!==undefined)?state.current:state;
+    const text=typeof raw==='string'?raw:String(raw||'');
+    const current=text.toLowerCase();
+    if(current==='connected'){
+      realtimeReady=true;
+      stopFallbackPolling();
+      stopRealtimeRetry();
+    }else if(current==='suspended' || current==='failed'){
+      handleRealtimeFailure();
+    }else if(current==='disconnected'){
+      if(!fallbackTimer) startFallbackPolling(true);
+      scheduleRealtimeRetry();
+    }
+  };
+  client.connection.on(handler);
+  return function(){
+    try{ client.connection.off(handler); }
+    catch(e){}
+  };
+}
+function handleRealtimeFailure(){
+  realtimeReady=false;
+  realtimeInFlight=false;
+  if(connectionCleanup){
+    try{ connectionCleanup(); }
+    catch(e){}
+    connectionCleanup=null;
+  }
+  channelCleanups.forEach(function(unsub){ try{ unsub(); }catch(e){} });
+  channelCleanups.clear();
+  presenceCleanups.forEach(function(unsub){ try{ unsub(); }catch(e){} });
+  presenceCleanups.clear();
+  if(!fallbackTimer) startFallbackPolling(true);
+  else refreshInboxState();
+  scheduleRealtimeRetry(REALTIME_RETRY_BASE);
+}
+
 rooms.forEach(function(room){
   const pid=room.getAttribute('data-project');
   if(pid) roomMap.set(String(pid),room);
@@ -3104,17 +3265,27 @@ rooms.forEach(function(room){ room.addEventListener('click',function(){ loadRoom
 
 /* subscribe to bump rooms on any chat traffic */
 function subscribeInbox(){
+  if(realtimeInFlight) return;
   if(!rooms.length || !rest) return;
   const params=[]; const seen=new Set();
   rooms.forEach(function(room){ const pid=room.getAttribute('data-project'); if(!pid || seen.has(pid)) return; seen.add(pid); params.push('project_ids[]='+encodeURIComponent(pid)); });
   if(!params.length) return;
+  realtimeInFlight=true;
   fetch(rest+'elxao/v1/inbox-token?'+params.join('&'),{ credentials:'same-origin', headers:headers })
     .then(r=>{ if(!r.ok) throw new Error(''+r.status); return r.json(); })
     .then(token=>{
-      if(!token || token.error){ startFallbackPolling(true); return; }
-      if(!window.ELXAO_ABLY.ensureClient){ startFallbackPolling(true); return; }
+      if(!token || token.error) throw new Error('token');
+      if(!window.ELXAO_ABLY || !window.ELXAO_ABLY.ensureClient) throw new Error('no-ably');
       return window.ELXAO_ABLY.ensureClient(token).then(function(client){
         stopFallbackPolling();
+        stopRealtimeRetry();
+        realtimeReady=true;
+        if(connectionCleanup){ try{ connectionCleanup(); }catch(e){} connectionCleanup=null; }
+        connectionCleanup=attachConnectionMonitor(client);
+        channelCleanups.forEach(function(unsub){ try{ unsub(); }catch(e){} });
+        channelCleanups.clear();
+        presenceCleanups.forEach(function(unsub){ try{ unsub(); }catch(e){} });
+        presenceCleanups.clear();
         const seenChannels=new Set();
         rooms.forEach(function(room){
           const channelName=room.getAttribute('data-room'); if(!channelName || seenChannels.has(channelName)) return;
@@ -3133,9 +3304,13 @@ function subscribeInbox(){
             presenceCleanups.set(channelName,function(){ try{ channel.presence.unsubscribe(['enter','update','leave'],presenceHandler); }catch(e){} });
           }
         });
-      }).catch(()=>{ startFallbackPolling(true); });
+      });
     })
-    .catch(()=>{ startFallbackPolling(true); });
+    .catch(function(err){
+      console.warn('ELXAO inbox realtime unavailable',err);
+      handleRealtimeFailure();
+    })
+    .finally(function(){ realtimeInFlight=false; });
 }
 
 function onChatEvent(ev){
@@ -3160,6 +3335,7 @@ if(window.ELXAO_CHAT_BUS.channel && window.ELXAO_CHAT_BUS.channel.addEventListen
 }
 
 registerCleanup(stopFallbackPolling);
+registerCleanup(stopRealtimeRetry);
 registerCleanup(function(){ channelCleanups.forEach(function(unsub){ try{ unsub(); }catch(e){} }); channelCleanups.clear(); });
 registerCleanup(function(){ presenceCleanups.forEach(function(unsub){ try{ unsub(); }catch(e){} }); presenceCleanups.clear(); });
 
