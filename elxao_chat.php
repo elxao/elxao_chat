@@ -827,7 +827,7 @@ ob_start();?>
 #elxao-chat-<?php echo $pid;?> .client { color:var(--chat-client) }
 #elxao-chat-<?php echo $pid;?> .pm     { color:var(--chat-pm) }
 #elxao-chat-<?php echo $pid;?> .admin  { color:var(--chat-admin) }
-#elxao-chat-<?php echo $pid;?> .chat-line{display:flex;gap:12px;align-items:flex-start;margin-bottom:12px;padding:14px 18px;border-radius:16px;background:#ffffff;border:1px solid rgba(15,23,42,0.08);box-shadow:0 8px 20px rgba(15,23,42,0.08);transition:box-shadow .2s ease,border-color .2s ease,transform .2s ease}
+#elxao-chat-<?php echo $pid;?> .chat-line{display:flex;gap:12px;align-items:flex-start;margin-bottom:12px;padding:14px 18px;border-radius:16px;background:#ffffff;border:1px solid rgba(15,23,42,0.08);box-shadow:0 8px 20px rgba(15,23,42,0.08);transition:box-shadow .2s ease,border-color .2s ease,transform .2s ease;width:fit-content;max-width:100%}
 #elxao-chat-<?php echo $pid;?> .chat-line:last-child{margin-bottom:0}
 #elxao-chat-<?php echo $pid;?> .chat-line:hover{transform:translateY(-2px);box-shadow:0 16px 32px rgba(15,23,42,0.08)}
 #elxao-chat-<?php echo $pid;?> .chat-line.is-unread{background:#ecfdf5;border-color:rgba(16,163,127,0.32);box-shadow:0 18px 32px rgba(16,163,127,0.16)}
