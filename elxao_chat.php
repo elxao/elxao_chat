@@ -802,7 +802,7 @@ ob_start();?>
     <div class="composer-input">
       <textarea rows="2" placeholder="Type your message..."></textarea>
       <button class="send" type="button" aria-label="Send message" title="Send">
-        <svg viewBox="0 0 24 24" width="20" height="20" fill="currentColor" aria-hidden="true">
+        <svg viewBox="0 0 24 24" width="24" height="24" fill="currentColor" aria-hidden="true">
           <path d="M2.01 21L23 12 2.01 3 2 10l15 2-15 2z"/>
         </svg>
       </button>
