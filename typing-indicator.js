@@ -20,6 +20,9 @@
       const room = chat.dataset.room;
       const myName = chat.dataset.myname || '';
       const myId = parseInt(chat.dataset.myid || '0', 10) || 0;
+      const restBase = chat.dataset.rest || '';
+      const restNonce = chat.dataset.nonce || '';
+      const projectId = parseInt(chat.dataset.project || '0', 10) || 0;
       if(!room) return;
 
       const indicator = document.createElement('div');
@@ -42,7 +45,8 @@
       let typingTimeoutId = null;
       const TYPING_DELAY_MS = 3000;
       let channel = null;
-
+      let clientPromise = null;
+      
       function updateIndicator(){
         const names = Array.from(typingUsers.values());
         if(names.length > 0){
@@ -82,8 +86,44 @@
 
       const ably = window.ELXAO_ABLY;
       if(!ably || !ably.ensureClient) return;
+      if(!restBase || !projectId) return;
 
-      ably.ensureClient().then(function(client){
+      const rest = /\/\s*$/.test(restBase) ? restBase : restBase + '/';
+      const headers = { 'Accept': 'application/json' };
+      if(restNonce) headers['X-WP-Nonce'] = restNonce;
+
+      function fetchRealtimeToken(){
+        const url = rest + 'elxao/v1/chat-token?project_id=' + encodeURIComponent(projectId);
+        return fetch(url, {
+          credentials: 'same-origin',
+          headers: headers
+        }).then(function(resp){
+          if(!resp || !resp.ok) throw new Error('token');
+          return resp.json();
+        });
+      }
+
+      function isValidToken(token){
+        if(!token || typeof token !== 'object') return false;
+        if(token.error || token.code) return false;
+        return !!(token.token || token.keyName || token.expires || token.issued);
+      }
+
+      function ensureRealtimeClient(){
+        if(clientPromise) return clientPromise;
+        clientPromise = fetchRealtimeToken()
+          .then(function(token){
+            if(!isValidToken(token)) throw new Error('token');
+            return ably.ensureClient(token);
+          })
+          .catch(function(err){
+            clientPromise = null;
+            throw err;
+          });
+        return clientPromise;
+      }
+
+      ensureRealtimeClient().then(function(client){
         channel = client.channels.get(room);
         channel.presence.enter({ typing: false, name: myName })
           .then(function(){ syncTypingState(); })
