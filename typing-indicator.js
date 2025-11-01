@@ -156,6 +156,7 @@
     const TYPING_DELAY_MS = 3000;
     const TYPING_STALE_MS = 5000;
     const CLEANUP_INTERVAL_MS = 1500;
+    const CONNECTION_RETRY_MS = 2000;
     let typingState = false;
     let desiredTypingState = false;
     let typingTimeoutId = null;
@@ -165,6 +166,10 @@
     let localConnectionId = null;
     let syncingTypingState = false;
     let resyncRequested = false;
+    let presenceSubscribed = false;
+    let presenceEntered = false;
+    let reconnectTimerId = null;
+    let realtimeReady = false;
 
     function updateIndicator(){
       const names = [];
@@ -292,6 +297,155 @@
       }, 200);
     }
 
+    function clearReconnectTimer(){
+      if(!reconnectTimerId) return;
+      clearTimeout(reconnectTimerId);
+      reconnectTimerId = null;
+    }
+
+    function scheduleConnectionRetry(){
+      if(realtimeReady) return;
+      if(reconnectTimerId) return;
+      reconnectTimerId = setTimeout(function(){
+        reconnectTimerId = null;
+        connectRealtime();
+      }, CONNECTION_RETRY_MS);
+    }
+
+    function waitForConnection(client){
+      return new Promise(function(resolve,reject){
+        if(!client || !client.connection){
+          reject(new Error('no_connection'));
+          return;
+        }
+        const connection = client.connection;
+        if(connection.state === 'connected'){
+          refreshLocalConnectionId(client);
+          resolve(connection);
+          return;
+        }
+        let settled = false;
+        const handler = function(event){
+          if(!event) return;
+          const state = typeof event === 'string' ? event : event.current;
+          if(state === 'connected'){
+            settled = true;
+            try{ connection.off(handler); }catch(err){/* ignore */}
+            refreshLocalConnectionId(client);
+            resolve(connection);
+          }else if(state === 'failed' || state === 'suspended' || state === 'closed'){
+            settled = true;
+            try{ connection.off(handler); }catch(err2){/* ignore */}
+            reject(new Error('connection_'+state));
+          }
+        };
+        try{
+          connection.on(handler);
+        }catch(err){
+          reject(err);
+          return;
+        }
+        setTimeout(function(){
+          if(settled) return;
+          try{ connection.off(handler); }catch(err3){/* ignore */}
+          reject(new Error('connection_timeout'));
+        }, 8000);
+      });
+    }
+
+    function ensurePresenceEntered(){
+      if(!channel) return Promise.reject(new Error('no_channel'));
+      if(presenceEntered){
+        syncTypingState();
+        return Promise.resolve();
+      }
+      let result;
+      try{
+        result = channel.presence.enter({ typing: false, name: myName });
+      }catch(err){
+        presenceEntered = false;
+        return Promise.reject(err);
+      }
+      if(result && typeof result.then === 'function'){
+        return result.then(function(){
+          presenceEntered = true;
+          syncTypingState();
+        }, function(err){
+          presenceEntered = false;
+          throw err;
+        });
+      }
+      presenceEntered = true;
+      syncTypingState();
+      return Promise.resolve();
+    }
+
+    function connectRealtime(){
+      startPruneTimer();
+      ensureRealtimeClient()
+        .then(function(client){
+          refreshLocalConnectionId(client);
+          watchConnection(client);
+          return waitForConnection(client).then(function(){ return client; });
+        })
+        .then(function(client){
+          channel = client.channels.get(room);
+          if(channel && typeof channel.on === 'function'){
+            try{
+              channel.on(function(stateChange){
+                if(!stateChange) return;
+                if(stateChange.current === 'detached' || stateChange.current === 'failed' || stateChange.current === 'suspended'){
+                  clearTypingUsers();
+                }
+              });
+            }catch(err){/* ignore */}
+          }
+          if(channel && typeof channel.presence.subscribe === 'function' && !presenceSubscribed){
+            try{
+              channel.presence.subscribe(function(msg){
+                updateIndicatorFromPresence(msg);
+              });
+              presenceSubscribed = true;
+            }catch(err){/* ignore */}
+          }
+          if(channel && typeof channel.presence.get === 'function'){
+            channel.presence.get(function(err, members){
+              if(members){
+                members.forEach(function(member){
+                  if(!member) return;
+                  const clientId = member.clientId || '';
+                  const myClientId = myId ? 'wpuser_' + myId : '';
+                  const connectionId = member.connectionId || '';
+                  if(connectionId && localConnectionId && connectionId === localConnectionId) return;
+                  if(!connectionId){
+                    if(myClientId && clientId === myClientId) return;
+                  }
+                  const data = member.data || {};
+                  if(data.typing){
+                    const key = presenceKeyFor(member) || (clientId ? 'client:' + clientId : (member.id ? 'id:' + member.id : 'anon'));
+                    setTypingForKey(key, data.name, true);
+                  }
+                });
+                updateIndicator();
+              }
+            });
+          }
+          return ensurePresenceEntered();
+        })
+        .then(function(){
+          realtimeReady = true;
+          clearReconnectTimer();
+        })
+        .catch(function(){
+          realtimeReady = false;
+          presenceEntered = false;
+          presenceSubscribed = false;
+          channel = null;
+          stopPruneTimer();
+          scheduleConnectionRetry();
+        });
+    }
+
     function handleTypingUpdateResult(promise, nextState){
       if(promise && typeof promise.then === 'function'){
         promise.then(function(){
@@ -385,52 +539,7 @@
       return clientPromise;
     }
 
-    startPruneTimer();
-
-    ensureRealtimeClient().then(function(client){
-      refreshLocalConnectionId(client);
-      watchConnection(client);
-      channel = client.channels.get(room);
-      if(channel && typeof channel.on === 'function'){
-        try{
-          channel.on(function(stateChange){
-            if(!stateChange) return;
-            if(stateChange.current === 'detached' || stateChange.current === 'failed' || stateChange.current === 'suspended'){
-              clearTypingUsers();
-            }
-          });
-        }catch(err){/* ignore */}
-      }
-      channel.presence.enter({ typing: false, name: myName })
-        .then(function(){ syncTypingState(); })
-        .catch(function(){});
-      syncTypingState();
-      channel.presence.subscribe(function(msg){
-        updateIndicatorFromPresence(msg);
-      });
-      channel.presence.get(function(err, members){
-        if(members){
-          members.forEach(function(member){
-            if(!member) return;
-            const clientId = member.clientId || '';
-            const myClientId = myId ? 'wpuser_' + myId : '';
-            const connectionId = member.connectionId || '';
-            if(connectionId && localConnectionId && connectionId === localConnectionId) return;
-            if(!connectionId){
-              if(myClientId && clientId === myClientId) return;
-            }
-            const data = member.data || {};
-            if(data.typing){
-              const key = presenceKeyFor(member) || (clientId ? 'client:' + clientId : (member.id ? 'id:' + member.id : 'anon'));
-              setTypingForKey(key, data.name, true);
-            }
-          });
-          updateIndicator();
-        }
-      });
-    }).catch(function(){
-      stopPruneTimer();
-    });
+    connectRealtime();
 
     const textarea = chat.querySelector('textarea');
     if(textarea){
@@ -453,6 +562,7 @@
 
     window.addEventListener('beforeunload', function(){
       stopPruneTimer();
+      clearReconnectTimer();
       desiredTypingState = false;
       syncTypingState();
       if(channel){
