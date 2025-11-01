@@ -46,6 +46,39 @@
       const TYPING_DELAY_MS = 3000;
       let channel = null;
       let clientPromise = null;
+      let localConnectionId = null;
+
+      function refreshLocalConnectionId(client){
+        if(!client || !client.connection) return;
+        const connection = client.connection;
+        if(connection && connection.id) localConnectionId = connection.id;
+      }
+
+      function watchConnection(client){
+        if(!client || !client.connection || !client.connection.on) return;
+        try{
+          client.connection.on(function(event){
+            if(!event) return;
+            if(typeof event === 'string'){
+              if(event === 'connected') refreshLocalConnectionId(client);
+              return;
+            }
+            if(event.current === 'connected' || event.current === 'update'){
+              refreshLocalConnectionId(client);
+            }
+          });
+        }catch(err){/* ignore */}
+      }
+
+      function presenceKeyFor(source){
+        if(!source || typeof source !== 'object') return '';
+        const connectionId = source.connectionId || (source.connection && source.connection.id) || '';
+        if(connectionId) return 'conn:' + connectionId;
+        const clientId = source.clientId || '';
+        if(clientId) return 'client:' + clientId;
+        if(source.id) return 'id:' + source.id;
+        return '';
+      }
       
       function updateIndicator(){
         const names = Array.from(typingUsers.values());
@@ -124,6 +157,8 @@
       }
 
       ensureRealtimeClient().then(function(client){
+        refreshLocalConnectionId(client);
+        watchConnection(client);
         channel = client.channels.get(room);
         channel.presence.enter({ typing: false, name: myName })
           .then(function(){ syncTypingState(); })
@@ -131,27 +166,37 @@
         syncTypingState();
         channel.presence.subscribe(function(msg){
           if(!msg) return;
-          const clientId = msg.clientId;
           const myClientId = myId ? 'wpuser_' + myId : '';
-          if(clientId && myClientId && clientId === myClientId) return;
+          const connectionId = msg.connectionId || '';
+          if(connectionId && localConnectionId && connectionId === localConnectionId) return;
+          if(!connectionId){
+            const clientId = msg.clientId;
+            if(clientId && myClientId && clientId === myClientId) return;
+          }
           const data = msg.data || {};
+          const key = presenceKeyFor(msg) || (msg.clientId ? 'client:' + msg.clientId : (msg.id ? 'id:' + msg.id : 'anon'));
           if(data.typing){
-            typingUsers.set(clientId, data.name || 'Someone');
+            typingUsers.set(key, data.name || 'Someone');
           }else{
-            typingUsers.delete(clientId);
+            typingUsers.delete(key);
           }
           updateIndicator();
         });
         channel.presence.get(function(err, members){
           if(members){
             members.forEach(function(member){
-              if(!member || !member.clientId) return;
-              const clientId = member.clientId;
+              if(!member) return;
+              const clientId = member.clientId || '';
               const myClientId = myId ? 'wpuser_' + myId : '';
-              if(myClientId && clientId === myClientId) return;
+              const connectionId = member.connectionId || '';
+              if(connectionId && localConnectionId && connectionId === localConnectionId) return;
+              if(!connectionId){
+                if(myClientId && clientId === myClientId) return;
+              }
               const data = member.data || {};
               if(data.typing){
-                typingUsers.set(clientId, data.name || 'Someone');
+                const key = presenceKeyFor(member) || (clientId ? 'client:' + clientId : (member.id ? 'id:' + member.id : 'anon'));
+                typingUsers.set(key, data.name || 'Someone');
               }
             });
             updateIndicator();
