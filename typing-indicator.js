@@ -47,6 +47,8 @@
       let channel = null;
       let clientPromise = null;
       let localConnectionId = null;
+      let syncingTypingState = false;
+      let resyncRequested = false;
 
       function refreshLocalConnectionId(client){
         if(!client || !client.connection) return;
@@ -92,13 +94,55 @@
         }
       }
 
+      function scheduleTypingResync(){
+        if(resyncRequested) return;
+        resyncRequested = true;
+        setTimeout(function(){
+          resyncRequested = false;
+          syncTypingState();
+        }, 200);
+      }
+
+      function handleTypingUpdateResult(promise, nextState){
+        if(promise && typeof promise.then === 'function'){
+          promise.then(function(){
+            typingState = nextState;
+          }, function(){
+            scheduleTypingResync();
+          }).then(function(){
+            syncingTypingState = false;
+            if(typingState !== desiredTypingState){
+              syncTypingState();
+            }
+          });
+        }else{
+          typingState = nextState;
+          syncingTypingState = false;
+          if(typingState !== desiredTypingState){
+            syncTypingState();
+          }
+        }
+      }
+
       function syncTypingState(){
         if(!channel) return;
+        if(syncingTypingState){
+          scheduleTypingResync();
+          return;
+        }
         if(typingState === desiredTypingState) return;
-        typingState = desiredTypingState;
+
+        const nextState = desiredTypingState;
+        syncingTypingState = true;
+        let result;
         try{
-          channel.presence.update({ typing: typingState, name: myName });
-        }catch(err){/* ignore */}
+          result = channel.presence.update({ typing: nextState, name: myName });
+        }catch(err){
+          syncingTypingState = false;
+          scheduleTypingResync();
+          return;
+        }
+        handleTypingUpdateResult(result, nextState);
       }
 
       function setDesiredTypingState(isTyping){
